@@ -1,0 +1,9 @@
+﻿{% extends "layout.html" %}
+{% block content %}
+<h2>Config Main</h2>
+{% if message %}<p class="msg">{{ message }}</p>{% endif %}
+<form method="post" action="/config/main">
+  <textarea name="content" rows="34">{{ content }}</textarea>
+  <button type="submit">Save (YAML validate)</button>
+</form>
+{% endblock %}

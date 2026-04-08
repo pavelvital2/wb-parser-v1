@@ -1,0 +1,17 @@
+﻿{% extends "layout.html" %}
+{% block content %}
+<h2>Logs</h2>
+<form method="get" action="/logs" class="inline-form">
+  <label>File</label>
+  <select name="file">
+    {% for f in files %}
+      <option value="{{ f }}" {% if selected == f %}selected{% endif %}>{{ f }}</option>
+    {% endfor %}
+  </select>
+  <label>Lines</label>
+  <input type="number" name="lines" value="{{ lines }}" min="10" max="5000">
+  <button type="submit">Open</button>
+</form>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<pre class="log-box">{{ content }}</pre>
+{% endblock %}

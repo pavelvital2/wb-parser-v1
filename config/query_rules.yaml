@@ -1,0 +1,54 @@
+﻿default:
+  top_n: 20
+  min_wordstat_volume: 0
+
+  weights:
+    suggest_position_sum: 1.0
+    suggest_repeat_log: 18.0
+    suggest_depth0_bonus: 8.0
+    wordstat_log_scale: 50.0
+    wordstat_weight: 0.45
+    suggest_weight: 0.45
+    parent_children_bonus: 6.0
+    priority_pattern_bonus: 20.0
+    required_term_bonus: 10.0
+
+  suggest_position_weights:
+    "1": 70
+    "2": 55
+    "3": 43
+    "4": 34
+    "5": 26
+    "6": 19
+    "7": 13
+    "8": 8
+
+  dedupe:
+    normalize_yo_to_e: true
+    collapse_spaces: true
+    token_replacements:
+      шевроны: шеврон
+      нашивки: нашивка
+    canonical_token_mappings:
+      патчи: патч
+      патчей: патч
+
+  filters:
+    stop_words: []
+    required_terms_any: []
+    exclude_patterns: []
+    priority_patterns: []
+
+  parent_priority:
+    enabled: true
+    keep_parent_for_selected_child: true
+    max_parent_hops: 2
+
+  niche_rules:
+    all:
+      top_n: 50
+      include_patterns: []
+      exclude_patterns: []
+      multipliers:
+        total: 1.0
+      canonical_token_mappings: {}

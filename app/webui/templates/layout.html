@@ -1,0 +1,32 @@
+﻿<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title or "WB Parser UI" }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>WB Parser Web UI</h1>
+    {% if user %}
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/actions">Actions</a>
+      <a href="/runs">Runs</a>
+      <a href="/logs">Logs</a>
+      <a href="/files">Files</a>
+      <a href="/config/prefixes">Prefixes</a>
+      <a href="/config/wordstat">Wordstat</a>
+      <a href="/config/query-rules">Query Rules</a>
+      <a href="/config/main">Main Config</a>
+      <a href="/logout">Logout</a>
+    </nav>
+    {% endif %}
+  </header>
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

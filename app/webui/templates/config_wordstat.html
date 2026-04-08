@@ -1,0 +1,10 @@
+﻿{% extends "layout.html" %}
+{% block content %}
+<h2>Wordstat Upload</h2>
+{% if message %}<p class="msg">{{ message }}</p>{% endif %}
+<form method="post" action="/config/wordstat" enctype="multipart/form-data">
+  <input type="file" name="wordstat_file" accept=".csv" required>
+  <button type="submit">Upload</button>
+</form>
+<p>Destination: <code>data/raw/wordstat/</code></p>
+{% endblock %}

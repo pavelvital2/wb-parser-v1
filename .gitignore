@@ -1,0 +1,72 @@
+﻿# ------------------------------
+# Python bytecode / caches
+# ------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ------------------------------
+# Build / packaging artifacts
+# ------------------------------
+dist/
+build/
+.eggs/
+*.egg-info/
+
+# ------------------------------
+# Virtual environments
+# ------------------------------
+.venv/
+venv/
+env/
+
+# ------------------------------
+# Local env / secrets
+# ------------------------------
+.env
+.env.*
+!.env.example
+
+# Cookie / auth local files
+*cookie*.txt
+config/wb_cookie.txt
+
+# ------------------------------
+# Runtime state
+# ------------------------------
+state/sqlite/*.sqlite
+state/sqlite/*.sqlite-shm
+state/sqlite/*.sqlite-wal
+state/checkpoints/**/*.tmp
+state/browser/
+state/run_reports/
+state/locks/
+
+# ------------------------------
+# Runtime outputs (generated data)
+# ------------------------------
+data/logs/
+data/raw/
+data/staging/
+data/marts/
+exports/
+
+# ------------------------------
+# Generic runtime/temp files
+# ------------------------------
+*.log
+*.tmp
+*.bak
+
+# ------------------------------
+# OS / editor files
+# ------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

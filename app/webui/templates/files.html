@@ -1,0 +1,31 @@
+﻿{% extends "layout.html" %}
+{% block content %}
+<h2>Files</h2>
+<form method="get" action="/files" class="inline-form">
+  <label>Root</label>
+  <select name="root">
+    {% for r in roots %}
+      <option value="{{ r }}" {% if selected_root == r %}selected{% endif %}>{{ r }}</option>
+    {% endfor %}
+  </select>
+  <label>Subdir</label>
+  <input type="text" name="subdir" value="{{ subdir }}" placeholder="component/run_id">
+  <button type="submit">List</button>
+</form>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<table>
+  <thead>
+    <tr><th>path</th><th>size</th><th>modified_at</th><th>download</th></tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td>{{ row.relative_path }}</td>
+      <td>{{ row.size }}</td>
+      <td>{{ row.modified_at }}</td>
+      <td><a href="/files/download?root={{ selected_root }}&path={{ row.relative_path }}">download</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

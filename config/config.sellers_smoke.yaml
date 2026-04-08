@@ -1,0 +1,111 @@
+﻿project:
+  name: wb_unified_parser_v1
+  source_system: wildberries
+  timezone: Europe/Moscow
+
+paths:
+  data_raw: data/raw
+  data_staging: data/staging
+  data_marts: data/marts
+  logs: data/logs
+  exports: exports
+  state_sqlite: state/sqlite/wb_pipeline_state.sqlite
+  checkpoints_dir: state/checkpoints
+
+runtime:
+  retry_max_attempts: 5
+  retry_base_delay_seconds: 1.0
+  retry_max_delay_seconds: 20.0
+  http_timeout_seconds: 45
+  dry_run: false
+  debug: false
+
+suggest:
+  prefixes_file: config/prefixes.txt
+  alphabet_mode: ru30
+  throttle_ms: 900
+  type_delay_ms: 50
+  headless: false
+  browser_profile_dir: state/browser/wb_profile
+  max_typed_queries: 0
+  full_refresh_checkpoints: false
+  force_full_refresh: false
+  empty_checkpoint_policy: reprocess
+
+filter:
+  rules_file: config/query_rules.yaml
+  wordstat_csv: config/wordstat.csv
+  wordstat_csv_files: []
+  wordstat_csv_glob: data/raw/wordstat/*.csv
+  input_files:
+    suggest_staging_csv: ""
+  output_files:
+    candidates_raw_csv: filter_candidates_raw.csv
+    debug_scores_csv: debug_scores.csv
+    top_queries_csv: top_queries.csv
+    queries_txt: queries.txt
+
+serp:
+  input_files:
+    queries_txt: exports/queries.txt
+    top_queries_csv: data/marts/filter/latest/top_queries.csv
+  pages_per_query: 10
+  page_size: 100
+  wb_cookie_file_env: WB_COOKIE_FILE
+  wb_cookie_file: config/wb_cookie.txt
+  base_url: https://www.wildberries.ru/__internal/u-search/exactmatch/ru/common/v18/search
+  request_params:
+    ab_testid: model_reranking_all_logistic_boost
+    appType: "1"
+    curr: rub
+    dest: "-1255987"
+    hide_vflags: "4294967296"
+    inheritFilters: "false"
+    lang: ru
+    resultset: catalog
+    sort: popular
+    spp: "30"
+    suppressSpellcheck: "false"
+  user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)
+  referer_base: https://www.wildberries.ru/catalog/0/search.aspx?search=
+  x_requested_with: XMLHttpRequest
+  sleep_between_pages_ms: 1300
+  sleep_between_queries_ms: 2500
+  stop_on_empty_page: true
+  raw_pages_subdir: pages
+  output_files:
+    raw_products_csv: products_raw.csv
+    staging_products_csv: products_staging.csv
+    mart_products_daily_csv: products_daily.csv
+    raw_pages_index_csv: pages_raw_index.csv
+    sellers_input_csv: products_for_sellers.csv
+
+sellers:
+  input_files:
+    products_daily_csv: data/marts/serp/latest/products_daily_smoke_stage6.csv
+  api_base_url: https://suppliers-shipment-2.wildberries.ru/api/v1/suppliers
+  curr: RUB
+  user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)
+  sleep_between_sellers_ms: 100
+  full_refresh_checkpoints: false
+  raw_responses_subdir: responses
+  request_headers:
+    accept: "*/*"
+    accept-language: ru,en;q=0.9,en-US;q=0.8
+    origin: https://www.wildberries.ru
+    x-client-name: site
+  output_files:
+    raw_sellers_csv: sellers_raw.csv
+    staging_sellers_csv: sellers_staging.csv
+    mart_sellers_daily_csv: sellers_daily.csv
+    bridge_csv: seller_query_product_bridge.csv
+
+webui:
+  host: 127.0.0.1
+  port: 8080
+  admin_username: admin
+  admin_password_env: WEBUI_ADMIN_PASSWORD
+  secret_key_env: WEBUI_SECRET_KEY
+
+
+

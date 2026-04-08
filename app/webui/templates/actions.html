@@ -1,0 +1,14 @@
+﻿{% extends "layout.html" %}
+{% block content %}
+<h2>Actions</h2>
+{% if message %}<p class="msg">{{ message }}</p>{% endif %}
+<p>Non-blocking запуск через subprocess. Отслеживайте результат в Runs/Logs.</p>
+<div class="actions-grid">
+  {% for action in actions %}
+    <form method="post" action="/actions/run" class="action-form">
+      <input type="hidden" name="target" value="{{ action }}">
+      <button type="submit">run {{ action }}</button>
+    </form>
+  {% endfor %}
+</div>
+{% endblock %}

@@ -1,0 +1,9 @@
+﻿{% extends "layout.html" %}
+{% block content %}
+<h2>Config Prefixes</h2>
+{% if message %}<p class="msg">{{ message }}</p>{% endif %}
+<form method="post" action="/config/prefixes">
+  <textarea name="content" rows="24">{{ content }}</textarea>
+  <button type="submit">Save</button>
+</form>
+{% endblock %}

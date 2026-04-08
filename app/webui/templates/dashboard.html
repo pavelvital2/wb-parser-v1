@@ -1,0 +1,44 @@
+﻿{% extends "layout.html" %}
+{% block content %}
+<h2>Dashboard</h2>
+<p>Operator: {{ user }}</p>
+
+<h3>Latest Outputs</h3>
+<table>
+  <thead>
+    <tr><th>Component</th><th>Layer</th><th>File</th><th>Status</th><th>Path</th><th>Size</th><th>Modified</th></tr>
+  </thead>
+  <tbody>
+  {% for row in latest_outputs %}
+    <tr>
+      <td>{{ row.component }}</td>
+      <td>{{ row.layer }}</td>
+      <td>{{ row.filename }}</td>
+      <td>{{ row.status }}</td>
+      <td>{{ row.path }}</td>
+      <td>{{ row.size }}</td>
+      <td>{{ row.modified_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h3>Recent Runs</h3>
+<table>
+  <thead>
+    <tr><th>run_id</th><th>component</th><th>status</th><th>started_at</th><th>finished_at</th><th>error_message</th></tr>
+  </thead>
+  <tbody>
+  {% for row in runs %}
+    <tr>
+      <td>{{ row.run_id }}</td>
+      <td>{{ row.component }}</td>
+      <td>{{ row.status }}</td>
+      <td>{{ row.started_at_utc }}</td>
+      <td>{{ row.finished_at_utc }}</td>
+      <td>{{ row.error_message }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
