@@ -269,3 +269,62 @@ def test_payload_anomaly_cooldown_retries_same_page_with_new_session(tmp_path: P
     assert len(page_rows) == 1
     assert page_rows[0]["source_ref"] == "test query|page=1"
     assert page_rows[0]["status"] == "success"
+
+
+def test_error_ip_rotation_retries_same_page_before_recording_error(tmp_path: Path, monkeypatch) -> None:
+    engine = _make_engine(tmp_path)
+    engine.deferred_retry_enabled = False
+    engine.error_ip_rotation_enabled = True
+    engine.error_ip_rotation_url = "https://rotate.example.test/change_ip"
+    engine.error_ip_rotation_wait_seconds = 0.0
+    engine.error_ip_rotation_max_attempts = 1
+
+    sessions: list[_CloseableSession] = []
+
+    def fake_build_session(cookie_value: str) -> _CloseableSession:
+        session = _CloseableSession(label=len(sessions))
+        sessions.append(session)
+        return session
+
+    fetch_calls: list[tuple[int, str, int]] = []
+
+    def fake_fetch_page(*, session: _CloseableSession, query: str, page: int, retry_payload_anomalies: bool = True):
+        fetch_calls.append((session.label, query, page))
+        if len(fetch_calls) == 1:
+            return (
+                _FakeResponse(429, "blocked"),
+                None,
+                "http_429: blocked",
+                "data/raw/serp/test/page_1_error.json",
+            )
+        return (
+            _JsonResponse(200, {"products": [{"id": 123, "name": "ok", "brand": "brand"}]}, '{"products":[{"id":123}]}'),
+            {"products": [{"id": 123, "name": "ok", "brand": "brand"}]},
+            "",
+            "data/raw/serp/test/page_1.json",
+        )
+
+    rotations: list[tuple[str, int, int, str]] = []
+
+    def fake_rotate_ip_after_error(*, query: str, page: int, http_status: int, error_message: str) -> bool:
+        rotations.append((query, page, http_status, error_message))
+        return True
+
+    monkeypatch.setattr(engine, "_build_session", fake_build_session)
+    monkeypatch.setattr(engine, "_fetch_page", fake_fetch_page)
+    monkeypatch.setattr(engine, "_rotate_ip_after_error", fake_rotate_ip_after_error)
+
+    result = engine.run()
+
+    assert result["items_ok"] == 1
+    assert result["items_error"] == 0
+    assert result["pages_done"] == 1
+    assert result["ip_rotations"] == 1
+    assert fetch_calls == [(0, "test query", 1), (1, "test query", 1)]
+    assert rotations == [("test query", 1, 429, "http_429: blocked")]
+    assert [session.closed for session in sessions] == [True, True]
+
+    page_rows = read_csv_rows(Path(result["pages_index_path"]))
+    assert len(page_rows) == 1
+    assert page_rows[0]["source_ref"] == "test query|page=1"
+    assert page_rows[0]["status"] == "success"

@@ -112,6 +112,10 @@ serp:
   retry_max_attempts: 5
   retry_base_delay_seconds: 1.0
   retry_max_delay_seconds: 20.0
+  error_ip_rotation_enabled: true
+  error_ip_rotation_url_env: PARSER_WB_PROXY_ROTATE_URL
+  error_ip_rotation_wait_seconds: 120
+  error_ip_rotation_max_attempts: 1
   deferred_retry_enabled: true
   deferred_retry_sleep_seconds: 600
   abort_after_consecutive_rate_limits: 3

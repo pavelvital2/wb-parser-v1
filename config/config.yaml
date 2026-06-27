@@ -219,6 +219,14 @@ serp:
 
   rate_limit_sleep_ms: 45000
 
+  error_ip_rotation_enabled: true
+
+  error_ip_rotation_url_env: PARSER_WB_PROXY_ROTATE_URL
+
+  error_ip_rotation_wait_seconds: 120
+
+  error_ip_rotation_max_attempts: 1
+
   deferred_retry_enabled: true
 
   deferred_retry_sleep_seconds: 600

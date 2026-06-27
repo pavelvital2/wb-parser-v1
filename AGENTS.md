@@ -211,6 +211,15 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   `state/browser/wb_persistent_profile`, the restarted persistent session
   returned `HTTP 200`, `antibot=false`, `cookie_count=10`, `promoted=true`.
   This verified the automatic profile reset escalation conditions.
+- On 2026-06-27, SERP got IP rotation on page errors. When a page still has an
+  error after normal endpoint fallback/retry, SERP calls the ignored
+  `PARSER_WB_PROXY_ROTATE_URL`, waits `error_ip_rotation_wait_seconds`
+  (`120` seconds in `config/config.yaml`), reloads current cookies, recreates
+  the HTTP session, and retries the same `query|page` before writing a final
+  page error. Default production limit is one IP rotation per page error through
+  `serp.error_ip_rotation_max_attempts=1`; this prevents infinite loops while
+  preserving resume/checkpoint behavior. Keep the rotate API URL only in
+  ignored `config/runtime.env`; do not print or commit it.
 - Proactive WB cookie renewal is scheduled through the user's crontab every
   30 minutes at minutes `7` and `37`: `7,37 * * * * /home/pavel/projects/parser_wb/scripts/run_wb_cookie_renewal.sh`
   with output appended to `data/logs/wb_cookie_renewal.log`. The renewal wrapper

@@ -120,6 +120,28 @@ class SerpEngine:
         self.payload_anomaly_keeper_smoke_enabled = bool(self.serp_cfg.get("payload_anomaly_keeper_smoke_enabled", False))
         self.payload_anomaly_keeper_smoke_sample_count = int(self.serp_cfg.get("payload_anomaly_keeper_smoke_sample_count", 3))
         self.payload_anomaly_keeper_smoke_page = int(self.serp_cfg.get("payload_anomaly_keeper_smoke_page", 1))
+        self.error_ip_rotation_url = self._resolve_error_ip_rotation_url()
+        self.error_ip_rotation_wait_seconds = self._resolve_error_ip_rotation_wait_seconds()
+        self.error_ip_rotation_timeout_seconds = float(
+            self.serp_cfg.get(
+                "error_ip_rotation_timeout_seconds",
+                os.getenv("PARSER_WB_PROXY_ROTATE_TIMEOUT_SECONDS", "30"),
+            )
+        )
+        self.error_ip_rotation_max_attempts = int(
+            self.serp_cfg.get(
+                "error_ip_rotation_max_attempts",
+                os.getenv("PARSER_WB_PROXY_ROTATE_MAX_ATTEMPTS_PER_PAGE", "1"),
+            )
+        )
+        self.error_ip_rotation_enabled = bool(
+            self.serp_cfg.get(
+                "error_ip_rotation_enabled",
+                os.getenv("PARSER_WB_PROXY_ROTATE_ON_ERROR", "1").strip().lower() not in {"0", "false", "no", "off"},
+            )
+        )
+        if not self.error_ip_rotation_url:
+            self.error_ip_rotation_enabled = False
 
         out_cfg = self.serp_cfg.get("output_files", {})
         self.raw_products_name = str(out_cfg.get("raw_products_csv", "products_raw.csv"))
@@ -159,6 +181,7 @@ class SerpEngine:
         failed_pages: dict[str, tuple[QueryTask, int]] = {}
         consecutive_rate_limits = 0
         payload_anomaly_cooldowns = 0
+        ip_rotations = 0
 
         session = self._build_session(cookie_value)
         try:
@@ -219,6 +242,7 @@ class SerpEngine:
                         error_message,
                         raw_file,
                         payload_anomaly_cooldowns,
+                        page_ip_rotations,
                     ) = self._fetch_page_with_payload_anomaly_cooldown(
                         session=session,
                         cookie_value=cookie_value,
@@ -226,6 +250,7 @@ class SerpEngine:
                         page=page,
                         cooldowns_done=payload_anomaly_cooldowns,
                     )
+                    ip_rotations += page_ip_rotations
                     http_status = response.status_code if response is not None else 0
                     products: list[dict[str, Any]] = []
 
@@ -359,6 +384,7 @@ class SerpEngine:
                 session = retry_result["session"]
                 cookie_value = retry_result["cookie_value"]
                 payload_anomaly_cooldowns = retry_result["payload_anomaly_cooldowns"]
+                ip_rotations += retry_result["ip_rotations"]
                 items_ok += retry_result["items_ok"]
                 pages_done += retry_result["pages_done"]
                 items_error = max(0, items_error - retry_result["errors_recovered"])
@@ -422,9 +448,11 @@ class SerpEngine:
             "products_daily_preview_export": str(preview_export_path) if outputs_published else "",
             "outputs_published": int(outputs_published),
             "payload_anomaly_cooldowns": payload_anomaly_cooldowns,
+            "ip_rotations": ip_rotations,
             "note": (
                 f"queries={len(tasks)} pages={pages_done} ok={items_ok} err={items_error} "
-                f"published={int(outputs_published)} payload_anomaly_cooldowns={payload_anomaly_cooldowns}"
+                f"published={int(outputs_published)} payload_anomaly_cooldowns={payload_anomaly_cooldowns} "
+                f"ip_rotations={ip_rotations}"
             ),
         }
 
@@ -480,6 +508,23 @@ class SerpEngine:
                 return env_value
         return str(self.serp_cfg.get("proxy_url") or "").strip()
 
+    def _resolve_error_ip_rotation_url(self) -> str:
+        env_name = str(self.serp_cfg.get("error_ip_rotation_url_env") or "PARSER_WB_PROXY_ROTATE_URL").strip()
+        if env_name:
+            env_value = os.getenv(env_name, "").strip()
+            if env_value:
+                return env_value
+        return str(self.serp_cfg.get("error_ip_rotation_url") or "").strip()
+
+    def _resolve_error_ip_rotation_wait_seconds(self) -> float:
+        raw_value: Any = self.serp_cfg.get("error_ip_rotation_wait_seconds")
+        if raw_value is None:
+            raw_value = os.getenv("PARSER_WB_PROXY_ROTATE_WAIT_SECONDS", "120")
+        try:
+            return max(0.0, float(raw_value))
+        except (TypeError, ValueError):
+            return 120.0
+
     def _ordered_base_urls(self) -> list[tuple[int, str]]:
         if len(self.base_urls) <= 1:
             return [(0, self.base_urls[0])]
@@ -523,10 +568,23 @@ class SerpEngine:
         query: str,
         page: int,
         cooldowns_done: int,
-    ) -> tuple[requests.Session, str, requests.Response | None, dict[str, Any] | None, str, str, int]:
+    ) -> tuple[requests.Session, str, requests.Response | None, dict[str, Any] | None, str, str, int, int]:
+        ip_rotations = 0
         if not self._payload_anomaly_cooldown_enabled():
             response, payload, error_message, raw_file = self._fetch_page(session=session, query=query, page=page)
-            return session, cookie_value, response, payload, error_message, raw_file, cooldowns_done
+            return self._retry_page_after_error_ip_rotation(
+                session=session,
+                cookie_value=cookie_value,
+                query=query,
+                page=page,
+                cooldowns_done=cooldowns_done,
+                ip_rotations=ip_rotations,
+                response=response,
+                payload=payload,
+                error_message=error_message,
+                raw_file=raw_file,
+                retry_payload_anomalies=True,
+            )
 
         consecutive_anomalies = 0
         while True:
@@ -537,7 +595,19 @@ class SerpEngine:
                 retry_payload_anomalies=False,
             )
             if not self._is_retryable_payload_anomaly(error_message):
-                return session, cookie_value, response, payload, error_message, raw_file, cooldowns_done
+                return self._retry_page_after_error_ip_rotation(
+                    session=session,
+                    cookie_value=cookie_value,
+                    query=query,
+                    page=page,
+                    cooldowns_done=cooldowns_done,
+                    ip_rotations=ip_rotations,
+                    response=response,
+                    payload=payload,
+                    error_message=error_message,
+                    raw_file=raw_file,
+                    retry_payload_anomalies=False,
+                )
 
             consecutive_anomalies += 1
             if consecutive_anomalies < self.payload_anomaly_cooldown_after_consecutive:
@@ -582,6 +652,103 @@ class SerpEngine:
             cooldowns_done += 1
             consecutive_anomalies = 0
             self._run_payload_anomaly_keeper_smoke()
+
+    def _retry_page_after_error_ip_rotation(
+        self,
+        *,
+        session: requests.Session,
+        cookie_value: str,
+        query: str,
+        page: int,
+        cooldowns_done: int,
+        ip_rotations: int,
+        response: requests.Response | None,
+        payload: dict[str, Any] | None,
+        error_message: str,
+        raw_file: str,
+        retry_payload_anomalies: bool,
+    ) -> tuple[requests.Session, str, requests.Response | None, dict[str, Any] | None, str, str, int, int]:
+        while error_message and self._should_rotate_ip_after_error(ip_rotations):
+            http_status = response.status_code if response is not None else 0
+            if not self._rotate_ip_after_error(query=query, page=page, http_status=http_status, error_message=error_message):
+                break
+
+            session.close()
+            cookie_value = self._load_cookie_value()
+            session = self._build_session(cookie_value)
+            ip_rotations += 1
+            response, payload, error_message, raw_file = self._fetch_page(
+                session=session,
+                query=query,
+                page=page,
+                retry_payload_anomalies=retry_payload_anomalies,
+            )
+
+        return session, cookie_value, response, payload, error_message, raw_file, cooldowns_done, ip_rotations
+
+    def _should_rotate_ip_after_error(self, ip_rotations: int) -> bool:
+        if bool(self.config.runtime.dry_run):
+            return False
+        if not self.error_ip_rotation_enabled:
+            return False
+        if self.error_ip_rotation_max_attempts <= 0:
+            return False
+        return ip_rotations < self.error_ip_rotation_max_attempts
+
+    def _rotate_ip_after_error(self, *, query: str, page: int, http_status: int, error_message: str) -> bool:
+        self.logger.warning(
+            "serp_error_ip_rotation_started",
+            extra={
+                "run_id": self.ctx.run_id,
+                "component": COMPONENT_SERP,
+                "query": query,
+                "page": page,
+                "http_status": http_status,
+                "wait_seconds": self.error_ip_rotation_wait_seconds,
+                "error_message": error_message[:240],
+            },
+        )
+        try:
+            response = requests.get(self.error_ip_rotation_url, timeout=self.error_ip_rotation_timeout_seconds)
+        except Exception as exc:
+            self.logger.warning(
+                "serp_error_ip_rotation_failed",
+                extra={
+                    "run_id": self.ctx.run_id,
+                    "component": COMPONENT_SERP,
+                    "query": query,
+                    "page": page,
+                    "error_class": exc.__class__.__name__,
+                },
+            )
+            return False
+
+        if response.status_code < 200 or response.status_code >= 300:
+            self.logger.warning(
+                "serp_error_ip_rotation_non_2xx",
+                extra={
+                    "run_id": self.ctx.run_id,
+                    "component": COMPONENT_SERP,
+                    "query": query,
+                    "page": page,
+                    "rotate_http_status": response.status_code,
+                },
+            )
+            return False
+
+        if self.error_ip_rotation_wait_seconds > 0:
+            self.logger.warning(
+                "serp_error_ip_rotation_wait",
+                extra={
+                    "run_id": self.ctx.run_id,
+                    "component": COMPONENT_SERP,
+                    "query": query,
+                    "page": page,
+                    "wait_seconds": self.error_ip_rotation_wait_seconds,
+                },
+            )
+            time.sleep(self.error_ip_rotation_wait_seconds)
+        return True
 
     def _run_payload_anomaly_keeper_smoke(self) -> None:
         if not self.payload_anomaly_keeper_smoke_enabled:
@@ -716,6 +883,7 @@ class SerpEngine:
         items_ok = 0
         pages_done = 0
         errors_recovered = 0
+        ip_rotations = 0
 
         for checkpoint_key, (task, page) in failed_pages.items():
             collected_at = utc_now_iso()
@@ -729,6 +897,7 @@ class SerpEngine:
                 error_message,
                 raw_file,
                 payload_anomaly_cooldowns,
+                page_ip_rotations,
             ) = self._fetch_page_with_payload_anomaly_cooldown(
                 session=session,
                 cookie_value=cookie_value,
@@ -736,6 +905,7 @@ class SerpEngine:
                 page=page,
                 cooldowns_done=payload_anomaly_cooldowns,
             )
+            ip_rotations += page_ip_rotations
             http_status = response.status_code if response is not None else 0
             products: list[dict[str, Any]] = []
 
@@ -830,6 +1000,7 @@ class SerpEngine:
             "pages_done": pages_done,
             "errors_recovered": errors_recovered,
             "payload_anomaly_cooldowns": payload_anomaly_cooldowns,
+            "ip_rotations": ip_rotations,
             "session": session,
             "cookie_value": cookie_value,
         }
