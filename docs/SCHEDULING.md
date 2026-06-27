@@ -1,4 +1,4 @@
-﻿# Scheduling Guide (V1)
+# Scheduling Guide (V1)
 
 This document describes production V1 scheduling for:
 - Windows Task Scheduler (primary)
@@ -76,6 +76,135 @@ Use the same CLI commands.
 # monthly day 1 00:00
 0 0 1 * * cd /opt/parser_new && WB_COOKIE_FILE=/opt/parser_new/config/wb_cookie.txt /usr/bin/python3 main.py --config config/config.yaml run monthly >> data/logs/cron_monthly.log 2>&1
 ```
+
+### Current Linux schedule for this host
+
+Current production schedule on `/home/pavel/projects/parser_wb` is product and
+seller collection only. It intentionally does not run `daily`, `filter`, or
+`suggest`.
+
+The user crontab contains:
+```bash
+15 0 * * * /home/pavel/projects/parser_wb/scripts/run_products_sellers_daily.sh >> /home/pavel/projects/parser_wb/data/logs/cron_products_sellers.log 2>&1
+```
+
+The host timezone is `Europe/Moscow`, so the cron entry runs daily at 00:15 MSK.
+
+Before the 00:15 collection, the host runs a WB access preflight twice:
+
+```cron
+45 23 * * * /home/pavel/projects/parser_wb/scripts/run_wb_nightly_preflight.sh >> /home/pavel/projects/parser_wb/data/logs/wb_nightly_preflight.log 2>&1
+5 0 * * * /home/pavel/projects/parser_wb/scripts/run_wb_nightly_preflight.sh >> /home/pavel/projects/parser_wb/data/logs/wb_nightly_preflight.log 2>&1
+```
+
+The preflight checks the current `config/wb_cookie.txt` with SERP/API smoke.
+When it passes, the cookie is saved as an ignored mode-`600` known-good backup
+under `state/wb_known_good/`. When it fails, the preflight tries to restore the
+latest smoke-valid known-good backup before attempting keeper refresh. If access
+cannot be restored, it sends an early Telegram notification to the `parser_wb`
+topic and exits non-zero. This preflight deliberately treats API smoke as the
+hard gate for the nightly SERP; persistent browser HTML state is useful for
+repair but is not the only condition, because the API/cookie contour can remain
+usable while browser HTML is blocked.
+
+The wrapper executes:
+```bash
+/home/Codex/agent-tools/parser_wb-python/bin/python main.py --config config/config.yaml run serp
+/home/Codex/agent-tools/parser_wb-python/bin/python main.py --config config/config.yaml run sellers
+```
+
+Before `serp`, the wrapper runs `scripts/wb_cookie_keeper.py ensure`. The
+keeper checks the current WB cookie with a smoke SERP request and, if the smoke
+check fails, tries to refresh `config/wb_cookie.txt` through
+Playwright/browser cookies without printing cookie values. Use
+`PARSER_WB_KEEPER_DISABLED=1` to skip this check,
+`PARSER_WB_STORAGE_STATE_FILE`/`WB_STORAGE_STATE_FILE` to point to a Playwright
+`storage_state`, and `PARSER_WB_KEEPER_SAMPLE_COUNT` to control how many
+queries are smoke-checked. The wrapper default is `3`. Smoke accepts configured
+SERP fallback endpoints and uses `serp.smoke_min_successes`; production config
+requires at least 2 successful smoke queries out of the default 3-query sample.
+This tolerates one temporary failed smoke but blocks a full SERP when 2 of 3
+queries already fail. Full SERP publication is still guarded by
+`validation.max_error_ratio.serp`.
+
+Cookies are also renewed proactively, not only after they fail. The user's
+crontab contains a separate job every 30 minutes:
+```cron
+7,37 * * * * /home/pavel/projects/parser_wb/scripts/run_wb_cookie_renewal.sh >> /home/pavel/projects/parser_wb/data/logs/wb_cookie_renewal.log 2>&1
+```
+
+That wrapper runs `scripts/wb_cookie_keeper.py renew`. Renewal always attempts a
+fresh browser/session refresh, but writes it first to temporary cookie and
+`storage_state` files. The temp cookie is smoke-tested and promoted to
+`config/wb_cookie.txt` only after a successful smoke; otherwise the existing
+cookie file is left unchanged.
+
+The host also keeps a persistent WB browser session alive through tmux session
+`wb_persistent_session`. The user confirmed that the mobile proxy rotates
+external IP automatically every 5 minutes by design, so one failed heartbeat
+during an IP change must not immediately kill the browser session. A local
+watchdog checks only local state every minute and restarts the tmux session only
+when the session is missing, the heartbeat is stale, state is unreadable, or
+several new failed heartbeats are observed in a row:
+
+```cron
+* * * * * /home/pavel/projects/parser_wb/scripts/run_wb_persistent_watchdog.sh
+```
+
+Relevant paths:
+- session log: `data/logs/wb_persistent_session.log`
+- session state: `state/wb_persistent_session/latest.json`
+- watchdog log: `data/logs/wb_persistent_watchdog.log`
+- watchdog state: `state/wb_persistent_session/watchdog.json`
+
+Default watchdog thresholds:
+- `PARSER_WB_WATCHDOG_MAX_AGE_SECONDS=900`
+- `PARSER_WB_WATCHDOG_BAD_HEARTBEATS=2`
+- `PARSER_WB_WATCHDOG_RESTART_COOLDOWN_SECONDS=600`
+
+The watchdog itself does not send WB requests and does not write cookies; it
+only starts/restarts the persistent browser wrapper. Cookie promotion remains in
+`scripts/wb_persistent_session.py` and still requires both SERP smoke and WB
+HTML anti-bot smoke.
+
+If WB blocks the host IP with `HTTP 498` on `www.wildberries.ru` or repeated
+`HTTP 429` on `search.wb.ru`, do not store proxy credentials in the repository.
+Set `PARSER_WB_PROXY_URL` in the scheduler environment or in the ignored local
+file `config/runtime.env` with mode `600`, for example:
+
+```bash
+PARSER_WB_PROXY_URL=<proxy-url>
+```
+
+Do not commit or print this file. The wrapper scripts source `config/runtime.env`
+before calling the parser, and the same variable is used by SERP requests and by
+`wb_cookie_keeper.py` smoke/Playwright refresh.
+
+`HTTP 498` is treated as an anti-bot/rate-limit status together with `HTTP 429`
+for longer sleeps and the consecutive rate-limit stop guard.
+
+If `serp` fails or finishes as an unacceptable partial, `sellers` is not
+started. The wrapper retries `serp` after a cooldown for transient WB anomalies
+such as `retryable_payload_anomaly: nested promo products=1`. Defaults:
+`PARSER_WB_SERP_MAX_ATTEMPTS=2` and
+`PARSER_WB_SERP_RETRY_SLEEP_SECONDS=3600`.
+
+Inside a SERP run, repeated `retryable_payload_anomaly` responses are retried on
+the same `query|page`. Current defaults: after 5 consecutive anomaly responses
+SERP sleeps 600 seconds, recreates the HTTP session, reloads the cookie file,
+optionally runs `scripts/wb_cookie_keeper.py smoke`, and retries the same page.
+Each later cooldown in the same run grows by 600 seconds: 10, 20, 30 minutes,
+and so on.
+
+After the wrapper exits, it calls `scripts/notify_products_sellers_daily.py` to
+send a Telegram summary to the `parser_wb` topic. The notification reports run
+status, duration, query count, product rows from
+`data/marts/serp/latest/products_daily.csv`, seller rows from
+`data/marts/sellers/latest/sellers_daily.csv`, bridge rows from
+`data/marts/sellers/latest/seller_query_product_bridge.csv`, and the cron log
+path. Notification errors are intentionally ignored by the wrapper so Telegram
+problems do not change parser exit status. Use `PARSER_WB_NOTIFY_DISABLED=1` to
+skip notification during manual tests.
 
 ### systemd timer note
 - Create two services calling the same commands.

@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from app.common.config import load_config
+from app.common.csv_io import read_csv_rows
 from app.common.run_context import RunContext, utc_now_iso
 from app.common.state_db import StateDB
 from app.serp.engine import SerpEngine
@@ -18,12 +19,57 @@ class _FakeResponse:
         raise ValueError("bad json")
 
 
+class _JsonResponse:
+    def __init__(self, status_code: int, payload: dict, text: str = "") -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+        self.content = (text or "{}").encode("utf-8")
+
+    def json(self):
+        return self._payload
+
+
 class _FakeSession:
     def __init__(self, response: _FakeResponse) -> None:
         self._response = response
 
     def get(self, *args, **kwargs):
         return self._response
+
+
+class _EndpointFallbackSession:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def get(self, url: str, *args, **kwargs):
+        self.urls.append(url)
+        if url == "https://fallback.local/search":
+            return _JsonResponse(
+                200,
+                {
+                    "products": [
+                        {
+                            "id": 123,
+                            "name": "ok",
+                            "brand": "brand",
+                            "supplierId": 456,
+                            "supplier": "seller",
+                        }
+                    ]
+                },
+                '{"products":[{"id":123}]}',
+            )
+        return _FakeResponse(498, "blocked")
+
+
+class _CloseableSession:
+    def __init__(self, label: int) -> None:
+        self.label = label
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _write(path: Path, content: str) -> None:
@@ -119,3 +165,107 @@ def test_fetch_page_saves_raw_on_invalid_json(tmp_path: Path) -> None:
     abs_path = engine.config.project_root / raw_file
     assert abs_path.exists()
     assert abs_path.read_text(encoding="utf-8") == "not a json payload"
+
+
+def test_fetch_page_falls_back_after_retryable_http_status(tmp_path: Path) -> None:
+    engine = _make_engine(tmp_path)
+    engine.base_urls = ["https://internal.local/search", "https://fallback.local/search"]
+    engine.retry_max_attempts = 1
+    session = _EndpointFallbackSession()
+
+    response, payload, error, raw_file = engine._fetch_page(session=session, query="шеврон мвд", page=1)
+
+    assert response is not None
+    assert response.status_code == 200
+    assert payload is not None
+    assert error == ""
+    assert raw_file.startswith(f"data/raw/serp/{engine.ctx.run_id}/")
+    assert session.urls == ["https://internal.local/search", "https://fallback.local/search"]
+    assert engine._active_base_url_index == 1
+
+
+def test_build_session_uses_configured_proxy(tmp_path: Path) -> None:
+    engine = _make_engine(tmp_path)
+    engine.proxy_url = "http://proxy.local:3128"
+
+    session = engine._build_session("cookie=1")
+
+    try:
+        assert session.proxies == {
+            "http": "http://proxy.local:3128",
+            "https": "http://proxy.local:3128",
+        }
+    finally:
+        session.close()
+
+
+def test_payload_anomaly_cooldown_retries_same_page_with_new_session(tmp_path: Path, monkeypatch) -> None:
+    engine = _make_engine(tmp_path)
+    engine.payload_anomaly_cooldown_after_consecutive = 2
+    engine.payload_anomaly_cooldown_base_seconds = 0.0
+    engine.payload_anomaly_cooldown_increment_seconds = 0.0
+    engine.payload_anomaly_keeper_smoke_enabled = False
+    engine.retry_base_delay_seconds = 0.0
+    engine.retry_max_delay_seconds = 0.0
+
+    sessions: list[_CloseableSession] = []
+
+    def fake_build_session(cookie_value: str) -> _CloseableSession:
+        session = _CloseableSession(label=len(sessions))
+        sessions.append(session)
+        return session
+
+    calls: list[tuple[int, str, int, bool]] = []
+
+    def fake_fetch_page(
+        *,
+        session: _CloseableSession,
+        query: str,
+        page: int,
+        retry_payload_anomalies: bool = True,
+    ):
+        calls.append((session.label, query, page, retry_payload_anomalies))
+        if len(calls) <= 2:
+            return (
+                _FakeResponse(200, "{}"),
+                None,
+                "retryable_payload_anomaly: nested promo products=1",
+                "data/raw/serp/test/page_1.json",
+            )
+        return (
+            _FakeResponse(200, "{}"),
+            {
+                "products": [
+                    {
+                        "id": 123,
+                        "name": "ok",
+                        "brand": "brand",
+                        "supplierId": 456,
+                        "supplier": "seller",
+                    }
+                ]
+            },
+            "",
+            "data/raw/serp/test/page_1.json",
+        )
+
+    monkeypatch.setattr(engine, "_build_session", fake_build_session)
+    monkeypatch.setattr(engine, "_fetch_page", fake_fetch_page)
+
+    result = engine.run()
+
+    assert result["items_ok"] == 1
+    assert result["items_error"] == 0
+    assert result["pages_done"] == 1
+    assert result["payload_anomaly_cooldowns"] == 1
+    assert calls == [
+        (0, "test query", 1, False),
+        (0, "test query", 1, False),
+        (1, "test query", 1, False),
+    ]
+    assert [session.closed for session in sessions] == [True, True]
+
+    page_rows = read_csv_rows(Path(result["pages_index_path"]))
+    assert len(page_rows) == 1
+    assert page_rows[0]["source_ref"] == "test query|page=1"
+    assert page_rows[0]["status"] == "success"

@@ -204,6 +204,8 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
     throttle_ms = int(settings.get("throttle_ms", 900))
     type_delay_ms = int(settings.get("type_delay_ms", 50))
     headless = bool(settings.get("headless", False))
+    browser_channel = str(settings.get("browser_channel", "")).strip()
+    browser_executable_path = str(settings.get("browser_executable_path", "")).strip()
     max_typed = int(settings.get("max_typed_queries", 0))
     full_refresh = bool(settings.get("full_refresh_checkpoints", False)) or bool(settings.get("force_full_refresh", False))
     empty_checkpoint_policy = str(settings.get("empty_checkpoint_policy", "reprocess")).lower().strip()
@@ -266,8 +268,17 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
     rows_written = 0
 
     with sync_playwright() as p:
+        launch_kwargs: dict[str, Any] = {
+            "user_data_dir": str(browser_profile_dir),
+            "headless": headless,
+        }
+        if browser_channel:
+            launch_kwargs["channel"] = browser_channel
+        elif browser_executable_path:
+            launch_kwargs["executable_path"] = browser_executable_path
+
         context = with_retry(
-            lambda: p.chromium.launch_persistent_context(user_data_dir=str(browser_profile_dir), headless=headless),
+            lambda: p.chromium.launch_persistent_context(**launch_kwargs),
             attempts=config.runtime.retry_max_attempts,
             base_delay=config.runtime.retry_base_delay_seconds,
             max_delay=config.runtime.retry_max_delay_seconds,
@@ -453,6 +464,5 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
         "raw_path": str(raw_path),
         "staging_path": str(staging_path),
     }
-
 
 

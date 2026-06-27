@@ -80,7 +80,14 @@ serp:
   # Env variable has priority over wb_cookie_file.
   wb_cookie_file_env: WB_COOKIE_FILE
   wb_cookie_file: ""
+  # Optional outbound proxy for WB access. Do not store credentials in this file;
+  # set PARSER_WB_PROXY_URL in the scheduler environment.
+  proxy_url_env: PARSER_WB_PROXY_URL
+  proxy_url: ""
   base_url: https://www.wildberries.ru/__internal/u-search/exactmatch/ru/common/v18/search
+  fallback_base_urls:
+    - https://search.wb.ru/exactmatch/ru/male/v18/search
+  smoke_min_successes: 2
   request_params:
     ab_testid: model_reranking_all_logistic_boost
     appType: "1"
@@ -96,7 +103,25 @@ serp:
   user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)
   referer_base: https://www.wildberries.ru/catalog/0/search.aspx?search=
   x_requested_with: XMLHttpRequest
+  rate_limit_http_statuses:
+    - 429
+    - 498
   sleep_between_pages_ms: 1300
+  error_sleep_ms: 1300
+  rate_limit_sleep_ms: 30000
+  retry_max_attempts: 5
+  retry_base_delay_seconds: 1.0
+  retry_max_delay_seconds: 20.0
+  deferred_retry_enabled: true
+  deferred_retry_sleep_seconds: 600
+  abort_after_consecutive_rate_limits: 3
+  payload_anomaly_cooldown_after_consecutive: 5
+  payload_anomaly_cooldown_base_seconds: 600
+  payload_anomaly_cooldown_increment_seconds: 600
+  payload_anomaly_cooldown_max_seconds: 0
+  payload_anomaly_keeper_smoke_enabled: true
+  payload_anomaly_keeper_smoke_sample_count: 3
+  payload_anomaly_keeper_smoke_page: 1
   sleep_between_queries_ms: 2500
   stop_on_empty_page: true
   raw_pages_subdir: pages

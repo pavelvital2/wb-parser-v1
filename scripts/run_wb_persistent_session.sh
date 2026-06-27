@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROJECT_DIR="/home/pavel/projects/parser_wb"
+PYTHON_BIN="/home/Codex/agent-tools/parser_wb-python/bin/python"
+CONFIG_FILE="$PROJECT_DIR/config/config.yaml"
+COOKIE_FILE="$PROJECT_DIR/config/wb_cookie.txt"
+RUNTIME_ENV_FILE="$PROJECT_DIR/config/runtime.env"
+SESSION_SCRIPT="$PROJECT_DIR/scripts/wb_persistent_session.py"
+LOCK_FILE="$PROJECT_DIR/state/locks/wb_persistent_session.flock"
+LOG_FILE="$PROJECT_DIR/data/logs/wb_persistent_session.log"
+
+mkdir -p "$PROJECT_DIR/data/logs" "$PROJECT_DIR/state/locks"
+exec >> "$LOG_FILE" 2>&1
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "$(date --iso-8601=seconds) wb persistent session skipped: previous session is still active"
+  exit 75
+fi
+
+cd "$PROJECT_DIR"
+
+if [[ -r "$RUNTIME_ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$RUNTIME_ENV_FILE"
+  set +a
+fi
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "$(date --iso-8601=seconds) python runtime is not executable: $PYTHON_BIN"
+  exit 2
+fi
+
+if [[ ! -r "$SESSION_SCRIPT" ]]; then
+  echo "$(date --iso-8601=seconds) persistent session script is not readable: $SESSION_SCRIPT"
+  exit 2
+fi
+
+if [[ ! -s "$COOKIE_FILE" ]]; then
+  echo "$(date --iso-8601=seconds) WB cookie file is missing or empty: $COOKIE_FILE"
+  exit 2
+fi
+
+export WB_COOKIE_FILE="$COOKIE_FILE"
+export PYTHONUNBUFFERED=1
+
+echo "$(date --iso-8601=seconds) wb persistent session started"
+"$PYTHON_BIN" "$SESSION_SCRIPT" \
+  --config "$CONFIG_FILE" \
+  --cookie-file "$COOKIE_FILE" \
+  --heartbeat-seconds "${PARSER_WB_BROWSER_HEARTBEAT_SECONDS:-300}" \
+  --wait-ms "${PARSER_WB_BROWSER_WAIT_MS:-5000}" \
+  --timeout-ms "${PARSER_WB_BROWSER_TIMEOUT_MS:-45000}"
+status=$?
+echo "$(date --iso-8601=seconds) wb persistent session finished: status=$status"
+exit "$status"

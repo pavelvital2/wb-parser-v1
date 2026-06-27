@@ -33,7 +33,7 @@ class SellerSeed:
 class RetryableHttpStatusError(requests.RequestException):
     def __init__(self, response: requests.Response) -> None:
         self.response = response
-        super().__init__(f"HTTP {response.status_code}")
+        super().__init__(f"HTTP {response.status_code}", response=response)
 
 
 def _as_path(project_root: Path, value: str) -> Path:
@@ -335,6 +335,21 @@ class SellersEngine:
         except ValueError:
             return str(file_path)
 
+    def _close_retry_response(self, attempt: int, delay: float, exc: Exception) -> None:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            response.close()
+        self.logger.warning(
+            "retry_scheduled",
+            extra={
+                "attempt": attempt,
+                "max_attempts": self.config.runtime.retry_max_attempts,
+                "delay_seconds": round(delay, 3),
+                "error_class": exc.__class__.__name__,
+                "error_message": str(exc),
+            },
+        )
+
     def _fetch_seller(
         self,
         session: requests.Session | None,
@@ -363,26 +378,33 @@ class SellersEngine:
                 base_delay=self.config.runtime.retry_base_delay_seconds,
                 max_delay=self.config.runtime.retry_max_delay_seconds,
                 retriable_exceptions=(requests.RequestException,),
+                on_retry=self._close_retry_response,
             )
         except RetryableHttpStatusError as exc:
             response = exc.response
-            raw_file = self._write_raw_response(seller_id=seller_id, content=response.content)
-            return response.status_code, None, f"http_{response.status_code}: {(response.text or '').strip()[:500]}", raw_file
+            try:
+                raw_file = self._write_raw_response(seller_id=seller_id, content=response.content)
+                return response.status_code, None, f"http_{response.status_code}: {(response.text or '').strip()[:500]}", raw_file
+            finally:
+                response.close()
         except Exception as exc:
             return 0, None, f"request_failed: {exc}", ""
 
-        raw_file = self._write_raw_response(seller_id=seller_id, content=response.content)
-
-        if response.status_code != 200:
-            return response.status_code, None, f"http_{response.status_code}: {(response.text or '').strip()[:500]}", raw_file
-
         try:
-            payload = response.json()
-            if not isinstance(payload, dict):
-                return response.status_code, None, "json_payload_not_object", raw_file
-            return response.status_code, payload, "", raw_file
-        except Exception as exc:
-            return response.status_code, None, f"json_decode_failed: {exc}", raw_file
+            raw_file = self._write_raw_response(seller_id=seller_id, content=response.content)
+
+            if response.status_code != 200:
+                return response.status_code, None, f"http_{response.status_code}: {(response.text or '').strip()[:500]}", raw_file
+
+            try:
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    return response.status_code, None, "json_payload_not_object", raw_file
+                return response.status_code, payload, "", raw_file
+            except Exception as exc:
+                return response.status_code, None, f"json_decode_failed: {exc}", raw_file
+        finally:
+            response.close()
 
     def _seller_row(
         self,
@@ -485,7 +507,6 @@ class SellersEngine:
             "product_run_id",
         ]
         return base_fields, base_fields, mart_fields, bridge_fields
-
 
 
 

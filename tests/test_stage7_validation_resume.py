@@ -266,7 +266,7 @@ def test_partial_status_set_correctly_for_non_critical(tmp_path: Path, monkeypat
     monkeypatch.setattr(runner_mod, "_dispatch_component", _raise_non_critical)
 
     code = runner_mod.run_component(cfg, db, target="serp")
-    assert code == 0
+    assert code == 1
 
     run = db.list_runs(limit=1)[0]
     assert run["status"] == "partial"
