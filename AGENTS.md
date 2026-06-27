@@ -155,12 +155,29 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   `wb_persistent_session` only when the session is missing, heartbeat is stale
   for more than `PARSER_WB_WATCHDOG_MAX_AGE_SECONDS` (default `900`), state is
   unreadable, or at least `PARSER_WB_WATCHDOG_BAD_HEARTBEATS` new failed
-  heartbeats are observed (default `2`). The watchdog must persist
+  heartbeats are observed (default `1`). The watchdog must persist
   `last_seen_checked_at_utc` in `state/wb_persistent_session/watchdog.json`;
   otherwise one unchanged failed heartbeat can be counted repeatedly by the
   minute cron loop. Restart cooldown defaults to `600` seconds. Logs:
   `data/logs/wb_persistent_watchdog.log`; state:
   `state/wb_persistent_session/watchdog.json`.
+- On 2026-06-27, automatic WB persistent profile reset escalation was added to
+  the watchdog. After the first new failed HTTP `498`/anti-bot heartbeat, it may
+  replace `state/browser/wb_persistent_profile` only when the latest failure is
+  a reset candidate such as HTTP `498`/anti-bot, current `config/wb_cookie.txt`
+  passes keeper SERP smoke, and an isolated clean desktop profile seeded with
+  the same cookies returns `HTTP 200`, `antibot=false`. When all gates pass,
+  watchdog stops `wb_persistent_session`, archives the old profile as
+  `state/browser/wb_persistent_profile.profile_reset_*`, removes stale
+  `state/browser/wb_storage_state.json`, moves the verified clean profile into
+  place, and restarts tmux. Defaults: enabled, reset HTTP statuses `498`,
+  profile-reset cooldown `3600` seconds. State fields include
+  `profile_reset_status`, `profile_reset_reason`,
+  `profile_reset_archived_profile`, and `last_profile_reset_utc`. Do not reset a
+  profile merely because of one mobile-proxy IP rotation or non-498 failed
+  heartbeat. If the isolated clean profile also returns HTTP `498`/anti-bot,
+  watchdog records `profile_reset_skipped` and does not restart the same stale
+  profile as a repair.
 - On 2026-06-27, isolated WB Android-like persistent browser experiments were
   run through the same mobile proxy after the desktop-like persistent browser
   entered HTTP 498 anti-bot. `scripts/wb_persistent_session.py` now has opt-in
@@ -188,6 +205,12 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   restarted persistent session produced `status=ok`, `http_status=200`,
   `antibot=false`, `cookie_count=10`, `promoted=true`. A follow-up
   `run_wb_nightly_preflight.sh` also passed and saved a known-good backup.
+- On 2026-06-27, a second manual reset using the current working cookies also
+  worked without fresh user cookies: an isolated clean desktop profile returned
+  `HTTP 200`, `antibot=false`, `cookie_count=10`; after replacing
+  `state/browser/wb_persistent_profile`, the restarted persistent session
+  returned `HTTP 200`, `antibot=false`, `cookie_count=10`, `promoted=true`.
+  This verified the automatic profile reset escalation conditions.
 - Proactive WB cookie renewal is scheduled through the user's crontab every
   30 minutes at minutes `7` and `37`: `7,37 * * * * /home/pavel/projects/parser_wb/scripts/run_wb_cookie_renewal.sh`
   with output appended to `data/logs/wb_cookie_renewal.log`. The renewal wrapper
