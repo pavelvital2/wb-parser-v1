@@ -13,6 +13,7 @@ import csv
 import html
 import json
 import os
+import sys
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -28,6 +29,11 @@ SELLERS_FILE = PROJECT_DIR / "data/marts/sellers/latest/sellers_daily.csv"
 BRIDGE_FILE = PROJECT_DIR / "data/marts/sellers/latest/seller_query_product_bridge.csv"
 QUERIES_FILE = PROJECT_DIR / "exports/queries.txt"
 WAREHOUSE_STATE_FILE = PROJECT_DIR / "state/wb_warehouse/latest.json"
+RUN_REPORT_FILE = PROJECT_DIR / "state/run_reports/latest.json"
+KEEPER_STATE_FILE = PROJECT_DIR / "state/wb_session_keeper/latest.json"
+PREFLIGHT_STATE_FILE = PROJECT_DIR / "state/wb_nightly_preflight/latest.json"
+WATCHDOG_STATE_FILE = PROJECT_DIR / "state/wb_persistent_session/watchdog.json"
+PERSISTENT_SESSION_STATE_FILE = PROJECT_DIR / "state/wb_persistent_session/latest.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -144,13 +150,24 @@ def count_queries(path: Path) -> int | None:
     return count
 
 
+def first_csv_value(path: Path, column: str) -> str:
+    if not path.exists():
+        return ""
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter=";")
+        for row in reader:
+            return str(row.get(column) or "")
+    return ""
+
+
 def file_label(path: Path) -> str:
     if not path.exists():
         return f"{path} (нет файла)"
     return f"{path} ({path.stat().st_size:,} bytes)".replace(",", " ")
 
 
-def warehouse_status_label(path: Path = WAREHOUSE_STATE_FILE) -> str:
+def warehouse_status_label(path: Path | None = None) -> str:
+    path = path or WAREHOUSE_STATE_FILE
     data = load_json(path)
     if not data:
         return "нет state"
@@ -163,6 +180,143 @@ def warehouse_status_label(path: Path = WAREHOUSE_STATE_FILE) -> str:
     if reason:
         return f"{status} ({reason})"
     return status
+
+
+def state_status_label(path: Path, *, success_key: str = "successes", min_key: str = "min_successes") -> str:
+    data = load_json(path)
+    if not data:
+        return "нет state"
+    status = str(data.get("status") or "unknown")
+    checked_at = str(data.get("checked_at_utc") or "")
+    successes = maybe_int(data.get(success_key))
+    min_successes = maybe_int(data.get(min_key))
+    parts = [status]
+    if successes is not None and min_successes is not None:
+        parts.append(f"{successes}/{min_successes}")
+    if checked_at:
+        parts.append(checked_at)
+    return ", ".join(parts)
+
+
+def preflight_label(path: Path | None = None) -> str:
+    path = path or PREFLIGHT_STATE_FILE
+    data = load_json(path)
+    if not data:
+        return "нет state"
+    status = str(data.get("status") or "unknown")
+    checked_at = str(data.get("checked_at_utc") or "")
+    actions = data.get("actions") if isinstance(data.get("actions"), list) else []
+    safe_actions = ", ".join(str(item) for item in actions[:3])
+    parts = [status]
+    if checked_at:
+        parts.append(checked_at)
+    if safe_actions:
+        parts.append(safe_actions)
+    return ", ".join(parts)
+
+
+def run_report_label(path: Path | None = None) -> str:
+    path = path or RUN_REPORT_FILE
+    data = load_json(path)
+    if not data:
+        return "нет report"
+    run_id = str(data.get("run_id") or "")
+    pipeline = str(data.get("pipeline") or "")
+    status = str(data.get("status") or "unknown")
+    duration = maybe_int(data.get("duration_seconds"))
+    parts = [item for item in (pipeline, status, run_id) if item]
+    if duration is not None:
+        parts.append(f"{duration}s")
+    return ", ".join(parts) if parts else status
+
+
+def serp_pages_health_label(path: Path | None = None) -> str:
+    path = path or SERP_PAGES_FILE
+    if not path.exists():
+        return "нет файла"
+    total = 0
+    by_status: dict[str, int] = {}
+    by_http: dict[str, int] = {}
+    run_id = ""
+    queries: set[str] = set()
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter=";")
+        for row in reader:
+            total += 1
+            run_id = run_id or str(row.get("run_id") or "")
+            status = str(row.get("status") or "unknown")
+            by_status[status] = by_status.get(status, 0) + 1
+            http_status = str(row.get("http_status") or "")
+            if http_status:
+                by_http[http_status] = by_http.get(http_status, 0) + 1
+            query = str(row.get("query") or "")
+            if query:
+                queries.add(query)
+    if total == 0:
+        return "0 pages"
+    success = by_status.get("success", 0)
+    errors = by_status.get("error", 0)
+    empty = by_status.get("empty", 0)
+    rate_429 = by_http.get("429", 0)
+    anti_498 = by_http.get("498", 0)
+    return (
+        f"run={run_id or 'unknown'}, pages={total}, queries={len(queries)}, "
+        f"success={success}, empty={empty}, errors={errors}, 429={rate_429}, 498={anti_498}"
+    )
+
+
+def latest_publication_label() -> str:
+    product_run = first_csv_value(PRODUCTS_FILE, "run_id")
+    seller_run = first_csv_value(SELLERS_FILE, "run_id")
+    if product_run and seller_run:
+        return f"published, products_run={product_run}, sellers_run={seller_run}"
+    if product_run:
+        return f"partial, products_run={product_run}, sellers latest missing"
+    if seller_run:
+        return f"partial, products latest missing, sellers_run={seller_run}"
+    return "нет latest"
+
+
+def browser_health_label(
+    watchdog_path: Path | None = None,
+    session_path: Path | None = None,
+) -> str:
+    watchdog_path = watchdog_path or WATCHDOG_STATE_FILE
+    session_path = session_path or PERSISTENT_SESSION_STATE_FILE
+    watchdog = load_json(watchdog_path)
+    session = load_json(session_path)
+    if not watchdog and not session:
+        return "нет state"
+    action = str(watchdog.get("action") or "")
+    reason = str(watchdog.get("reason") or "")
+    session_status = str(session.get("status") or "")
+    http_status = str(session.get("http_status") or "")
+    antibot = session.get("antibot")
+    parts = []
+    if action:
+        parts.append(action)
+    if reason:
+        parts.append(reason)
+    if session_status:
+        parts.append(f"session={session_status}")
+    if http_status:
+        parts.append(f"http={http_status}")
+    if antibot is not None:
+        parts.append(f"antibot={str(bool(antibot)).lower()}")
+    return ", ".join(parts) if parts else "unknown"
+
+
+def health_lines() -> list[str]:
+    return [
+        "",
+        "<b>Health</b>",
+        f"WB API smoke: <code>{html.escape(state_status_label(KEEPER_STATE_FILE))}</code>",
+        f"Preflight: <code>{html.escape(preflight_label())}</code>",
+        f"SERP latest: <code>{html.escape(serp_pages_health_label())}</code>",
+        f"Latest: <code>{html.escape(latest_publication_label())}</code>",
+        f"Run report: <code>{html.escape(run_report_label())}</code>",
+        f"Browser channel: <code>{html.escape(browser_health_label())}</code>",
+    ]
 
 
 def parse_dt(value: str) -> datetime | None:
@@ -227,6 +381,7 @@ def build_message(args: argparse.Namespace) -> str:
         f"Продавцов: <b>{fmt_count(sellers)}</b>",
         f"Связок товар-продавец: <b>{fmt_count(bridge)}</b>",
         f"Warehouse: <b>{html.escape(warehouse_status_label())}</b>",
+        *health_lines(),
         "",
         f"Лог: <code>{html.escape(args.log_path)}</code>",
         f"Товары: <code>{html.escape(file_label(PRODUCTS_FILE))}</code>",

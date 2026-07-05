@@ -223,10 +223,17 @@ send a Telegram summary to the `parser_wb` topic. The notification reports run
 status, duration, query count, product rows from
 `data/marts/serp/latest/products_daily.csv`, seller rows from
 `data/marts/sellers/latest/sellers_daily.csv`, bridge rows from
-`data/marts/sellers/latest/seller_query_product_bridge.csv`, and the cron log
-path. Notification errors are intentionally ignored by the wrapper so Telegram
-problems do not change parser exit status. Use `PARSER_WB_NOTIFY_DISABLED=1` to
-skip notification during manual tests.
+`data/marts/sellers/latest/seller_query_product_bridge.csv`, warehouse status,
+and the cron log path.
+
+The same Telegram message includes a local-only health block. It reads existing
+state files and CSV indexes; it does not call Wildberries and does not print
+cookies, request headers, proxy credentials, or browser storage state. The block
+summarizes WB API smoke, nightly preflight state, SERP latest page status counts
+including HTTP `429`/`498`, latest publication run ids, latest run report, and
+the persistent-browser/watchdog state. Notification errors are intentionally
+ignored by the wrapper so Telegram problems do not change parser exit status.
+Use `PARSER_WB_NOTIFY_DISABLED=1` to skip notification during manual tests.
 
 ### systemd timer note
 - Create two services calling the same commands.
