@@ -68,6 +68,66 @@ Read-only SQL:
   "select query, count(*) from query_positions group by query order by 2 desc limit 10"
 ```
 
+## Parser Data API
+
+Seller VPS agents должны читать warehouse через read-only Parser Data API, а не
+копировать `data/warehouse` или сырые parser datasets:
+
+```text
+http://127.0.0.1:8787
+```
+
+Базовые read-only endpoints:
+
+```text
+GET /warehouse/wb/summary
+GET /warehouse/wb/query-positions
+GET /warehouse/wb/daily-changes
+GET /warehouse/wb/top-movers
+GET /warehouse/wb/seller-changes
+GET /warehouse/wb/run-quality
+```
+
+Агрегированные endpoints для компактной аналитики:
+
+```text
+GET /warehouse/wb/aggregates/store-query-positions
+GET /warehouse/wb/aggregates/visibility-gaps
+GET /warehouse/wb/aggregates/query-coverage
+GET /warehouse/wb/aggregates/competitors-top
+GET /warehouse/wb/aggregates/top-movers
+GET /warehouse/wb/aggregates/seo-visibility-candidates
+GET /warehouse/wb/aggregates/promotion-visibility-candidates
+GET /warehouse/wb/aggregates/market-summary
+```
+
+Правила API:
+
+- API остается read-only и не пишет в warehouse.
+- Если `supplier_id`, `product_id`/`nmID` или `brand` не переданы, агрегаты
+  возвращают market-level аналитику.
+- Parser Data API не содержит hardcoded ownership logic для конкретных
+  магазинов или брендов.
+- `total_quantity` - parser-visible stock из WB выдачи, не официальные остатки.
+- SEO/promotion candidates являются parser-side shortlist; продажи, маржа,
+  официальный stock, campaign state и эффективность рекламы должны
+  присоединяться на Seller VPS из seller-side источников.
+
+Planned P1 агрегаты:
+
+```text
+GET /warehouse/wb/aggregates/product-position-history
+GET /warehouse/wb/aggregates/query-product-matrix
+GET /warehouse/wb/aggregates/price-position-map
+GET /warehouse/wb/aggregates/rating-review-gaps
+GET /warehouse/wb/aggregates/brand-supplier-share
+GET /warehouse/wb/aggregates/new-lost-top
+GET /warehouse/wb/aggregates/serp-volatility
+GET /warehouse/wb/aggregates/niche-opportunities
+GET /warehouse/wb/aggregates/content-proxy-gaps
+GET /warehouse/wb/aggregates/query-discovery
+```
+
 Safe refresh wrapper:
 
 ```bash
