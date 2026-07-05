@@ -11,6 +11,7 @@ LOG_FILE="$PROJECT_DIR/data/logs/cron_products_sellers.log"
 NOTIFY_SCRIPT="$PROJECT_DIR/scripts/notify_products_sellers_daily.py"
 KEEPER_SCRIPT="$PROJECT_DIR/scripts/wb_cookie_keeper.py"
 PREFLIGHT_SCRIPT="$PROJECT_DIR/scripts/wb_nightly_preflight.py"
+WAREHOUSE_REFRESH_SCRIPT="$PROJECT_DIR/scripts/run_wb_warehouse_refresh.sh"
 STARTED_AT="$(date --iso-8601=seconds)"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S%z)"
 SERP_MAX_ATTEMPTS="${PARSER_WB_SERP_MAX_ATTEMPTS:-2}"
@@ -135,5 +136,13 @@ if (( serp_status != 0 )); then
 fi
 
 "$PYTHON_BIN" main.py --config "$CONFIG_FILE" run sellers --job-id "scheduled_sellers_${RUN_STAMP}"
+
+if [[ "${PARSER_WB_WAREHOUSE_REFRESH_DISABLED:-0}" != "1" && -x "$WAREHOUSE_REFRESH_SCRIPT" ]]; then
+  warehouse_status=0
+  PARSER_WB_WAREHOUSE_ALLOW_ACTIVE_DAILY=1 "$WAREHOUSE_REFRESH_SCRIPT" || warehouse_status=$?
+  if (( warehouse_status != 0 )); then
+    echo "$(date --iso-8601=seconds) warehouse_failed: exit_status=$warehouse_status"
+  fi
+fi
 
 echo "$(date --iso-8601=seconds) products+sellers daily finished: stamp=$RUN_STAMP"

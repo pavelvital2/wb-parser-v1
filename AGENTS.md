@@ -15,6 +15,11 @@ Global priorities for all roles:
 - minimal safe changes over broad refactoring;
 - preserve architecture, contracts, and repository conventions;
 - do not invent facts, causes, execution results, or test outcomes.
+- if the owner and coordinating agent assign this project agent as the
+  executor, treat outside changes as draft input, review them, and complete the
+  work inside the project context;
+- if another agent is assigned as architect/reviewer/controller, do not let that
+  agent silently become the implementer without explicit owner approval.
 
 If something was not verified, say so explicitly.
 
@@ -48,6 +53,19 @@ If something was not verified, say so explicitly.
 
 ---
 
+## Hermes Summary Rule
+
+- После каждой значимой завершенной задачи агент, который выполнял работу,
+  обязан сам сохранить компактное Hermes summary без секретов.
+- Raw transcript не считается заменой summary.
+- Summary должно фиксировать цель, результат, принятые решения, затронутые
+  файлы/сервисы, выполненную проверку, оставшиеся риски или открытые вопросы.
+- Нельзя сохранять в summary cookies, токены, пароли, raw logs, auth headers,
+  персональные данные покупателей, `storage_state` или другие секреты.
+- Если задача изменила устойчивое правило, workflow, skill или runbook, агент
+  должен обновить соответствующий постоянный документ и затем сохранить Hermes
+  summary с ссылкой на измененные файлы.
+
 ## Repository truth sources
 If present, read and follow these files before making decisions:
 
@@ -70,6 +88,59 @@ These notes capture verified decisions needed to keep the Linux workspace
 operable. Preserve them unless the user explicitly changes the operating mode.
 
 - The active workspace is `/home/pavel/projects/parser_wb`.
+- 2026-07-02 Parser VPS GSM proxy format: load `/home/pavel/.marketplace-proxy.env`. Use `MARKETPLACE_PROXY_URL` / `socks5h://100.65.95.2:1080` for curl/requests-style clients that support SOCKS remote DNS. For Chromium/Playwright `proxy.server`, use `MARKETPLACE_BROWSER_PROXY_URL` / `socks5://100.65.95.2:1080` or fallback `socks5://127.0.0.1:1080`; Chromium rejects `socks5h://` with `ERR_NO_SUPPORTED_PROXIES`. Verified browser smoke to `https://api.ipify.org` returned GSM IP `217.118.78.56`.
+- 2026-07-02 `PySocks 1.7.1` is installed in centralized `/home/Codex/agent-tools/parser_wb-python`, so Python `requests` in parser_wb can use `socks5h://` proxies. Verified neutral smoke: `requests.get("https://api.ipify.org", proxies={...})` through `socks5h://100.65.95.2:1080` returned GSM IP `217.118.78.56`. Do not switch production `PARSER_WB_PROXY_URL` from the existing HTTP proxy to the GSM SOCKS proxy without owner approval.
+- 2026-07-02 Local HTTP/CONNECT proxy bridge is available at `http://127.0.0.1:18080` via `marketplace-http-proxy.service`. It supports HTTP proxy requests and HTTPS CONNECT, then forwards through GSM SOCKS. Use it for tools that require an HTTP proxy URL. Verified neutral smokes through curl, Python requests, and Playwright returned GSM IP `217.118.78.56`. Do not switch production `PARSER_WB_PROXY_URL` to it without owner approval.
+- 2026-07-02 External authenticated proxy for owner WB cookie collection is available on Parser VPS: HTTP `23.26.193.117:31080`, HTTPS/CONNECT `23.26.193.117:31443`, SOCKS5 `23.26.193.117:31085`; service `marketplace-external-proxy.service`; logs `/var/log/marketplace-external-proxy/proxy.log`. Credentials live only in root-only `/etc/marketplace-external-proxy.env`; do not print, store, or commit them.
+- 2026-07-02 Direct Windows 3proxy for owner WB cookie collection is available through Gleb's router: HTTP `178.215.153.53:31080`, HTTPS/CONNECT `178.215.153.53:31443`, SOCKS5 `178.215.153.53:31085`. Router virtual-server rules forward to Windows `192.168.0.138`; Windows scheduled task `Gleb3proxy`; config `C:\Proxy\3proxy\3proxy.cfg`; logs `C:\Proxy\3proxy\logs\`. Router admin ports `80` and `443` must remain unchanged. The proxy requires username/password auth and exits through GSM; verified from Seller VPS on 2026-07-02 with `api.ipify.org`, all modes returned `217.118.78.56`. Do not print, store, or commit credentials.
+- 2026-07-04 Current WB steady-state channel is direct Windows 3proxy plus
+  secret Opera-derived API headers. Runtime `config/runtime.env` must source
+  `/home/pavel/.marketplace-proxy.env`, set `PARSER_WB_PROXY_URL` from the
+  direct HTTP proxy, set `PARSER_WB_REQUEST_HEADERS_FILE` to ignored mode-`600`
+  `config/wb_request_headers.json`, set `PARSER_WB_COOKIE_RENEW_COMMAND=ensure`,
+  and keep stale rotate hooks disabled. Do not print or commit the proxy
+  credentials or header values. Verification: keeper smoke through
+  `config/config.yaml` returned `3/3` HTTP 200 product responses via direct
+  3proxy; preflight passed and saved known-good backup. A clean Playwright
+  browser profile through the same proxy returned WB HTML `HTTP 498`, so
+  `PARSER_WB_PERSISTENT_WATCHDOG_ENABLED=0` is intentional for this runtime and
+  the persistent browser must not be treated as the hard gate for SERP.
+- 2026-07-04 WB direct-3proxy fallback channel was verified as not depending on
+  `config/wb_cookie.txt` for SERP page-1 smoke when Opera-derived API headers
+  are present: `wb_cookie_keeper.py smoke --without-cookie --sample-count 3`
+  returned `3/3` HTTP 200 product responses through `search.wb.ru`. Without the
+  secret API headers, the same fallback returned HTTP `429`. Runtime therefore
+  sets `PARSER_WB_COOKIE_REQUIRED=0` and `PARSER_WB_COOKIELESS_FALLBACK_OK=1`:
+  cookies remain preferred, but an expired or missing cookie file must not be
+  treated as a hard collection failure while the header+fallback smoke passes.
+  This is a stable collection fallback, not a proven browser cookie renewal
+  path; clean Playwright and Opera cURL replay through the same proxy still
+  returned WB HTML/API `HTTP 498` with no `Set-Cookie`.
+- On 2026-07-04, a fresh Chromium Copy-as-cURL WB internal API request was
+  accepted as an API-header and cookie refresh source after validation. The
+  file had no `-H Cookie` header, but did contain a `-b` cookie string directly
+  after the `authorization` header. Safe sequence: chmod the attached curl file
+  to `600`, parse non-cookie request headers and the `-b` cookie string without
+  printing values, save them to ignored mode-`600` candidates under
+  `state/wb_header_candidates/` and `state/wb_cookie_candidates/`, verify keeper
+  smoke and `--without-cookie` smoke return `3/3` HTTP 200 product responses,
+  then back up and replace ignored `config/wb_request_headers.json` and
+  `config/wb_cookie.txt`. The direct replay of the
+  `www.wildberries.ru/__internal...` URL still returned HTTP `498` with no
+  `Set-Cookie`, so this refreshes the provided API headers/cookie pair, not an
+  autonomous browser cookie renewal path.
+- On 2026-07-05, WB warehouse safe refresh was connected after the successful
+  nightly `serp -> sellers` wrapper. Runtime script:
+  `scripts/run_wb_warehouse_refresh.sh`; state:
+  `state/wb_warehouse/latest.json`; history: `state/wb_warehouse/history/`;
+  log: `data/logs/wb_warehouse_refresh.log`; lock:
+  `state/locks/wb_warehouse_refresh.flock`. It validates
+  `state/run_reports/latest.json` for successful `sellers`, then runs
+  `scripts/wb_warehouse.py build` and `check`. It writes only under
+  `data/warehouse/wb`, `state/wb_warehouse`, and `data/logs`; it must not touch
+  Ozon, cron, proxy, cookies, `runtime.env`, request headers, parser `latest`,
+  or raw/staging/marts retention. Warehouse failure is non-fatal for parser
+  publication and must be reported separately as `warehouse_failed`.
 - Use the centralized runtime `/home/Codex/agent-tools/parser_wb-python`.
 - Agents must not install tools or dependencies themselves. If a dependency is
   missing, report the requirement for centralized installation.
@@ -220,13 +291,18 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   `serp.error_ip_rotation_max_attempts=1`; this prevents infinite loops while
   preserving resume/checkpoint behavior. Keep the rotate API URL only in
   ignored `config/runtime.env`; do not print or commit it.
-- Proactive WB cookie renewal is scheduled through the user's crontab every
+- WB cookie/access maintenance is scheduled through the user's crontab every
   30 minutes at minutes `7` and `37`: `7,37 * * * * /home/pavel/projects/parser_wb/scripts/run_wb_cookie_renewal.sh`
-  with output appended to `data/logs/wb_cookie_renewal.log`. The renewal wrapper
-  runs `wb_cookie_keeper.py renew`, which refreshes into temporary cookie and
-  storage_state files, smoke-tests the temporary cookie, and promotes it only
-  after successful smoke. This prevents overwriting working cookies with a bad
-  one-cookie Playwright refresh.
+  with output appended to `data/logs/wb_cookie_renewal.log`. Current direct
+  3proxy runtime uses `PARSER_WB_COOKIE_RENEW_COMMAND=ensure`, so the wrapper
+  validates the current cookie with SERP/API smoke first and only attempts
+  browser refresh if smoke fails. A refreshed temporary cookie is promoted only
+  after smoke and HTML anti-bot gates pass; otherwise the existing
+  `config/wb_cookie.txt` is left unchanged. This prevents the currently blocked
+  Playwright browser path from overwriting a working API cookie/header contour.
+  If renewal fails but `PARSER_WB_COOKIELESS_FALLBACK_OK=1`, the wrapper checks
+  `wb_cookie_keeper.py smoke --without-cookie`; if that smoke passes, the
+  collection channel is considered alive and the cookie file is left unchanged.
 - The Linux wrapper scripts load optional ignored `config/runtime.env` if it
   exists. Use this file or scheduler environment for runtime secrets such as
   `PARSER_WB_PROXY_URL`; keep it mode `600` and never commit or print values.

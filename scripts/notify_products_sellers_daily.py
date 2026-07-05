@@ -27,6 +27,7 @@ SERP_PAGES_FILE = PROJECT_DIR / "data/raw/serp/latest/pages_raw_index.csv"
 SELLERS_FILE = PROJECT_DIR / "data/marts/sellers/latest/sellers_daily.csv"
 BRIDGE_FILE = PROJECT_DIR / "data/marts/sellers/latest/seller_query_product_bridge.csv"
 QUERIES_FILE = PROJECT_DIR / "exports/queries.txt"
+WAREHOUSE_STATE_FILE = PROJECT_DIR / "state/wb_warehouse/latest.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,6 +150,21 @@ def file_label(path: Path) -> str:
     return f"{path} ({path.stat().st_size:,} bytes)".replace(",", " ")
 
 
+def warehouse_status_label(path: Path = WAREHOUSE_STATE_FILE) -> str:
+    data = load_json(path)
+    if not data:
+        return "нет state"
+    status = str(data.get("status") or "unknown")
+    reason = str(data.get("reason") or "")
+    rows = data.get("warehouse", {}).get("rows", {}) if isinstance(data.get("warehouse"), dict) else {}
+    product_rows = rows.get("product_snapshots") if isinstance(rows, dict) else None
+    if product_rows is not None:
+        return f"{status} ({reason}), product_snapshots={fmt_count(maybe_int(product_rows))}"
+    if reason:
+        return f"{status} ({reason})"
+    return status
+
+
 def parse_dt(value: str) -> datetime | None:
     if not value or value == "unknown":
         return None
@@ -210,6 +226,7 @@ def build_message(args: argparse.Namespace) -> str:
         f"SERP-страниц: <b>{fmt_count(serp_pages)}</b>",
         f"Продавцов: <b>{fmt_count(sellers)}</b>",
         f"Связок товар-продавец: <b>{fmt_count(bridge)}</b>",
+        f"Warehouse: <b>{html.escape(warehouse_status_label())}</b>",
         "",
         f"Лог: <code>{html.escape(args.log_path)}</code>",
         f"Товары: <code>{html.escape(file_label(PRODUCTS_FILE))}</code>",
