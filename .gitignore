@@ -32,10 +32,14 @@ env/
 .env.*
 !.env.example
 config/runtime.env
+config/runtime.env*
+config/*.secret.*
+config/*secret*
 config/*request_headers*.json
 
 # Cookie / auth local files
 *cookie*.txt
+config/*cookie*
 *cookie*.txt.backup_*
 *storage_state*.json
 config/wb_cookie.txt
@@ -78,6 +82,9 @@ exports/
 *.log
 *.tmp
 *.bak
+AGENTS.md.bak*
+docs/*handoff*
+docs/*task_handoff*
 
 # ------------------------------
 # OS / editor files

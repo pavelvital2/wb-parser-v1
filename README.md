@@ -121,6 +121,28 @@ Dry-run / job-id:
 py main.py --config config/config.yaml run serp --dry-run --job-id manual_check
 ```
 
+## Local Pre-Push Check (Linux VPS)
+Before pushing parser_wb changes from `/home/pavel/projects/parser_wb`, run:
+
+```bash
+scripts/run_pre_push_check.sh
+```
+
+The check is local-only. It does not call Wildberries and does not print runtime
+secrets. It runs path safety checks, whitespace checks, shell syntax checks,
+`validate`, warehouse dry-run/check, and `pytest`.
+
+For a quick staged-path guard:
+
+```bash
+scripts/run_pre_push_check.sh --staged-only
+```
+
+The check fails if staged/tracked/untracked git-visible paths include runtime or
+secret-like files such as `state/`, `data/warehouse/`, `data/logs/`,
+`config/*cookie*`, `config/runtime.env*`, `*request_headers*`, browser
+`storage_state`, or handoff scratch files.
+
 Retention cleanup:
 ```powershell
 py main.py --config config/config.yaml cleanup

@@ -88,6 +88,13 @@ These notes capture verified decisions needed to keep the Linux workspace
 operable. Preserve them unless the user explicitly changes the operating mode.
 
 - The active workspace is `/home/pavel/projects/parser_wb`.
+- Before commit/push, run `scripts/run_pre_push_check.sh` from the project root.
+  It checks staged/tracked/untracked git-visible paths for runtime or secret-like
+  files and then runs local validation/test checks. Use
+  `scripts/run_pre_push_check.sh --staged-only` for a quick path guard. Do not
+  use this as permission to stage secrets: keep `state/`, `data/warehouse/`,
+  `data/logs/`, cookies, `runtime.env`, request headers, browser
+  `storage_state`, and handoff scratch files out of git.
 - 2026-07-02 Parser VPS GSM proxy format: load `/home/pavel/.marketplace-proxy.env`. Use `MARKETPLACE_PROXY_URL` / `socks5h://100.65.95.2:1080` for curl/requests-style clients that support SOCKS remote DNS. For Chromium/Playwright `proxy.server`, use `MARKETPLACE_BROWSER_PROXY_URL` / `socks5://100.65.95.2:1080` or fallback `socks5://127.0.0.1:1080`; Chromium rejects `socks5h://` with `ERR_NO_SUPPORTED_PROXIES`. Verified browser smoke to `https://api.ipify.org` returned GSM IP `217.118.78.56`.
 - 2026-07-02 `PySocks 1.7.1` is installed in centralized `/home/Codex/agent-tools/parser_wb-python`, so Python `requests` in parser_wb can use `socks5h://` proxies. Verified neutral smoke: `requests.get("https://api.ipify.org", proxies={...})` through `socks5h://100.65.95.2:1080` returned GSM IP `217.118.78.56`. Do not switch production `PARSER_WB_PROXY_URL` from the existing HTTP proxy to the GSM SOCKS proxy without owner approval.
 - 2026-07-02 Local HTTP/CONNECT proxy bridge is available at `http://127.0.0.1:18080` via `marketplace-http-proxy.service`. It supports HTTP proxy requests and HTTPS CONNECT, then forwards through GSM SOCKS. Use it for tools that require an HTTP proxy URL. Verified neutral smokes through curl, Python requests, and Playwright returned GSM IP `217.118.78.56`. Do not switch production `PARSER_WB_PROXY_URL` to it without owner approval.
