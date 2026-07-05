@@ -99,23 +99,6 @@ GET /warehouse/wb/aggregates/top-movers
 GET /warehouse/wb/aggregates/seo-visibility-candidates
 GET /warehouse/wb/aggregates/promotion-visibility-candidates
 GET /warehouse/wb/aggregates/market-summary
-```
-
-Правила API:
-
-- API остается read-only и не пишет в warehouse.
-- Если `supplier_id`, `product_id`/`nmID` или `brand` не переданы, агрегаты
-  возвращают market-level аналитику.
-- Parser Data API не содержит hardcoded ownership logic для конкретных
-  магазинов или брендов.
-- `total_quantity` - parser-visible stock из WB выдачи, не официальные остатки.
-- SEO/promotion candidates являются parser-side shortlist; продажи, маржа,
-  официальный stock, campaign state и эффективность рекламы должны
-  присоединяться на Seller VPS из seller-side источников.
-
-Planned P1 агрегаты:
-
-```text
 GET /warehouse/wb/aggregates/product-position-history
 GET /warehouse/wb/aggregates/query-product-matrix
 GET /warehouse/wb/aggregates/price-position-map
@@ -127,6 +110,18 @@ GET /warehouse/wb/aggregates/niche-opportunities
 GET /warehouse/wb/aggregates/content-proxy-gaps
 GET /warehouse/wb/aggregates/query-discovery
 ```
+
+Правила API:
+
+- API остается read-only и не пишет в warehouse.
+- Если `supplier_id`, `product_id`/`nmID` или `brand` не переданы, агрегаты
+  возвращают market-level аналитику.
+- Parser Data API не содержит hardcoded ownership logic для конкретных
+  магазинов или брендов.
+- `total_quantity` - parser-visible stock из WB выдачи, не официальные остатки.
+- SEO, promotion, content и niche endpoints являются parser-side shortlist;
+  продажи, маржа, официальный stock, campaign state, спрос и эффективность
+  рекламы должны присоединяться на Seller VPS из seller-side источников.
 
 Safe refresh wrapper:
 
