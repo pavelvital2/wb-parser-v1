@@ -52,6 +52,18 @@ def _as_path(project_root: Path, value: str) -> Path:
     return path
 
 
+def _request_headers_from_config(raw_value: Any) -> dict[str, str]:
+    if not isinstance(raw_value, dict):
+        return {}
+    headers: dict[str, str] = {}
+    for name, value in raw_value.items():
+        header_name = str(name or "").strip()
+        if not header_name or value is None:
+            continue
+        headers[header_name] = str(value)
+    return headers
+
+
 def _max_error_ratio(config: AppConfig) -> float | None:
     value = config.raw.get("validation", {}).get("max_error_ratio", {}).get(COMPONENT_SERP)
     if value is None:
@@ -97,6 +109,8 @@ class SerpEngine:
         self.user_agent = str(self.serp_cfg.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"))
         self.referer_base = str(self.serp_cfg.get("referer_base", "https://www.wildberries.ru/catalog/0/search.aspx?search="))
         self.x_requested_with = str(self.serp_cfg.get("x_requested_with", "XMLHttpRequest"))
+        self.request_headers = _request_headers_from_config(self.serp_cfg.get("request_headers"))
+        self.cookie_required = self._resolve_cookie_required()
 
         self.pages_per_query = int(self.serp_cfg.get("pages_per_query", 10))
         self.page_size = int(self.serp_cfg.get("page_size", 100))
@@ -458,14 +472,15 @@ class SerpEngine:
 
     def _build_session(self, cookie_value: str) -> requests.Session:
         session = requests.Session()
-        session.headers.update(
-            {
-                "user-agent": self.user_agent,
-                "x-requested-with": self.x_requested_with,
-                "accept": "application/json, text/plain, */*",
-                "cookie": cookie_value,
-            }
-        )
+        headers = {
+            "user-agent": self.user_agent,
+            "x-requested-with": self.x_requested_with,
+            "accept": "application/json, text/plain, */*",
+        }
+        headers.update(self.request_headers)
+        if cookie_value:
+            headers["cookie"] = cookie_value
+        session.headers.update(headers)
         if self.proxy_url:
             session.proxies.update({"http": self.proxy_url, "https": self.proxy_url})
         return session
@@ -507,6 +522,16 @@ class SerpEngine:
             if env_value:
                 return env_value
         return str(self.serp_cfg.get("proxy_url") or "").strip()
+
+    def _resolve_cookie_required(self) -> bool:
+        env_name = str(self.serp_cfg.get("cookie_required_env") or "PARSER_WB_COOKIE_REQUIRED").strip()
+        if env_name:
+            env_value = os.getenv(env_name, "").strip().lower()
+            if env_value:
+                return env_value not in {"0", "false", "no", "off"}
+        if "cookie_required" in self.serp_cfg:
+            return bool(self.serp_cfg.get("cookie_required"))
+        return True
 
     def _resolve_error_ip_rotation_url(self) -> str:
         env_name = str(self.serp_cfg.get("error_ip_rotation_url_env") or "PARSER_WB_PROXY_ROTATE_URL").strip()
@@ -1051,9 +1076,15 @@ class SerpEngine:
 
         path = _as_path(self.config.project_root, cookie_file)
         if not path.exists():
+            if not self.cookie_required:
+                self.logger.warning("cookie_file_missing_optional", extra={"path": str(path)})
+                return ""
             raise CriticalPipelineError(f"SERP cookie file not found: {path}")
         value = path.read_text(encoding="utf-8").strip()
         if not value:
+            if not self.cookie_required:
+                self.logger.warning("cookie_file_empty_optional", extra={"path": str(path)})
+                return ""
             raise CriticalPipelineError(f"SERP cookie file is empty: {path}")
         return value
 

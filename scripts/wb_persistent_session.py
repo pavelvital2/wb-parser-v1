@@ -324,6 +324,9 @@ def main(argv: list[str] | None = None) -> int:
             launch_kwargs["proxy"] = proxy
         if args.mobile_android:
             launch_kwargs.update(android_context_options())
+        extra_headers = keeper.request_headers_from_config(config)
+        if extra_headers:
+            launch_kwargs["extra_http_headers"] = extra_headers
         context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
         try:
             if args.mobile_android:

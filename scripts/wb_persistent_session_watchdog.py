@@ -128,6 +128,10 @@ def profile_reset_enabled(value: str) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def watchdog_enabled(value: str) -> bool:
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def is_profile_reset_candidate(args: argparse.Namespace, latest: dict[str, Any]) -> bool:
     reset_statuses = parse_statuses(str(args.profile_reset_http_statuses))
     latest_http = int(latest.get("http_status") or 0)
@@ -391,6 +395,34 @@ def main(argv: list[str] | None = None) -> int:
     runner = resolve_path(args.runner)
     state_json = resolve_path(args.state_json)
     watchdog_state_path = resolve_path(args.watchdog_state)
+    if not watchdog_enabled(os.getenv("PARSER_WB_PERSISTENT_WATCHDOG_ENABLED", "1")):
+        latest = read_json(state_json)
+        state = {
+            "status": "ok",
+            "checked_at_utc": utc_now_iso(),
+            "tmux_session": args.tmux_session,
+            "session_active_before": tmux_has_session(args.tmux_session),
+            "latest_checked_at_utc": str(latest.get("checked_at_utc") or ""),
+            "last_seen_checked_at_utc": str(latest.get("checked_at_utc") or ""),
+            "heartbeat_age_seconds": None,
+            "latest_status": str(latest.get("status") or ""),
+            "latest_http_status": int(latest.get("http_status") or 0),
+            "latest_antibot": bool(latest.get("antibot")),
+            "latest_cookie_count": int(latest.get("cookie_count") or 0),
+            "consecutive_bad_heartbeats": 0,
+            "action": "disabled",
+            "reason": "disabled_by_env",
+            "profile_reset_status": "skipped",
+            "profile_reset_reason": "disabled_by_env",
+            "profile_reset_archived_profile": "",
+            "profile_reset_probe_state_json": "",
+            "last_restart_utc": "",
+            "last_profile_reset_utc": "",
+            "error_class": "",
+        }
+        write_json(watchdog_state_path, state)
+        print("watchdog status=ok action=disabled reason=disabled_by_env")
+        return 0
     previous_state = read_json(watchdog_state_path)
     latest = read_json(state_json)
     now = utc_now()

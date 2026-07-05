@@ -36,6 +36,30 @@ def test_proxy_helpers_use_env_and_prepare_requests_and_playwright(monkeypatch) 
     }
 
 
+def test_runtime_request_headers_file_merges_without_cookie(tmp_path: Path, monkeypatch) -> None:
+    keeper = _load_keeper()
+    headers_path = tmp_path / "headers.json"
+    headers_path.write_text(
+        '{"authorization":"Bearer runtime","deviceid":"device-1","cookie":"stale=1"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TEST_WB_HEADERS_FILE", str(headers_path))
+    config = {
+        "serp": {
+            "request_headers_file_env": "TEST_WB_HEADERS_FILE",
+            "request_headers": {"x-queryid": "base"},
+        }
+    }
+
+    keeper.inject_runtime_request_headers(config, tmp_path)
+
+    assert keeper.request_headers_from_config(config) == {
+        "x-queryid": "base",
+        "authorization": "Bearer runtime",
+        "deviceid": "device-1",
+    }
+
+
 def test_ensure_keeps_existing_cookie_when_refresh_smoke_fails(tmp_path: Path, monkeypatch) -> None:
     keeper = _load_keeper()
     cookie_path = tmp_path / "wb_cookie.txt"
@@ -141,6 +165,11 @@ def test_smoke_uses_fallback_urls_and_min_successes(tmp_path: Path, monkeypatch)
             "proxy_url": "http://proxy.local:3128",
             "input_files": {"queries_txt": str(queries_path)},
             "request_params": {},
+            "request_headers": {
+                "authorization": "Bearer token",
+                "deviceid": "device-1",
+                "cookie": "stale=1",
+            },
         },
     }
     args = argparse.Namespace(
@@ -163,10 +192,10 @@ def test_smoke_uses_fallback_urls_and_min_successes(tmp_path: Path, monkeypatch)
                 raise ValueError("no json")
             return self._payload
 
-    calls: list[tuple[str, str, dict[str, str] | None]] = []
+    calls: list[tuple[str, str, dict[str, str] | None, dict[str, str]]] = []
 
     def fake_get(url, *, params, headers, timeout, proxies=None):
-        calls.append((url, params["query"], proxies))
+        calls.append((url, params["query"], proxies, headers))
         if url == "https://fallback.example/search" and params["query"] == "q1":
             return Response(200, {"products": [{"name": "ok"}]})
         return Response(498, text="blocked")
@@ -175,9 +204,58 @@ def test_smoke_uses_fallback_urls_and_min_successes(tmp_path: Path, monkeypatch)
 
     assert keeper.smoke(config, args, emit=False) is True
     expected_proxy = {"http": "http://proxy.local:3128", "https": "http://proxy.local:3128"}
-    assert calls == [
+    assert [(url, query, proxy) for url, query, proxy, _headers in calls] == [
         ("https://internal.example/search", "q1", expected_proxy),
         ("https://fallback.example/search", "q1", expected_proxy),
         ("https://internal.example/search", "q2", expected_proxy),
         ("https://fallback.example/search", "q2", expected_proxy),
     ]
+    assert all(headers["authorization"] == "Bearer token" for *_prefix, headers in calls)
+    assert all(headers["deviceid"] == "device-1" for *_prefix, headers in calls)
+    assert all(headers["cookie"] == "cookie=1" for *_prefix, headers in calls)
+
+
+def test_smoke_can_check_fallback_without_cookie(tmp_path: Path, monkeypatch) -> None:
+    keeper = _load_keeper()
+    cookie_path = tmp_path / "wb_cookie.txt"
+    cookie_path.write_text("cookie=1\n", encoding="utf-8")
+
+    config = {
+        "runtime": {"http_timeout_seconds": 5},
+        "serp": {
+            "wb_cookie_file": str(cookie_path),
+            "base_url": "https://fallback.example/search",
+            "input_files": {"queries_txt": str(tmp_path / "missing.txt")},
+            "request_params": {},
+            "request_headers": {"authorization": "Bearer token"},
+        },
+    }
+    args = argparse.Namespace(
+        cookie_file=str(cookie_path),
+        state_json=str(tmp_path / "state.json"),
+        query="q1",
+        sample_count=1,
+        min_successes=1,
+        page=1,
+        without_cookie=True,
+    )
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"products": [{"name": "ok"}]}
+
+    seen_headers: list[dict[str, str]] = []
+
+    def fake_get(url, *, params, headers, timeout, proxies=None):
+        seen_headers.append(headers)
+        return Response()
+
+    monkeypatch.setattr(keeper.requests, "get", fake_get)
+
+    assert keeper.smoke(config, args, emit=False) is True
+    assert seen_headers
+    assert "cookie" not in seen_headers[0]
+    assert seen_headers[0]["authorization"] == "Bearer token"

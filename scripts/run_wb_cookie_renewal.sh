@@ -45,7 +45,7 @@ if [[ ! -r "$KEEPER_SCRIPT" ]]; then
   exit 2
 fi
 
-if [[ ! -s "$COOKIE_FILE" ]]; then
+if [[ ! -s "$COOKIE_FILE" && "${PARSER_WB_COOKIE_REQUIRED:-1}" != "0" ]]; then
   echo "$(date --iso-8601=seconds) WB cookie file is missing or empty: $COOKIE_FILE"
   exit 2
 fi
@@ -53,7 +53,7 @@ fi
 export WB_COOKIE_FILE="$COOKIE_FILE"
 
 echo "$(date --iso-8601=seconds) wb cookie renewal started"
-"$PYTHON_BIN" "$KEEPER_SCRIPT" renew \
+"$PYTHON_BIN" "$KEEPER_SCRIPT" "${PARSER_WB_COOKIE_RENEW_COMMAND:-ensure}" \
   --config "$CONFIG_FILE" \
   --cookie-file "$COOKIE_FILE" \
   --sample-count "${PARSER_WB_COOKIE_RENEW_SAMPLE_COUNT:-1}" \
@@ -61,5 +61,17 @@ echo "$(date --iso-8601=seconds) wb cookie renewal started"
   --wait-ms "${PARSER_WB_COOKIE_RENEW_WAIT_MS:-5000}" \
   --timeout-ms "${PARSER_WB_COOKIE_RENEW_TIMEOUT_MS:-45000}"
 status=$?
+if [[ "$status" -ne 0 && "${PARSER_WB_COOKIELESS_FALLBACK_OK:-0}" == "1" ]]; then
+  echo "$(date --iso-8601=seconds) wb cookie renewal failed; checking cookie-less fallback channel"
+  if "$PYTHON_BIN" "$KEEPER_SCRIPT" smoke \
+    --config "$CONFIG_FILE" \
+    --cookie-file "$COOKIE_FILE" \
+    --sample-count "${PARSER_WB_COOKIE_RENEW_SAMPLE_COUNT:-1}" \
+    --page "${PARSER_WB_COOKIE_RENEW_PAGE:-1}" \
+    --without-cookie; then
+    echo "$(date --iso-8601=seconds) wb cookie-less fallback channel ok; keeping existing cookie file unchanged"
+    status=0
+  fi
+fi
 echo "$(date --iso-8601=seconds) wb cookie renewal finished: status=$status"
 exit "$status"

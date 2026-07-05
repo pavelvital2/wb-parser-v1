@@ -144,13 +144,16 @@ serp:
 
   page_size: 100
 
-  wb_cookie_file_env: WB_COOKIE_FILE
-
-  wb_cookie_file: config/wb_cookie.txt
+  wb_cookie_file_env: WB_COOKIE_FILE
+  cookie_required_env: PARSER_WB_COOKIE_REQUIRED
+
+  wb_cookie_file: config/wb_cookie.txt
 
   proxy_url_env: PARSER_WB_PROXY_URL
 
   proxy_url: ""
+
+  request_headers_file_env: PARSER_WB_REQUEST_HEADERS_FILE
 
   base_url: https://www.wildberries.ru/__internal/u-search/exactmatch/ru/common/v18/search
   fallback_base_urls:

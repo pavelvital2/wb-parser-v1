@@ -73,7 +73,7 @@ def load_config(path: str) -> AppConfig:
     )
 
     paths.ensure_base_dirs()
-    _inject_env(raw)
+    _inject_env(raw, project_root=project_root)
 
     return AppConfig(
         raw=raw,
@@ -84,11 +84,47 @@ def load_config(path: str) -> AppConfig:
     )
 
 
-def _inject_env(raw: dict[str, Any]) -> None:
+def _coerce_headers(raw_value: Any) -> dict[str, str]:
+    if not isinstance(raw_value, dict):
+        return {}
+    headers: dict[str, str] = {}
+    for name, value in raw_value.items():
+        header_name = str(name or "").strip()
+        if not header_name or value is None:
+            continue
+        if header_name.lower() == "cookie":
+            continue
+        headers[header_name] = str(value)
+    return headers
+
+
+def _load_headers_file(project_root: Path, value: str) -> dict[str, str]:
+    if not value:
+        return {}
+    path = _as_path(project_root, value)
+    if not path.exists():
+        raise FileNotFoundError(f"request headers file not found: {path}")
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if isinstance(payload, dict) and isinstance(payload.get("headers"), dict):
+        payload = payload["headers"]
+    return _coerce_headers(payload)
+
+
+def _inject_env(raw: dict[str, Any], *, project_root: Path) -> None:
     serp = raw.get("serp", {})
+    if not isinstance(serp, dict):
+        return
     env_name = serp.get("wb_cookie_file_env", "")
     if env_name and os.getenv(env_name):
         serp["wb_cookie_file"] = os.getenv(env_name)
+
+    headers_env_name = str(serp.get("request_headers_file_env") or "PARSER_WB_REQUEST_HEADERS_FILE").strip()
+    headers_file = os.getenv(headers_env_name, "").strip() if headers_env_name else ""
+    headers_file = headers_file or str(serp.get("request_headers_file") or "").strip()
+    if headers_file:
+        merged = _coerce_headers(serp.get("request_headers"))
+        merged.update(_load_headers_file(project_root, headers_file))
+        serp["request_headers"] = merged
 
     webui = raw.get("webui", {})
     pwd_env = webui.get("admin_password_env", "")

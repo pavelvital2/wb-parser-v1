@@ -67,7 +67,7 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 2
 fi
 
-if [[ ! -s "$COOKIE_FILE" ]]; then
+if [[ ! -s "$COOKIE_FILE" && "${PARSER_WB_COOKIE_REQUIRED:-1}" != "0" ]]; then
   echo "$(date --iso-8601=seconds) WB cookie file is missing or empty: $COOKIE_FILE"
   exit 2
 fi

@@ -40,6 +40,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
         raise RuntimeError("config is not a YAML object")
+    inject_runtime_request_headers(data, config_path.parent.parent)
     return data
 
 
@@ -95,6 +96,44 @@ def requests_proxies(proxy_url: str) -> dict[str, str] | None:
     return {"http": proxy_url, "https": proxy_url}
 
 
+def _coerce_request_headers(raw_headers: Any) -> dict[str, str]:
+    if not isinstance(raw_headers, dict):
+        return {}
+    headers: dict[str, str] = {}
+    for name, value in raw_headers.items():
+        header_name = str(name or "").strip()
+        if not header_name or value is None:
+            continue
+        if header_name.lower() == "cookie":
+            continue
+        headers[header_name] = str(value)
+    return headers
+
+
+def inject_runtime_request_headers(config: dict[str, Any], project_root: Path = PROJECT_ROOT) -> None:
+    serp = config.get("serp") if isinstance(config.get("serp"), dict) else {}
+    env_name = str(serp.get("request_headers_file_env") or "PARSER_WB_REQUEST_HEADERS_FILE").strip()
+    headers_file = os.getenv(env_name, "").strip() if env_name else ""
+    headers_file = headers_file or str(serp.get("request_headers_file") or "").strip()
+    if not headers_file:
+        return
+
+    path = resolve_path(headers_file, root=project_root)
+    if not path.exists():
+        raise RuntimeError(f"request headers file not found: {path}")
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if isinstance(payload, dict) and isinstance(payload.get("headers"), dict):
+        payload = payload["headers"]
+    headers = _coerce_request_headers(serp.get("request_headers"))
+    headers.update(_coerce_request_headers(payload))
+    serp["request_headers"] = headers
+
+
+def request_headers_from_config(config: dict[str, Any]) -> dict[str, str]:
+    serp = config.get("serp") if isinstance(config.get("serp"), dict) else {}
+    return _coerce_request_headers(serp.get("request_headers"))
+
+
 def playwright_proxy_config(proxy_url: str) -> dict[str, str] | None:
     if not proxy_url:
         return None
@@ -141,6 +180,29 @@ def read_cookie_value(cookie_path: Path) -> str:
     if not value:
         raise RuntimeError(f"cookie file is empty: {cookie_path}")
     return value
+
+
+def cookie_required(config: dict[str, Any]) -> bool:
+    serp = config.get("serp") if isinstance(config.get("serp"), dict) else {}
+    env_name = str(serp.get("cookie_required_env") or "PARSER_WB_COOKIE_REQUIRED").strip()
+    if env_name:
+        env_value = os.getenv(env_name, "").strip().lower()
+        if env_value:
+            return env_value not in {"0", "false", "no", "off"}
+    if "cookie_required" in serp:
+        return bool(serp.get("cookie_required"))
+    return True
+
+
+def read_cookie_value_for_smoke(config: dict[str, Any], args: argparse.Namespace, cookie_path: Path) -> str:
+    if getattr(args, "without_cookie", False):
+        return ""
+    try:
+        return read_cookie_value(cookie_path)
+    except RuntimeError:
+        if cookie_required(config):
+            raise
+        return ""
 
 
 def write_cookie_value(cookie_path: Path, cookie_value: str) -> None:
@@ -211,7 +273,7 @@ def write_state(path_value: str, data: dict[str, Any]) -> None:
 def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True) -> bool:
     serp = config.get("serp") if isinstance(config.get("serp"), dict) else {}
     cookie_path = resolve_cookie_path(config, args.cookie_file)
-    cookie_value = read_cookie_value(cookie_path)
+    cookie_value = read_cookie_value_for_smoke(config, args, cookie_path)
     queries = load_queries(config, args.query, max(1, int(args.sample_count)))
     page = int(args.page)
     base_urls = resolve_serp_base_urls(config)
@@ -221,8 +283,10 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
         "user-agent": str(serp.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
         "x-requested-with": str(serp.get("x_requested_with") or "XMLHttpRequest"),
         "accept": "application/json, text/plain, */*",
-        "cookie": cookie_value,
     }
+    headers.update(request_headers_from_config(config))
+    if cookie_value:
+        headers["cookie"] = cookie_value
     referer_base = str(serp.get("referer_base") or "https://www.wildberries.ru/catalog/0/search.aspx?search=")
     request_params = serp.get("request_params") if isinstance(serp.get("request_params"), dict) else {}
     timeout = int(config.get("runtime", {}).get("http_timeout_seconds", 45))
@@ -331,8 +395,9 @@ def html_access_smoke(config: dict[str, Any], args: argparse.Namespace, cookie_p
     headers = {
         "user-agent": str(serp.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "cookie": cookie_value,
     }
+    headers.update(request_headers_from_config(config))
+    headers["cookie"] = cookie_value
     try:
         response = requests.get(
             url,
@@ -385,6 +450,9 @@ def refresh(config: dict[str, Any], args: argparse.Namespace) -> bool:
     elif args.require_storage_state:
         print(f"refresh failed: storage_state not found: {storage_state}", file=sys.stderr)
         return False
+    extra_headers = request_headers_from_config(config)
+    if extra_headers:
+        context_kwargs["extra_http_headers"] = extra_headers
 
     try:
         with sync_playwright() as p:
@@ -525,6 +593,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-headless", action="store_true")
     parser.add_argument("--wait-ms", type=int, default=3000)
     parser.add_argument("--timeout-ms", type=int, default=45000)
+    parser.add_argument("--without-cookie", action="store_true")
     return parser
 
 

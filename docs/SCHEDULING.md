@@ -127,19 +127,41 @@ This tolerates one temporary failed smoke but blocks a full SERP when 2 of 3
 queries already fail. Full SERP publication is still guarded by
 `validation.max_error_ratio.serp`.
 
-Cookies are also renewed proactively, not only after they fail. The user's
-crontab contains a separate job every 30 minutes:
+The user's crontab contains a separate WB cookie/access maintenance job every
+30 minutes:
 ```cron
 7,37 * * * * /home/pavel/projects/parser_wb/scripts/run_wb_cookie_renewal.sh >> /home/pavel/projects/parser_wb/data/logs/wb_cookie_renewal.log 2>&1
 ```
 
-That wrapper runs `scripts/wb_cookie_keeper.py renew`. Renewal always attempts a
-fresh browser/session refresh, but writes it first to temporary cookie and
-`storage_state` files. The temp cookie is smoke-tested and promoted to
-`config/wb_cookie.txt` only after a successful smoke; otherwise the existing
-cookie file is left unchanged.
+Current direct-3proxy steady state uses `scripts/wb_cookie_keeper.py ensure` by
+default through `PARSER_WB_COOKIE_RENEW_COMMAND=ensure` in ignored
+`config/runtime.env`. This checks the current `config/wb_cookie.txt` with the
+same SERP/API smoke gate and only attempts browser refresh if smoke fails. A
+temporary refreshed cookie is promoted only after smoke and HTML anti-bot gates
+pass; otherwise the existing cookie file is left unchanged.
 
-The host also keeps a persistent WB browser session alive through tmux session
+For the current direct Windows 3proxy WB channel, `config/runtime.env` sources
+`/home/pavel/.marketplace-proxy.env`, sets `PARSER_WB_PROXY_URL` from the direct
+HTTP proxy, and sets `PARSER_WB_REQUEST_HEADERS_FILE` to an ignored mode-`600`
+secret headers file derived from the verified owner Opera session. The
+successful gate is the API/SERP contour: 3-query keeper smoke returned HTTP 200
+for all three sample queries through this runtime. A clean Playwright/Chrome
+profile through the same proxy returned WB HTML `HTTP 498`, so the persistent
+browser watchdog is disabled with `PARSER_WB_PERSISTENT_WATCHDOG_ENABLED=0` for
+this runtime and must not be treated as the hard gate for collection.
+
+The direct-3proxy fallback channel has an explicit no-cookie gate. With the
+secret Opera-derived API headers loaded, `wb_cookie_keeper.py smoke
+--without-cookie --sample-count 3` returned HTTP 200 product responses for all
+three sample queries through `search.wb.ru`; without those headers the fallback
+returned HTTP 429. Runtime therefore sets `PARSER_WB_COOKIE_REQUIRED=0` and
+`PARSER_WB_COOKIELESS_FALLBACK_OK=1`: cookies remain preferred, but an expired
+or missing `config/wb_cookie.txt` is not a hard collection failure while the
+header+fallback smoke passes. This is not a proven browser cookie renewal path;
+clean Playwright and Opera cURL replay through the same proxy still returned WB
+HTTP 498 and no `Set-Cookie`.
+
+When enabled, the host keeps a persistent WB browser session alive through tmux session
 `wb_persistent_session`. The user confirmed that the mobile proxy rotates
 external IP automatically every 5 minutes by design, so one failed heartbeat
 during an IP change must not immediately kill the browser session. A local

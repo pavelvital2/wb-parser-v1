@@ -71,6 +71,45 @@ def test_watchdog_counts_only_new_bad_heartbeats(tmp_path: Path, monkeypatch) ->
     assert payload["action"] == "noop"
 
 
+def test_watchdog_can_be_disabled_by_env(tmp_path: Path, monkeypatch) -> None:
+    watchdog = _load_watchdog()
+    runner = tmp_path / "run.sh"
+    runner.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    latest = tmp_path / "latest.json"
+    state = tmp_path / "watchdog.json"
+    checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    _write_json(
+        latest,
+        {
+            "status": "failed",
+            "checked_at_utc": checked_at,
+            "http_status": 498,
+            "antibot": True,
+            "cookie_count": 10,
+        },
+    )
+    monkeypatch.setenv("PARSER_WB_PERSISTENT_WATCHDOG_ENABLED", "0")
+    monkeypatch.setattr(watchdog, "tmux_has_session", lambda _session: True)
+    monkeypatch.setattr(watchdog, "start_tmux_session", lambda *_args: (_ for _ in ()).throw(AssertionError("started")))
+
+    code = watchdog.main(
+        [
+            "--runner",
+            str(runner),
+            "--state-json",
+            str(latest),
+            "--watchdog-state",
+            str(state),
+        ]
+    )
+
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    assert code == 0
+    assert payload["action"] == "disabled"
+    assert payload["reason"] == "disabled_by_env"
+    assert payload["consecutive_bad_heartbeats"] == 0
+
+
 def test_watchdog_profile_reset_after_first_498(tmp_path: Path, monkeypatch) -> None:
     watchdog = _load_watchdog()
     runner = tmp_path / "run.sh"

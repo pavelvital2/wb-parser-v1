@@ -199,6 +199,47 @@ def test_build_session_uses_configured_proxy(tmp_path: Path) -> None:
         session.close()
 
 
+def test_build_session_merges_configured_request_headers_without_overriding_cookie(tmp_path: Path) -> None:
+    engine = _make_engine(tmp_path)
+    engine.request_headers = {
+        "authorization": "Bearer token",
+        "deviceid": "device-1",
+        "cookie": "stale=1",
+    }
+
+    session = engine._build_session("fresh=1")
+
+    try:
+        assert session.headers["authorization"] == "Bearer token"
+        assert session.headers["deviceid"] == "device-1"
+        assert session.headers["cookie"] == "fresh=1"
+    finally:
+        session.close()
+
+
+def test_build_session_omits_empty_cookie_header(tmp_path: Path) -> None:
+    engine = _make_engine(tmp_path)
+    engine.request_headers = {"authorization": "Bearer token"}
+
+    session = engine._build_session("")
+
+    try:
+        assert session.headers["authorization"] == "Bearer token"
+        assert "cookie" not in {name.lower(): value for name, value in session.headers.items()}
+    finally:
+        session.close()
+
+
+def test_load_cookie_value_allows_missing_cookie_when_optional(tmp_path: Path, monkeypatch) -> None:
+    engine = _make_engine(tmp_path)
+    cookie_path = tmp_path / "state" / "wb_cookie.txt"
+    cookie_path.unlink()
+    monkeypatch.setenv("PARSER_WB_COOKIE_REQUIRED", "0")
+    engine.cookie_required = engine._resolve_cookie_required()
+
+    assert engine._load_cookie_value() == ""
+
+
 def test_payload_anomaly_cooldown_retries_same_page_with_new_session(tmp_path: Path, monkeypatch) -> None:
     engine = _make_engine(tmp_path)
     engine.payload_anomaly_cooldown_after_consecutive = 2
