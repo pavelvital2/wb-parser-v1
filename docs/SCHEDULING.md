@@ -140,6 +140,10 @@ same SERP/API smoke gate and only attempts browser refresh if smoke fails. A
 temporary refreshed cookie is promoted only after smoke and HTML anti-bot gates
 pass; otherwise the existing cookie file is left unchanged.
 
+Detailed WB access/cookie repair rules are in `docs/WB_ACCESS_COOKIE_RUNBOOK.md`.
+Use that runbook before changing proxy/cookie/header runtime or processing a new
+browser Copy-as-cURL export.
+
 For the current direct Windows 3proxy WB channel, `config/runtime.env` sources
 `/home/pavel/.marketplace-proxy.env`, sets `PARSER_WB_PROXY_URL` from the direct
 HTTP proxy, and sets `PARSER_WB_REQUEST_HEADERS_FILE` to an ignored mode-`600`

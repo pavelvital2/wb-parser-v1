@@ -143,6 +143,16 @@ secret-like files such as `state/`, `data/warehouse/`, `data/logs/`,
 `config/*cookie*`, `config/runtime.env*`, `*request_headers*`, browser
 `storage_state`, or handoff scratch files.
 
+## WB Access Runbook (Linux VPS)
+Current WB access/cookie operating rules are documented in:
+
+```text
+docs/WB_ACCESS_COOKIE_RUNBOOK.md
+```
+
+Use it before changing WB proxy/cookie/header runtime, interpreting `429`/`498`,
+or processing a new browser Copy-as-cURL export.
+
 Retention cleanup:
 ```powershell
 py main.py --config config/config.yaml cleanup
