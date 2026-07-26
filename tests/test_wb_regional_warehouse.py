@@ -12,6 +12,7 @@ from app.common.exceptions import CriticalPipelineError
 from app.warehouse.wb_regional import (
     DUCKDB_MAX_THREADS,
     DUCKDB_MEMORY_LIMIT,
+    DUCKDB_MEMORY_LIMIT_SETTING,
     _create_schema,
     bounded_regional_connection,
     ingest_regional_run,
@@ -93,8 +94,8 @@ def _legacy_global_database(project: Path) -> None:
                 'success'::VARCHAR AS status,
                 '2026-07-01T00:00:00+00:00'::VARCHAR AS started_at_utc,
                 '2026-07-01T00:10:00+00:00'::VARCHAR AS finished_at_utc,
-                600.0::DOUBLE AS duration_seconds,
-                1::BIGINT AS items_ok,
+                999.0::DOUBLE AS duration_seconds,
+                77::BIGINT AS items_ok,
                 0::BIGINT AS items_error,
                 2::BIGINT AS components_count,
                 'state/run_reports/legacy.json'::VARCHAR
@@ -285,6 +286,16 @@ def test_regional_warehouse_is_idempotent_and_assigns_legacy_to_yaroslavl(
                 (SELECT count(*) FROM regional_query_quality)
             """
         ).fetchone()
+        legacy_quality = database.execute(
+            """
+            SELECT duration_seconds, items_ok,
+                   queries_expected, queries_ok,
+                   pages_max, pages_ok,
+                   positions_max, positions_ok
+            FROM regional_run_quality
+            WHERE region_id = 'yaroslavl'
+            """
+        ).fetchone()
         position_columns = {
             row[0]
             for row in database.execute(
@@ -315,6 +326,7 @@ def test_regional_warehouse_is_idempotent_and_assigns_legacy_to_yaroslavl(
         "2026-07-01T00:00:00+00:00",
     )
     assert quality_counts == (2, 1)
+    assert legacy_quality == (600.0, 77, 1, 1, 1, 1, 1, 1)
     assert {
         "collected_at_utc",
         "imt_id",
@@ -377,8 +389,17 @@ def test_regional_duckdb_runtime_is_bounded_and_temp_session_is_cleaned(
             "SELECT memory_limit, threads, temp_directory "
             "FROM wb_regional_runtime_contract"
         ).fetchone()
+        actual = connection.execute(
+            "SELECT current_setting('memory_limit'), "
+            "current_setting('threads'), current_setting('temp_directory')"
+        ).fetchone()
         assert contract[0] == DUCKDB_MEMORY_LIMIT
         assert contract[1] == DUCKDB_MAX_THREADS
+        assert actual == (
+            DUCKDB_MEMORY_LIMIT_SETTING,
+            DUCKDB_MAX_THREADS,
+            contract[2],
+        )
         temp_dir = Path(contract[2])
         assert temp_dir.is_dir()
         assert temp_dir.stat().st_mode & 0o777 == 0o700
@@ -402,6 +423,124 @@ def test_legacy_sync_rejects_unbounded_duckdb_connection(
             )
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("setting", ["memory_limit", "threads", "temp_directory"])
+def test_legacy_sync_rejects_tampered_actual_duckdb_settings(
+    tmp_path: Path,
+    setting: str,
+) -> None:
+    _legacy_global_database(tmp_path)
+    database_path = tmp_path / "data/warehouse/wb_regional/test.duckdb"
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    with bounded_regional_connection(
+        project_root=tmp_path,
+        database_path=database_path,
+    ) as connection:
+        if setting == "memory_limit":
+            connection.execute("SET memory_limit = '2GiB'")
+        elif setting == "threads":
+            connection.execute("SET threads = 1")
+        else:
+            wrong_temp = tmp_path / "wrong-temp"
+            wrong_temp.mkdir(mode=0o700)
+            connection.execute(
+                "SET temp_directory = ?",
+                [str(wrong_temp)],
+            )
+        with pytest.raises(
+            CriticalPipelineError,
+            match="bounded DuckDB runtime is invalid",
+        ):
+            migrate_legacy_yaroslavl(
+                project_root=tmp_path,
+                connection=connection,
+            )
+
+
+def test_legacy_run_quality_uses_observed_position_counts(
+    tmp_path: Path,
+) -> None:
+    _legacy_global_database(tmp_path)
+    _legacy_execute(
+        tmp_path,
+        """
+        INSERT INTO query_positions SELECT
+            '20260701_000000Z', '2026-07-01',
+            '2026-07-01T00:00:01+00:00',
+            'legacy-query', 2, 1, 101, '9001', '8001', 'legacy product',
+            'legacy brand', '6001', '7001', 'legacy seller',
+            99.0, 120.0, 99.0, 17.5, 4.5, 10, 5, 'success',
+            'data/marts/serp/history.csv'
+        UNION ALL SELECT
+            '20260701_000000Z', '2026-07-01',
+            '2026-07-01T00:00:02+00:00',
+            'second-query', 1, 1, 1, '9002', '8002', 'second product',
+            'legacy brand', '6001', '7001', 'legacy seller',
+            100.0, 121.0, 100.0, 17.4, 4.6, 11, 6, 'success',
+            'data/marts/serp/history.csv'
+        """,
+    )
+    bridge_path, sellers_path = _sources(tmp_path)
+    result = ingest_regional_run(
+        project_root=tmp_path,
+        run_id="20260726_001600Z",
+        collection_plan_id="shevron-four-regions-top1000-v2",
+        bridge_path=bridge_path,
+        sellers_path=sellers_path,
+    )
+    database = duckdb.connect(result["database_path"], read_only=True)
+    try:
+        quality = database.execute(
+            """
+            SELECT items_ok, queries_expected, queries_ok,
+                   pages_max, pages_ok, positions_max, positions_ok,
+                   duplicate_product_positions, duration_seconds
+            FROM regional_run_quality
+            WHERE region_id = 'yaroslavl'
+            """
+        ).fetchone()
+    finally:
+        database.close()
+    assert quality == (77, 2, 2, 3, 3, 3, 3, 1, 600.0)
+
+
+def test_legacy_run_quality_without_positions_uses_zero_and_null_duration(
+    tmp_path: Path,
+) -> None:
+    _legacy_global_database(tmp_path)
+    _legacy_execute(
+        tmp_path,
+        """
+        INSERT INTO daily_run_quality SELECT
+            '20260702_000000Z', 'products_sellers_daily', 'success',
+            'not-a-timestamp', '2026-07-02T00:10:00+00:00',
+            600.0, 55, 2, 3, 'state/run_reports/no-positions.json'
+        """,
+    )
+    bridge_path, sellers_path = _sources(tmp_path)
+    result = ingest_regional_run(
+        project_root=tmp_path,
+        run_id="20260726_001600Z",
+        collection_plan_id="shevron-four-regions-top1000-v2",
+        bridge_path=bridge_path,
+        sellers_path=sellers_path,
+    )
+    database = duckdb.connect(result["database_path"], read_only=True)
+    try:
+        quality = database.execute(
+            """
+            SELECT duration_seconds, items_ok,
+                   queries_expected, queries_ok,
+                   pages_max, pages_ok, positions_max, positions_ok
+            FROM regional_run_quality
+            WHERE run_id = '20260702_000000Z'
+              AND region_id = 'yaroslavl'
+            """
+        ).fetchone()
+    finally:
+        database.close()
+    assert quality == (None, 55, 0, 0, 0, 0, 0, 0)
 
 
 def test_legacy_sync_appends_new_run_without_rewriting_prior_rows(

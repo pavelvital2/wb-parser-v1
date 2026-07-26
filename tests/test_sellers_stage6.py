@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from app.common.config import load_config
-from app.common.csv_io import read_csv_rows
-from app.common.exceptions import NonCriticalPipelineError
+from app.common.csv_io import read_csv_rows, write_csv_rows
+from app.common.exceptions import CriticalPipelineError, NonCriticalPipelineError
 from app.common.run_context import RunContext, utc_now_iso
 from app.common.state_db import StateDB
 from app.sellers.engine import SellerSeed, SellersEngine, SellersRunScope
@@ -344,6 +344,212 @@ def test_scoped_sellers_deduplicate_suppliers_without_global_latest(
     monkeypatch.setattr(SellersEngine, "_fetch_seller", fake_fetch)
     result = engine.run()
     assert calls == ["1001"]
+    assert result["status"] == "success"
+    assert result["items_ok"] == 1
+    assert result["processed_sellers"] == 1
+    assert result["invocation_processed_sellers"] == 1
     assert result["latest_mart_sellers_path"] == ""
     assert not (tmp_path / "data/marts/sellers/latest").exists()
     assert len(read_csv_rows(Path(str(result["mart_sellers_path"])))) == 1
+
+
+def test_scoped_sellers_partial_resume_reports_full_verified_mart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(str(_make_config(tmp_path)))
+    input_path = (
+        tmp_path
+        / "data/marts/wb_four_region/plan/run/products_for_sellers.csv"
+    )
+    _write_products_csv(
+        input_path,
+        [
+            {
+                "run_id": "regional-run",
+                "query": "q1",
+                "query_group": "pack",
+                "nmId": "11",
+                "supplier_id": "1001",
+                "supplier_name": "A",
+                "status": "success",
+            },
+            {
+                "run_id": "regional-run",
+                "query": "q2",
+                "query_group": "pack",
+                "nmId": "22",
+                "supplier_id": "2002",
+                "supplier_name": "B",
+                "status": "success",
+            },
+        ],
+    )
+    db = StateDB(tmp_path / "state/wb_four_region/plan/run/sellers.sqlite")
+    db.init_schema()
+    run_id = "20260726_001600Z"
+    ctx = RunContext(
+        run_id=run_id,
+        pipeline="wb_four_region_nightly",
+        component="sellers_regional",
+        started_at_utc=utc_now_iso(),
+    )
+    scope = SellersRunScope(
+        input_products_path=input_path,
+        raw_dir=tmp_path / "data/raw/sellers_scoped/plan/run",
+        staging_dir=tmp_path / "data/staging/sellers_scoped/plan/run",
+        mart_dir=tmp_path / "data/marts/sellers_scoped/plan/run",
+        checkpoint_component="sellers_regional:plan",
+    )
+    monkeypatch.setattr(
+        SellersEngine,
+        "_build_session",
+        lambda self: nullcontext(object()),
+    )
+    first_calls: list[str] = []
+
+    def first_fetch(
+        self: SellersEngine,
+        session: object,
+        seller_id: str,
+    ) -> tuple[int, dict[str, object] | None, str, str]:
+        first_calls.append(seller_id)
+        if seller_id == "2002":
+            return 503, None, "http_503: unavailable", ""
+        return 200, _success_payload(seller_id), "", ""
+
+    monkeypatch.setattr(SellersEngine, "_fetch_seller", first_fetch)
+    first = SellersEngine(
+        config=config,
+        db=db,
+        ctx=ctx,
+        run_scope=scope,
+    ).run()
+    assert first_calls == ["1001", "2002"]
+    assert first["status"] == "partial"
+    assert first["items_ok"] == 1
+    assert first["items_error"] == 1
+    assert first["processed_sellers"] == 2
+    assert first["invocation_processed_sellers"] == 2
+
+    resume_calls: list[str] = []
+
+    def resumed_fetch(
+        self: SellersEngine,
+        session: object,
+        seller_id: str,
+    ) -> tuple[int, dict[str, object], str, str]:
+        resume_calls.append(seller_id)
+        return 200, _success_payload(seller_id), "", ""
+
+    monkeypatch.setattr(SellersEngine, "_fetch_seller", resumed_fetch)
+    resumed = SellersEngine(
+        config=config,
+        db=db,
+        ctx=ctx,
+        run_scope=scope,
+    ).run()
+    assert resume_calls == ["2002"]
+    assert resumed["status"] == "success"
+    assert resumed["items_ok"] == 2
+    assert resumed["items_error"] == 0
+    assert resumed["processed_sellers"] == 2
+    assert resumed["invocation_processed_sellers"] == 1
+    mart_rows = read_csv_rows(Path(str(resumed["mart_sellers_path"])))
+    assert [row["supplier_id"] for row in mart_rows] == ["1001", "2002"]
+    assert [row["status"] for row in mart_rows] == ["success", "success"]
+
+    monkeypatch.setattr(
+        SellersEngine,
+        "_fetch_seller",
+        lambda *_args, **_kwargs: pytest.fail(
+            "fully resumed sellers must not fetch"
+        ),
+    )
+    fully_resumed = SellersEngine(
+        config=config,
+        db=db,
+        ctx=ctx,
+        run_scope=scope,
+    ).run()
+    assert fully_resumed["status"] == "success"
+    assert fully_resumed["items_ok"] == 2
+    assert fully_resumed["items_error"] == 0
+    assert fully_resumed["processed_sellers"] == 2
+    assert fully_resumed["invocation_processed_sellers"] == 0
+
+
+def test_scoped_sellers_rejects_error_row_behind_success_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(str(_make_config(tmp_path)))
+    input_path = (
+        tmp_path
+        / "data/marts/wb_four_region/plan/run/products_for_sellers.csv"
+    )
+    _write_products_csv(
+        input_path,
+        [
+            {
+                "run_id": "regional-run",
+                "query": "q1",
+                "query_group": "pack",
+                "nmId": "11",
+                "supplier_id": "1001",
+                "supplier_name": "A",
+                "status": "success",
+            }
+        ],
+    )
+    db = StateDB(tmp_path / "state/wb_four_region/plan/run/sellers.sqlite")
+    db.init_schema()
+    ctx = RunContext(
+        run_id="20260726_001600Z",
+        pipeline="wb_four_region_nightly",
+        component="sellers_regional",
+        started_at_utc=utc_now_iso(),
+    )
+    scope = SellersRunScope(
+        input_products_path=input_path,
+        raw_dir=tmp_path / "data/raw/sellers_scoped/plan/run",
+        staging_dir=tmp_path / "data/staging/sellers_scoped/plan/run",
+        mart_dir=tmp_path / "data/marts/sellers_scoped/plan/run",
+        checkpoint_component="sellers_regional:plan",
+    )
+    monkeypatch.setattr(
+        SellersEngine,
+        "_build_session",
+        lambda self: nullcontext(object()),
+    )
+    monkeypatch.setattr(
+        SellersEngine,
+        "_fetch_seller",
+        lambda self, session, seller_id: (
+            200,
+            _success_payload(seller_id),
+            "",
+            "",
+        ),
+    )
+    first = SellersEngine(
+        config=config,
+        db=db,
+        ctx=ctx,
+        run_scope=scope,
+    ).run()
+    mart_path = Path(str(first["mart_sellers_path"]))
+    rows = read_csv_rows(mart_path)
+    rows[0]["status"] = "error"
+    write_csv_rows(mart_path, rows, list(rows[0]))
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="checkpoint does not match successful mart row",
+    ):
+        SellersEngine(
+            config=config,
+            db=db,
+            ctx=ctx,
+            run_scope=scope,
+        ).run()

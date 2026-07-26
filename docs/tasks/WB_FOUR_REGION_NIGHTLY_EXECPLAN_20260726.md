@@ -153,13 +153,27 @@ because the unchanged production warehouse continues to rebuild before
 cutover. Legacy `query_positions`, `seller_daily_metrics` and
 `daily_run_quality` are synchronized so historical analytics remain available.
 
+Legacy run-quality counts are observational because historical plans did not
+carry the regional expected-count contract. For each legacy `run_id`,
+`queries_expected/queries_ok`, `pages_max/pages_ok` and
+`positions_max/positions_ok` all contain the corresponding distinct/actual
+counts derived from `query_positions`. They are zero when that run has no
+position facts. `items_ok`, `items_error` and `components_count` remain the
+independent source metrics from `daily_run_quality`; `items_ok` is never
+relabelled as a position count. `duration_seconds` is recomputed from a valid
+RFC 3339 UTC `started_at_utc`/`finished_at_utc` pair and is null when that pair
+is invalid or reversed.
+
 Regional warehouse and legacy sync must use the shared bounded DuckDB
 connection contract: `memory_limit=1GiB`, at most two threads and a private
 mode-`700` spill directory below ignored
 `data/warehouse/wb_regional/tmp`. Clean shutdown removes its own session
 directory; a later locked invocation may remove only stale `session-*`
 directories older than 24 hours. Opening the legacy sync through an unbounded
-DuckDB connection fails closed.
+DuckDB connection fails closed. The sync checks DuckDB's actual
+`current_setting(memory_limit)`, `current_setting(threads)` and
+`current_setting(temp_directory)` values; an application-owned marker cannot
+substitute for the active engine settings.
 
 Offline full-source rehearsal on 2026-07-26 used a copied/read-only production
 source and a temporary regional database. With the production runtime contract
@@ -167,6 +181,12 @@ it completed first sync plus `no_changes` sync in 20.76 seconds at
 `max_rss_kb=1261052`, preserving 878994 position facts, 24617 seller facts and
 69 run-quality facts. The rehearsal did not open the production regional
 database for writing.
+
+The post-audit rehearsal after actual-setting and observed-quality validation
+used the same bounded contract and full copied/read-only source. First sync was
+`updated`, the immediate repeat was `no_changes`, elapsed time was 20.04
+seconds and `max_rss_kb=1239648`. Target counts remained exactly 878994
+positions, 24617 sellers and 69 run-quality rows.
 
 ### Notification
 

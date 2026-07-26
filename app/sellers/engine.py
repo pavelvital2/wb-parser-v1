@@ -250,14 +250,17 @@ class SellersEngine:
                 if self.sleep_between_sellers_ms > 0 and not dry_run:
                     time.sleep(self.sleep_between_sellers_ms / 1000.0)
 
+        invocation_processed = processed
         write_csv_rows(bridge_path, bridge_rows, bridge_fields)
 
-        scoped_fully_resumed = (
-            self.run_scope is not None
-            and len(completed) == len(seeds)
-            and mart_path.is_file()
-        )
-        if items_ok == 0 and not dry_run and not scoped_fully_resumed:
+        if self.run_scope is not None and not dry_run:
+            items_ok, items_error, processed = self._canonicalize_scoped_mart(
+                mart_path=mart_path,
+                mart_fields=mart_fields,
+                seeds=seeds,
+                completed=completed,
+            )
+        if items_ok == 0 and not dry_run:
             raise CriticalPipelineError("Sellers collected zero successful rows")
 
         latest_raw = ""
@@ -298,11 +301,22 @@ class SellersEngine:
                 )
             )
 
+        run_status = (
+            "dry_run"
+            if dry_run
+            else (
+                "success"
+                if items_ok == len(seeds) and items_error == 0
+                else "partial"
+            )
+        )
         return {
+            "status": run_status,
             "items_ok": items_ok,
             "items_error": items_error,
             "non_critical_errors": items_error,
             "processed_sellers": processed,
+            "invocation_processed_sellers": invocation_processed,
             "input_products_path": str(products_path),
             "raw_sellers_path": str(raw_path),
             "staging_sellers_path": str(staging_path),
@@ -312,8 +326,66 @@ class SellersEngine:
             "latest_staging_sellers_path": latest_staging,
             "latest_mart_sellers_path": latest_mart,
             "latest_bridge_path": latest_bridge,
-            "note": f"sellers={len(seeds)} processed={processed} ok={items_ok} err={items_error}",
+            "note": (
+                f"sellers={len(seeds)} processed={processed} "
+                f"invocation_processed={invocation_processed} "
+                f"ok={items_ok} err={items_error}"
+            ),
         }
+
+    def _canonicalize_scoped_mart(
+        self,
+        *,
+        mart_path: Path,
+        mart_fields: list[str],
+        seeds: dict[str, SellerSeed],
+        completed: set[str],
+    ) -> tuple[int, int, int]:
+        if not mart_path.is_file() or mart_path.is_symlink():
+            raise CriticalPipelineError("Scoped sellers mart is unavailable")
+        if not completed.issubset(seeds):
+            raise CriticalPipelineError(
+                "Scoped sellers checkpoints contain an unknown seller"
+            )
+        latest_by_seller: dict[str, dict[str, str]] = {}
+        for row in read_csv_rows(mart_path):
+            seller_id = _safe_supplier_id(row.get("supplier_id", ""))
+            if not seller_id or seller_id not in seeds:
+                raise CriticalPipelineError(
+                    "Scoped sellers mart contains an unknown seller"
+                )
+            latest_by_seller[seller_id] = row
+        if set(latest_by_seller) != set(seeds):
+            raise CriticalPipelineError("Scoped sellers mart is incomplete")
+        for seller_id in completed:
+            if latest_by_seller[seller_id].get("status") != "success":
+                raise CriticalPipelineError(
+                    "Scoped sellers checkpoint does not match successful mart row"
+                )
+
+        canonical_rows = [
+            {
+                field: latest_by_seller[seller_id].get(field, "")
+                for field in mart_fields
+            }
+            for seller_id in seeds
+        ]
+        write_csv_rows(mart_path, canonical_rows, mart_fields)
+        verified_rows = read_csv_rows(mart_path)
+        verified_ids = [
+            _safe_supplier_id(row.get("supplier_id", ""))
+            for row in verified_rows
+        ]
+        if (
+            verified_ids != list(seeds)
+            or len(set(verified_ids)) != len(verified_ids)
+        ):
+            raise CriticalPipelineError("Scoped sellers mart is not canonical")
+        items_ok = sum(
+            row.get("status") == "success" for row in verified_rows
+        )
+        items_error = len(verified_rows) - items_ok
+        return items_ok, items_error, len(verified_rows)
 
     def _resolve_products_input_path(self) -> Path:
         if self.run_scope is not None:

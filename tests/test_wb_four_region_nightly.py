@@ -850,6 +850,7 @@ def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
 
         def run(self) -> dict[str, Any]:
             return {
+                "status": "success",
                 "items_ok": 800,
                 "items_error": 0,
                 "mart_sellers_path": str(seller_output),
@@ -939,6 +940,7 @@ def test_downstream_failure_leaves_previous_scoped_latest_unchanged(
 
         def run(self) -> dict[str, Any]:
             return {
+                "status": "success",
                 "items_ok": 1,
                 "items_error": 0,
                 "mart_sellers_path": str(seller_output),

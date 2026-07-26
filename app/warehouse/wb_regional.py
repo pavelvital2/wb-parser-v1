@@ -23,6 +23,7 @@ LEGACY_REGION_NAME = "Ярославль"
 LEGACY_REGION_PROVENANCE = "legacy_global_assigned_yaroslavl"
 COLLECTED_REGION_PROVENANCE = "scoped_collection_plan"
 DUCKDB_MEMORY_LIMIT = "1GiB"
+DUCKDB_MEMORY_LIMIT_SETTING = "1.0 GiB"
 DUCKDB_MAX_THREADS = 2
 STALE_TEMP_SECONDS = 24 * 60 * 60
 
@@ -456,20 +457,64 @@ def _legacy_source_tables(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute(
         """
         CREATE OR REPLACE TEMP TABLE legacy_run_quality_source AS
-        WITH normalized AS (
+        WITH position_counts AS (
             SELECT
-                coalesce(run_id, '')::VARCHAR AS run_id,
-                coalesce(pipeline, '')::VARCHAR AS pipeline,
-                coalesce(status, '')::VARCHAR AS status,
-                coalesce(started_at_utc, '')::VARCHAR AS started_at_utc,
-                coalesce(finished_at_utc, '')::VARCHAR AS finished_at_utc,
-                duration_seconds::DOUBLE AS duration_seconds,
-                items_ok::BIGINT AS items_ok,
-                items_error::BIGINT AS items_error,
-                components_count::BIGINT AS components_count,
-                coalesce(warehouse_source_path, '')::VARCHAR
+                run_id,
+                count(DISTINCT query_id)::INTEGER AS queries_observed,
+                count(DISTINCT (query_id, page))::INTEGER AS pages_observed,
+                count(*)::INTEGER AS positions_observed,
+                (
+                    count(*) - count(DISTINCT (query_id, product_id))
+                )::BIGINT AS duplicate_product_positions
+            FROM legacy_position_source
+            GROUP BY run_id
+        ),
+        normalized AS (
+            SELECT
+                coalesce(quality.run_id, '')::VARCHAR AS run_id,
+                coalesce(quality.pipeline, '')::VARCHAR AS pipeline,
+                coalesce(quality.status, '')::VARCHAR AS status,
+                coalesce(quality.started_at_utc, '')::VARCHAR AS started_at_utc,
+                coalesce(quality.finished_at_utc, '')::VARCHAR AS finished_at_utc,
+                CASE
+                    WHEN regexp_full_match(
+                        coalesce(quality.started_at_utc, ''),
+                        '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|\\+00:00)$'
+                    )
+                    AND regexp_full_match(
+                        coalesce(quality.finished_at_utc, ''),
+                        '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|\\+00:00)$'
+                    )
+                    AND try_cast(
+                        quality.started_at_utc AS TIMESTAMPTZ
+                    ) IS NOT NULL
+                    AND try_cast(
+                        quality.finished_at_utc AS TIMESTAMPTZ
+                    ) >= try_cast(
+                        quality.started_at_utc AS TIMESTAMPTZ
+                    )
+                    THEN date_diff(
+                        'millisecond',
+                        try_cast(quality.started_at_utc AS TIMESTAMPTZ),
+                        try_cast(quality.finished_at_utc AS TIMESTAMPTZ)
+                    ) / 1000.0
+                    ELSE NULL
+                END::DOUBLE AS duration_seconds,
+                quality.items_ok::BIGINT AS items_ok,
+                quality.items_error::BIGINT AS items_error,
+                quality.components_count::BIGINT AS components_count,
+                coalesce(counts.queries_observed, 0)::INTEGER
+                    AS queries_observed,
+                coalesce(counts.pages_observed, 0)::INTEGER
+                    AS pages_observed,
+                coalesce(counts.positions_observed, 0)::INTEGER
+                    AS positions_observed,
+                coalesce(counts.duplicate_product_positions, 0)::BIGINT
+                    AS duplicate_product_positions,
+                coalesce(quality.warehouse_source_path, '')::VARCHAR
                     AS warehouse_source_path
-            FROM legacy_source.daily_run_quality
+            FROM legacy_source.daily_run_quality quality
+            LEFT JOIN position_counts counts USING (run_id)
         )
         SELECT
             *,
@@ -484,6 +529,10 @@ def _legacy_source_tables(connection: duckdb.DuckDBPyConnection) -> None:
                 items_ok := items_ok,
                 items_error := items_error,
                 components_count := components_count,
+                queries_observed := queries_observed,
+                pages_observed := pages_observed,
+                positions_observed := positions_observed,
+                duplicate_product_positions := duplicate_product_positions,
                 warehouse_source_path := warehouse_source_path
             ))) AS source_row_sha256
         FROM normalized
@@ -581,8 +630,8 @@ def migrate_legacy_yaroslavl(
 ) -> dict[str, int | str]:
     try:
         runtime_contract = connection.execute(
-            "SELECT memory_limit, threads, temp_directory "
-            "FROM wb_regional_runtime_contract"
+            "SELECT current_setting('memory_limit'), "
+            "current_setting('threads'), current_setting('temp_directory')"
         ).fetchone()
     except duckdb.Error as exc:
         raise CriticalPipelineError(
@@ -591,9 +640,20 @@ def migrate_legacy_yaroslavl(
     expected_temp_root = project_root / "data/warehouse/wb_regional/tmp"
     if (
         runtime_contract is None
-        or runtime_contract[0] != DUCKDB_MEMORY_LIMIT
+        or runtime_contract[0] != DUCKDB_MEMORY_LIMIT_SETTING
+        or type(runtime_contract[1]) is not int
         or runtime_contract[1] != DUCKDB_MAX_THREADS
-        or not Path(runtime_contract[2]).is_relative_to(expected_temp_root)
+        or not isinstance(runtime_contract[2], str)
+    ):
+        raise CriticalPipelineError(
+            "regional warehouse bounded DuckDB runtime is invalid"
+        )
+    actual_temp_directory = Path(runtime_contract[2])
+    if (
+        not actual_temp_directory.is_relative_to(expected_temp_root)
+        or not actual_temp_directory.is_dir()
+        or actual_temp_directory.is_symlink()
+        or actual_temp_directory.stat().st_mode & 0o777 != 0o700
     ):
         raise CriticalPipelineError(
             "regional warehouse bounded DuckDB runtime is invalid"
@@ -702,13 +762,13 @@ def migrate_legacy_yaroslavl(
                 """,
                 [LEGACY_REGION_ID, LEGACY_REGION_PROVENANCE],
             ).fetchone()[0]
-            if changed_positions or changed_sellers or changed_run_quality:
-                raise CriticalPipelineError(
-                    "legacy WB source changed an already imported row"
-                )
             if missing_positions or missing_sellers or missing_run_quality:
                 raise CriticalPipelineError(
                     "legacy WB source removed an already imported row"
+                )
+            if changed_positions or changed_sellers or changed_run_quality:
+                raise CriticalPipelineError(
+                    "legacy WB source changed an already imported row"
                 )
             before_positions = int(
                 connection.execute(
@@ -808,13 +868,13 @@ def migrate_legacy_yaroslavl(
                     source.items_ok,
                     source.items_error,
                     source.components_count,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    source.items_ok,
-                    0,
+                    source.queries_observed,
+                    source.queries_observed,
+                    source.pages_observed,
+                    source.pages_observed,
+                    source.positions_observed,
+                    source.positions_observed,
+                    source.duplicate_product_positions,
                     '{}',
                     source.source_key_sha256,
                     source.source_row_sha256

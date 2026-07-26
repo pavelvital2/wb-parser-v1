@@ -461,7 +461,13 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   must not depend on incidental parser state files.
   Regional warehouse/sync DuckDB connections are bounded to `1GiB`, two
   threads and private spill sessions under ignored
-  `data/warehouse/wb_regional/tmp`; do not bypass this runtime factory.
+  `data/warehouse/wb_regional/tmp`; do not bypass this runtime factory. Verify
+  the engine's actual `current_setting(...)` values rather than trusting an
+  application marker. Legacy Yaroslavl run-quality query/page/position counts
+  are observed from imported position facts; source
+  `daily_run_quality.items_ok` remains a separate metric. Scoped regional
+  seller resume must canonicalize one final row per expected supplier, require
+  successful checkpoint/output agreement and report full verified-mart totals.
   Operational contract:
   `docs/tasks/WB_FOUR_REGION_NIGHTLY_EXECPLAN_20260726.md`.
 - A WB top-20 product-only SERP run on 2026-06-12

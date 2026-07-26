@@ -439,6 +439,18 @@ carry complete run/query terminal, count, egress and source-hash evidence;
 future Parser Data API code must read these facts rather than arbitrary parser
 state files.
 
+For legacy Yaroslavl quality rows, query/page/position expected and successful
+columns have observed-history semantics: both sides contain counts derived
+from the actual legacy position facts, or zero when none exist. The separate
+legacy `items_ok` metric remains the source daily-run metric. Duration is
+derived only from a valid ordered UTC start/finish pair.
+
+Scoped seller resume rewrites its mart deterministically to one latest row per
+expected supplier. A completed checkpoint must match a successful mart row.
+Returned `processed_sellers` and `items_ok` describe the complete verified
+mart, while `invocation_processed_sellers` records only work performed by the
+current invocation.
+
 Warehouse ingestion uses a bounded DuckDB runtime in production:
 `memory_limit=1GiB`, `threads=2`, with private mode-`700` spill sessions under
 ignored `data/warehouse/wb_regional/tmp`. Each clean close removes its own

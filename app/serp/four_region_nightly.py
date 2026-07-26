@@ -514,7 +514,10 @@ def run_four_region_downstream(
                 ctx=context,
                 run_scope=seller_scope,
             ).run()
-            if int(sellers_result.get("items_error", 0)) != 0:
+            if (
+                sellers_result.get("status") != "success"
+                or int(sellers_result.get("items_error", 0)) != 0
+            ):
                 raise CriticalPipelineError("regional sellers stage is partial")
             deadline.ensure_active()
             warehouse_result = warehouse_ingest(
