@@ -55,6 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         required=True,
     )
+    collection_plan_p.add_argument(
+        "--guarded-pilot",
+        action="store_true",
+        help="Run the explicit Stage 3 A-B-A pilot contract",
+    )
 
     run_p = sub.add_parser("run", help="Run one component or pipeline")
     run_p.add_argument("target", choices=_RUN_TARGETS)
@@ -310,17 +315,26 @@ def cmd_run(args: argparse.Namespace, target_override: str | None = None) -> int
 def cmd_collection_plan(args: argparse.Namespace) -> int:
     from app.serp.collection_plan import CollectionPlanValidationError
     from app.serp.collection_plan_runner import run_collection_plan
+    from app.serp.regional_pilot import run_guarded_regional_pilot
 
     config = load_config(args.config)
     plan_path = Path(args.plan_file)
     if not plan_path.is_absolute():
         plan_path = config.project_root / plan_path
     try:
-        manifest = run_collection_plan(
-            config=config,
-            plan_path=plan_path,
-            no_publish=args.no_publish,
-        )
+        if args.guarded_pilot:
+            manifest = run_guarded_regional_pilot(
+                config=config,
+                plan_path=plan_path,
+                no_publish=args.no_publish,
+                guarded_pilot=True,
+            )
+        else:
+            manifest = run_collection_plan(
+                config=config,
+                plan_path=plan_path,
+                no_publish=args.no_publish,
+            )
     except (CriticalPipelineError, CollectionPlanValidationError) as exc:
         print(str(exc))
         return 1

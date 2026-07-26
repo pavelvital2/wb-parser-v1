@@ -14,6 +14,7 @@ from app.common.config import load_config
 from app.common.exceptions import ConfigValidationError, CriticalPipelineError
 from app.serp.collection_plan import CollectionPlanValidationError
 from app.serp.collection_plan_runner import run_collection_plan
+from app.serp.regional_pilot import run_guarded_regional_pilot
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--plan-file", required=True)
     parser.add_argument("--no-publish", action="store_true", required=True)
+    parser.add_argument("--guarded-pilot", action="store_true")
     return parser
 
 
@@ -33,11 +35,19 @@ def main() -> int:
         plan_path = Path(args.plan_file)
         if not plan_path.is_absolute():
             plan_path = config.project_root / plan_path
-        manifest = run_collection_plan(
-            config=config,
-            plan_path=plan_path,
-            no_publish=args.no_publish,
-        )
+        if args.guarded_pilot:
+            manifest = run_guarded_regional_pilot(
+                config=config,
+                plan_path=plan_path,
+                no_publish=args.no_publish,
+                guarded_pilot=True,
+            )
+        else:
+            manifest = run_collection_plan(
+                config=config,
+                plan_path=plan_path,
+                no_publish=args.no_publish,
+            )
     except (
         CriticalPipelineError,
         CollectionPlanValidationError,

@@ -1,6 +1,6 @@
 # WB query packs and regions
 
-Status: Stage 2 isolated runner implemented; live pilot not executed
+Status: Stage 3 guarded pilot contract implemented; live pilot not executed
 
 ## Scope
 
@@ -188,7 +188,66 @@ Loaders reject:
 
 ## Stop gate
 
-The Stage 2 implementation is stopped before live execution. The tracked plan
+The Stage 3 implementation is stopped before live execution. The tracked plan
 and regions remain disabled; no resolver/search smoke or pilot has run.
 Scoped publication, warehouse migration, Parser Data API changes and scheduling
 remain unapproved.
+
+## Stage 3 guarded pilot
+
+The A-B-A contract is available only with the additional explicit flag:
+
+```text
+python main.py --config config/config.yaml collection-plan \
+  --plan-file config/wb/collection_plans/{collection_plan_id}.json \
+  --no-publish --guarded-pilot
+```
+
+The dedicated launcher accepts the same `--guarded-pilot` flag. The flag does
+not bypass plan or region validation. The tracked plan and both tracked regions
+remain `enabled=false`; a future live pilot requires a separate reviewed
+enable commit followed by a disable commit.
+
+While holding the existing daily, pipeline, warehouse-refresh and plan locks,
+the guarded runner performs this fixed sequence:
+
+1. hash the protected file set and user crontab without persisting their
+   contents;
+2. check neutral egress and resolve Moscow and Rostov-on-Don destinations;
+3. probe the primary endpoint and at most one fallback, then pin the first
+   usable endpoint;
+4. write an immutable effective snapshot containing the actual pinned endpoint;
+5. collect three Moscow pages, check egress, collect three Rostov-on-Don pages,
+   check egress, repeat the first Moscow query, then perform the final egress
+   check;
+6. write endpoint, request-budget, repeat-control and comparison evidence;
+7. re-hash protected state, fail on any mismatch, and retain all locks through
+   final manifest fsync.
+
+The WB request budget is fail-closed and counts attempts before transport I/O:
+`geo<=2`, `endpoint_probe<=2`, `regional_search=6`, `repeat_search=1`,
+`total_wb<=11`. Neutral egress checks are recorded separately. There are no
+retries, second pages, endpoint switches after pinning, proxy rotations,
+sellers, warehouse refreshes, publication or notification.
+
+The Moscow repeat is stored under the Moscow scoped raw run and in a separate
+control artifact; it is not appended to the 600 primary product rows. Regional
+membership/position comparison is emitted only when the Moscow A-A membership
+Jaccard is at least `0.95`. Otherwise comparison is `not_eligible` and contains
+no regional difference rows. The artifact is limited to SERP membership and
+position evidence and makes no sales, demand or ranking-causality claim.
+
+Stage 3 state artifacts are immutable files under the scoped run:
+
+```text
+state/wb_collection_plans/{plan}/{run_id}/endpoint_preflight.json
+state/wb_collection_plans/{plan}/{run_id}/request_budget.json
+state/wb_collection_plans/{plan}/{run_id}/control/moscow_repeat.json
+state/wb_collection_plans/{plan}/{run_id}/comparison.json
+state/wb_collection_plans/{plan}/{run_id}/protected_evidence.json
+```
+
+Endpoint evidence contains only endpoint IDs, outcome, HTTP status and safe
+error codes. Protected evidence contains only relative paths, presence status
+and SHA-256 values. Neither contract stores endpoint URLs, URL queries, full
+egress IP, cookies, headers, proxy values, credentials or crontab contents.

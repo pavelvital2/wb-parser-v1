@@ -123,6 +123,14 @@ class ScopedSearchResult:
     http_status: int = 200
 
 
+@dataclass(frozen=True, slots=True)
+class EndpointProbeResult:
+    endpoint_id: str
+    suitable: bool
+    http_status: int | None
+    error_code: str | None
+
+
 class ScopedTransport(Protocol):
     request_params: Mapping[str, Any]
     endpoint_policy: EffectiveEndpointPolicy
@@ -142,6 +150,16 @@ class ScopedTransport(Protocol):
         *,
         timeout_seconds: float,
     ) -> ScopedSearchResult: ...
+
+    def probe_endpoint(
+        self,
+        request: ScopedSearchRequest,
+        *,
+        endpoint_id: str,
+        timeout_seconds: float,
+    ) -> EndpointProbeResult: ...
+
+    def pin_endpoint(self, endpoint_id: str) -> None: ...
 
     def close(self) -> None: ...
 
@@ -483,6 +501,7 @@ class RequestsScopedTransport:
             endpoint_ids=endpoint_ids,
             pinned_endpoint_id=endpoint_ids[0],
         )
+        self._endpoint_pin_finalized = False
 
     @classmethod
     def from_config(cls, config: AppConfig) -> "RequestsScopedTransport":
@@ -656,6 +675,87 @@ class RequestsScopedTransport:
             )
         return self._extract_dest(self._response_json(response, code="resolver"))
 
+    def _endpoint_url(self, endpoint_id: str) -> str:
+        try:
+            index = self.endpoint_policy.endpoint_ids.index(endpoint_id)
+        except ValueError as exc:
+            raise ScopedTransportError("endpoint_id_unknown") from exc
+        return self.endpoint_urls[index]
+
+    def probe_endpoint(
+        self,
+        request: ScopedSearchRequest,
+        *,
+        endpoint_id: str,
+        timeout_seconds: float,
+    ) -> EndpointProbeResult:
+        if self._endpoint_pin_finalized:
+            raise ScopedTransportError("endpoint_probe_after_pin")
+        if request.endpoint_id != endpoint_id:
+            raise ScopedTransportError("endpoint_probe_identity_mismatch")
+        endpoint_url = self._endpoint_url(endpoint_id)
+        try:
+            response = self.session.get(
+                endpoint_url,
+                params=dict(request.params),
+                headers={"referer": f"{self.referer_base}{quote(request.task.query)}"},
+                timeout=min(self.timeout_seconds, timeout_seconds),
+            )
+        except requests.RequestException:
+            return EndpointProbeResult(
+                endpoint_id=endpoint_id,
+                suitable=False,
+                http_status=None,
+                error_code="endpoint_probe_network_error",
+            )
+        if response.status_code != 200:
+            return EndpointProbeResult(
+                endpoint_id=endpoint_id,
+                suitable=False,
+                http_status=response.status_code,
+                error_code=f"endpoint_probe_http_{response.status_code}",
+            )
+        try:
+            payload = self._response_json(response, code="endpoint_probe")
+            products = _extract_products(payload)
+            if len(products) != request.task.page_size:
+                raise CollectionPlanRunError("endpoint_probe_products_count_invalid")
+            seen: set[str] = set()
+            for product in products:
+                product_id = _normalize_product_id(product)
+                if product_id in seen:
+                    raise CollectionPlanRunError(
+                        "endpoint_probe_product_duplicate"
+                    )
+                seen.add(product_id)
+        except (CollectionPlanRunError, ScopedTransportError) as exc:
+            error_code = str(
+                getattr(exc, "code", "endpoint_probe_payload_invalid")
+            ).replace("\n", " ")[:100]
+            return EndpointProbeResult(
+                endpoint_id=endpoint_id,
+                suitable=False,
+                http_status=200,
+                error_code=error_code,
+            )
+        return EndpointProbeResult(
+            endpoint_id=endpoint_id,
+            suitable=True,
+            http_status=200,
+            error_code=None,
+        )
+
+    def pin_endpoint(self, endpoint_id: str) -> None:
+        if self._endpoint_pin_finalized:
+            raise ScopedTransportError("endpoint_pin_already_finalized")
+        self._endpoint_url(endpoint_id)
+        self.endpoint_policy = EffectiveEndpointPolicy(
+            selection_mode=self.endpoint_policy.selection_mode,
+            endpoint_ids=self.endpoint_policy.endpoint_ids,
+            pinned_endpoint_id=endpoint_id,
+        )
+        self._endpoint_pin_finalized = True
+
     def search(
         self,
         request: ScopedSearchRequest,
@@ -664,7 +764,7 @@ class RequestsScopedTransport:
     ) -> ScopedSearchResult:
         if request.endpoint_id != self.endpoint_policy.pinned_endpoint_id:
             raise ScopedTransportError("search_endpoint_not_pinned")
-        endpoint_url = self.endpoint_urls[0]
+        endpoint_url = self._endpoint_url(request.endpoint_id)
         try:
             response = self.session.get(
                 endpoint_url,
