@@ -52,7 +52,7 @@ validation:
 
     suggest: 0.95
 
-    serp: 0.95
+    serp: 0.05
 
     sellers: 0.95
 
@@ -90,7 +90,9 @@ suggest:
 
   type_delay_ms: 50
 
-  headless: false
+  headless: true
+
+  browser_channel: chrome
 
   browser_profile_dir: state/browser/wb_profile
 
@@ -142,11 +144,21 @@ serp:
 
   page_size: 100
 
-  wb_cookie_file_env: WB_COOKIE_FILE
+  wb_cookie_file_env: WB_COOKIE_FILE
+  cookie_required_env: PARSER_WB_COOKIE_REQUIRED
+
+  wb_cookie_file: config/wb_cookie.txt
 
-  wb_cookie_file: config/wb_cookie.txt
-
-  base_url: https://www.wildberries.ru/__internal/u-search/exactmatch/ru/common/v18/search
+  proxy_url_env: PARSER_WB_PROXY_URL
+
+  proxy_url: ""
+
+  request_headers_file_env: PARSER_WB_REQUEST_HEADERS_FILE
+
+  base_url: https://www.wildberries.ru/__internal/u-search/exactmatch/ru/common/v18/search
+  fallback_base_urls:
+    - https://search.wb.ru/exactmatch/ru/male/v18/search
+  smoke_min_successes: 2
 
   request_params:
 
@@ -178,9 +190,67 @@ serp:
 
   x_requested_with: XMLHttpRequest
 
-  sleep_between_pages_ms: 1300
-
-  sleep_between_queries_ms: 2500
+  retry_http_statuses:
+
+    - 429
+
+    - 498
+
+    - 500
+
+    - 502
+
+    - 503
+
+    - 504
+
+  rate_limit_http_statuses:
+
+    - 429
+
+    - 498
+
+  retry_max_attempts: 4
+
+  retry_base_delay_seconds: 8.0
+
+  retry_max_delay_seconds: 60.0
+
+  sleep_between_pages_ms: 4500
+
+  error_sleep_ms: 8000
+
+  rate_limit_sleep_ms: 45000
+
+  error_ip_rotation_enabled: true
+
+  error_ip_rotation_url_env: PARSER_WB_PROXY_ROTATE_URL
+
+  error_ip_rotation_wait_seconds: 120
+
+  error_ip_rotation_max_attempts: 1
+
+  deferred_retry_enabled: true
+
+  deferred_retry_sleep_seconds: 600
+
+  abort_after_consecutive_rate_limits: 3
+
+  payload_anomaly_cooldown_after_consecutive: 5
+
+  payload_anomaly_cooldown_base_seconds: 600
+
+  payload_anomaly_cooldown_increment_seconds: 600
+
+  payload_anomaly_cooldown_max_seconds: 0
+
+  payload_anomaly_keeper_smoke_enabled: true
+
+  payload_anomaly_keeper_smoke_sample_count: 3
+
+  payload_anomaly_keeper_smoke_page: 1
+
+  sleep_between_queries_ms: 12000
 
   stop_on_empty_page: true
 

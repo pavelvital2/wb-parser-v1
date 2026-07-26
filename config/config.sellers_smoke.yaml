@@ -53,7 +53,12 @@ serp:
   page_size: 100
   wb_cookie_file_env: WB_COOKIE_FILE
   wb_cookie_file: config/wb_cookie.txt
+  proxy_url_env: PARSER_WB_PROXY_URL
+  proxy_url: ""
   base_url: https://www.wildberries.ru/__internal/u-search/exactmatch/ru/common/v18/search
+  fallback_base_urls:
+    - https://search.wb.ru/exactmatch/ru/male/v18/search
+  smoke_min_successes: 2
   request_params:
     ab_testid: model_reranking_all_logistic_boost
     appType: "1"
@@ -69,6 +74,9 @@ serp:
   user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)
   referer_base: https://www.wildberries.ru/catalog/0/search.aspx?search=
   x_requested_with: XMLHttpRequest
+  rate_limit_http_statuses:
+    - 429
+    - 498
   sleep_between_pages_ms: 1300
   sleep_between_queries_ms: 2500
   stop_on_empty_page: true
@@ -106,6 +114,3 @@ webui:
   admin_username: admin
   admin_password_env: WEBUI_ADMIN_PASSWORD
   secret_key_env: WEBUI_SECRET_KEY
-
-
-

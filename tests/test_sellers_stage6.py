@@ -108,6 +108,29 @@ def _success_payload(seller_id: str) -> dict[str, str | int | float | bool]:
     }
 
 
+class _FakeSellerResponse:
+    def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.content = b'{"ok": true}'
+        self.text = '{"ok": true}'
+        self.closed = False
+
+    def json(self) -> dict[str, object]:
+        return self._payload
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeSellerSession:
+    def __init__(self, response: _FakeSellerResponse) -> None:
+        self.response = response
+
+    def get(self, *args, **kwargs) -> _FakeSellerResponse:
+        return self.response
+
+
 def test_extract_unique_suppliers_from_products(tmp_path: Path) -> None:
     rows = [
         {"supplier_id": "1001", "supplier_name": "A", "query": "кроссовки", "query_group": "обувь", "nmId": "11", "run_id": "r1"},
@@ -149,6 +172,23 @@ def test_run_writes_raw_staging_mart_and_bridge(tmp_path: Path, monkeypatch: pyt
     assert len(read_csv_rows(staging_path)) == 2
     assert len(read_csv_rows(mart_path)) == 2
     assert len(read_csv_rows(bridge_path)) == 3
+
+
+def test_fetch_seller_closes_response(tmp_path: Path) -> None:
+    engine, _ = _setup(
+        tmp_path,
+        [{"run_id": "pr1", "query": "кроссовки", "query_group": "обувь", "nmId": "11", "supplier_id": "1001", "supplier_name": "A", "status": "success"}],
+    )
+    response = _FakeSellerResponse(200, _success_payload("1001"))
+    session = _FakeSellerSession(response)
+
+    status, payload, error, raw_file = engine._fetch_seller(session, "1001")
+
+    assert status == 200
+    assert payload is not None
+    assert error == ""
+    assert raw_file
+    assert response.closed is True
 
 
 def test_checkpoint_resume_by_seller_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -247,5 +287,4 @@ def test_bridge_contains_query_product_seller_links(tmp_path: Path, monkeypatch:
     assert ("1001", "кроссовки", "11") in triples
     assert ("1001", "кроссовки", "12") in triples
     assert ("2002", "футболка", "21") in triples
-
 

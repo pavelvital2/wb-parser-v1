@@ -31,19 +31,38 @@ env/
 .env
 .env.*
 !.env.example
+config/runtime.env
+config/runtime.env*
+config/*.secret.*
+config/*secret*
+config/*request_headers*.json
 
 # Cookie / auth local files
 *cookie*.txt
+config/*cookie*
+*cookie*.txt.backup_*
+*storage_state*.json
 config/wb_cookie.txt
 
 # ------------------------------
 # Runtime state
 # ------------------------------
+state/
 state/sqlite/*.sqlite
 state/sqlite/*.sqlite-shm
 state/sqlite/*.sqlite-wal
+state/*.sqlite3
+state/*.sqlite3-shm
+state/*.sqlite3-wal
 state/checkpoints/**/*.tmp
 state/browser/
+state/wb_session_keeper/
+state/wb_persistent_session/
+state/wb_android_*/
+state/wb_desktop_clean/
+state/wb_manual_profile_reset/
+state/wb_known_good/
+state/wb_nightly_preflight/
 state/run_reports/
 state/locks/
 
@@ -54,6 +73,7 @@ data/logs/
 data/raw/
 data/staging/
 data/marts/
+data/warehouse/
 exports/
 
 # ------------------------------
@@ -62,6 +82,9 @@ exports/
 *.log
 *.tmp
 *.bak
+AGENTS.md.bak*
+docs/*handoff*
+docs/*task_handoff*
 
 # ------------------------------
 # OS / editor files

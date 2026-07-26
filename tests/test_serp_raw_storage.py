@@ -2,10 +2,13 @@
 
 from pathlib import Path
 
+import pytest
+
 from app.common.config import load_config
+from app.common.csv_io import read_csv_rows
 from app.common.run_context import RunContext, utc_now_iso
 from app.common.state_db import StateDB
-from app.serp.engine import SerpEngine
+from app.serp.engine import SerpEngine, _mask_external_ip
 
 
 class _FakeResponse:
@@ -13,9 +16,28 @@ class _FakeResponse:
         self.status_code = status_code
         self.text = text
         self.content = text.encode("utf-8")
+        self.closed = False
 
     def json(self):
         raise ValueError("bad json")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _JsonResponse:
+    def __init__(self, status_code: int, payload: dict, text: str = "") -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+        self.content = (text or "{}").encode("utf-8")
+        self.closed = False
+
+    def json(self):
+        return self._payload
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _FakeSession:
@@ -24,6 +46,40 @@ class _FakeSession:
 
     def get(self, *args, **kwargs):
         return self._response
+
+
+class _EndpointFallbackSession:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def get(self, url: str, *args, **kwargs):
+        self.urls.append(url)
+        if url == "https://fallback.local/search":
+            return _JsonResponse(
+                200,
+                {
+                    "products": [
+                        {
+                            "id": 123,
+                            "name": "ok",
+                            "brand": "brand",
+                            "supplierId": 456,
+                            "supplier": "seller",
+                        }
+                    ]
+                },
+                '{"products":[{"id":123}]}',
+            )
+        return _FakeResponse(498, "blocked")
+
+
+class _CloseableSession:
+    def __init__(self, label: int) -> None:
+        self.label = label
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _write(path: Path, content: str) -> None:
@@ -94,6 +150,12 @@ def _make_engine(tmp_path: Path, run_id: str = "20260307_120000Z") -> SerpEngine
     return SerpEngine(config=cfg, db=db, ctx=ctx)
 
 
+def _enable_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_LOADED", "1")
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_SHA256", "a" * 64)
+    monkeypatch.setenv("PARSER_WB_PROXY_URL", "http://proxy.local:3128")
+
+
 def test_write_raw_response_uses_run_and_query_slug(tmp_path: Path) -> None:
     engine = _make_engine(tmp_path)
     rel = engine._write_raw_response("шеврон мвд", 3, b'{"products":[]}')
@@ -119,3 +181,331 @@ def test_fetch_page_saves_raw_on_invalid_json(tmp_path: Path) -> None:
     abs_path = engine.config.project_root / raw_file
     assert abs_path.exists()
     assert abs_path.read_text(encoding="utf-8") == "not a json payload"
+
+
+def test_fetch_page_falls_back_after_retryable_http_status(tmp_path: Path) -> None:
+    engine = _make_engine(tmp_path)
+    engine.base_urls = ["https://internal.local/search", "https://fallback.local/search"]
+    engine.retry_max_attempts = 1
+    session = _EndpointFallbackSession()
+
+    response, payload, error, raw_file = engine._fetch_page(session=session, query="шеврон мвд", page=1)
+
+    assert response is not None
+    assert response.status_code == 200
+    assert payload is not None
+    assert error == ""
+    assert raw_file.startswith(f"data/raw/serp/{engine.ctx.run_id}/")
+    assert session.urls == ["https://internal.local/search", "https://fallback.local/search"]
+    assert engine._active_base_url_index == 1
+
+
+def test_build_session_uses_configured_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_proxy(monkeypatch)
+    engine = _make_engine(tmp_path)
+
+    session = engine._build_session("cookie=1")
+
+    try:
+        assert session.proxies == {
+            "http": "http://proxy.local:3128",
+            "https": "http://proxy.local:3128",
+        }
+    finally:
+        session.close()
+
+
+def test_build_session_merges_configured_request_headers_without_overriding_cookie(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_proxy(monkeypatch)
+    engine = _make_engine(tmp_path)
+    engine.request_headers = {
+        "authorization": "Bearer token",
+        "deviceid": "device-1",
+        "cookie": "stale=1",
+    }
+
+    session = engine._build_session("fresh=1")
+
+    try:
+        assert session.headers["authorization"] == "Bearer token"
+        assert session.headers["deviceid"] == "device-1"
+        assert session.headers["cookie"] == "fresh=1"
+    finally:
+        session.close()
+
+
+def test_build_session_omits_empty_cookie_header(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_proxy(monkeypatch)
+    engine = _make_engine(tmp_path)
+    engine.request_headers = {"authorization": "Bearer token"}
+
+    session = engine._build_session("")
+
+    try:
+        assert session.headers["authorization"] == "Bearer token"
+        assert "cookie" not in {name.lower(): value for name, value in session.headers.items()}
+    finally:
+        session.close()
+
+
+def test_load_cookie_value_allows_missing_cookie_when_optional(tmp_path: Path, monkeypatch) -> None:
+    engine = _make_engine(tmp_path)
+    cookie_path = tmp_path / "state" / "wb_cookie.txt"
+    cookie_path.unlink()
+    monkeypatch.setenv("PARSER_WB_COOKIE_REQUIRED", "0")
+    engine.cookie_required = engine._resolve_cookie_required()
+
+    assert engine._load_cookie_value() == ""
+
+
+def test_payload_anomaly_cooldown_retries_same_page_with_new_session(tmp_path: Path, monkeypatch) -> None:
+    engine = _make_engine(tmp_path)
+    engine.payload_anomaly_cooldown_after_consecutive = 2
+    engine.payload_anomaly_cooldown_base_seconds = 0.0
+    engine.payload_anomaly_cooldown_increment_seconds = 0.0
+    engine.payload_anomaly_keeper_smoke_enabled = False
+    engine.retry_base_delay_seconds = 0.0
+    engine.retry_max_delay_seconds = 0.0
+
+    sessions: list[_CloseableSession] = []
+
+    def fake_build_session(cookie_value: str) -> _CloseableSession:
+        session = _CloseableSession(label=len(sessions))
+        sessions.append(session)
+        return session
+
+    calls: list[tuple[int, str, int, bool]] = []
+
+    def fake_fetch_page(
+        *,
+        session: _CloseableSession,
+        query: str,
+        page: int,
+        retry_payload_anomalies: bool = True,
+    ):
+        calls.append((session.label, query, page, retry_payload_anomalies))
+        if len(calls) <= 2:
+            return (
+                _FakeResponse(200, "{}"),
+                None,
+                "retryable_payload_anomaly: nested promo products=1",
+                "data/raw/serp/test/page_1.json",
+            )
+        return (
+            _FakeResponse(200, "{}"),
+            {
+                "products": [
+                    {
+                        "id": 123,
+                        "name": "ok",
+                        "brand": "brand",
+                        "supplierId": 456,
+                        "supplier": "seller",
+                    }
+                ]
+            },
+            "",
+            "data/raw/serp/test/page_1.json",
+        )
+
+    monkeypatch.setattr(engine, "_build_session", fake_build_session)
+    monkeypatch.setattr(engine, "_fetch_page", fake_fetch_page)
+
+    result = engine.run()
+
+    assert result["items_ok"] == 1
+    assert result["items_error"] == 0
+    assert result["pages_done"] == 1
+    assert result["payload_anomaly_cooldowns"] == 1
+    assert calls == [
+        (0, "test query", 1, False),
+        (0, "test query", 1, False),
+        (1, "test query", 1, False),
+    ]
+    assert [session.closed for session in sessions] == [True, True]
+
+    page_rows = read_csv_rows(Path(result["pages_index_path"]))
+    assert len(page_rows) == 1
+    assert page_rows[0]["source_ref"] == "test query|page=1"
+    assert page_rows[0]["status"] == "success"
+
+
+def test_error_ip_rotation_retries_same_page_before_recording_error(tmp_path: Path, monkeypatch) -> None:
+    engine = _make_engine(tmp_path)
+    engine.deferred_retry_enabled = False
+    engine.error_ip_rotation_enabled = True
+    engine.error_ip_rotation_url = "https://rotate.example.test/change_ip"
+    engine.error_ip_rotation_wait_seconds = 0.0
+    engine.error_ip_rotation_max_attempts = 1
+
+    sessions: list[_CloseableSession] = []
+
+    def fake_build_session(cookie_value: str) -> _CloseableSession:
+        session = _CloseableSession(label=len(sessions))
+        sessions.append(session)
+        return session
+
+    fetch_calls: list[tuple[int, str, int]] = []
+
+    def fake_fetch_page(*, session: _CloseableSession, query: str, page: int, retry_payload_anomalies: bool = True):
+        fetch_calls.append((session.label, query, page))
+        if len(fetch_calls) == 1:
+            return (
+                _FakeResponse(429, "blocked"),
+                None,
+                "http_429: blocked",
+                "data/raw/serp/test/page_1_error.json",
+            )
+        return (
+            _JsonResponse(200, {"products": [{"id": 123, "name": "ok", "brand": "brand"}]}, '{"products":[{"id":123}]}'),
+            {"products": [{"id": 123, "name": "ok", "brand": "brand"}]},
+            "",
+            "data/raw/serp/test/page_1.json",
+        )
+
+    rotate_requests: list[tuple[str, float]] = []
+    rotate_response = _JsonResponse(
+        200,
+        {
+            "ok": True,
+            "previous_external_ip": "203.0.113.10",
+            "current_external_ip": "198.51.100.20",
+        },
+        '{"ok":true}',
+    )
+
+    def fake_rotate_request(url: str, timeout: float):
+        rotate_requests.append((url, timeout))
+        return rotate_response
+
+    monkeypatch.setattr(engine, "_build_session", fake_build_session)
+    monkeypatch.setattr(engine, "_fetch_page", fake_fetch_page)
+    monkeypatch.setattr("app.serp.engine.requests.get", fake_rotate_request)
+    monkeypatch.setattr("app.serp.engine.time.sleep", lambda seconds: None)
+
+    result = engine.run()
+
+    assert result["items_ok"] == 1
+    assert result["items_error"] == 0
+    assert result["pages_done"] == 1
+    assert result["ip_rotations"] == 1
+    assert result["ip_rotation_attempts"] == 1
+    assert result["ip_rotation_successes"] == 1
+    assert result["ip_rotation_failures"] == 0
+    assert result["ip_rotation_last_change"] == "203.0.x.x->198.51.x.x"
+    assert result["ip_rotation_last_reason"] == "http_status=429"
+    assert result["ip_rotation_last_scope"] == "page=1"
+    assert fetch_calls == [(0, "test query", 1), (1, "test query", 1)]
+    assert rotate_requests == [("https://rotate.example.test/change_ip", engine.error_ip_rotation_timeout_seconds)]
+    assert rotate_response.closed is True
+    assert [session.closed for session in sessions] == [True, True]
+
+    page_rows = read_csv_rows(Path(result["pages_index_path"]))
+    assert len(page_rows) == 1
+    assert page_rows[0]["source_ref"] == "test query|page=1"
+    assert page_rows[0]["status"] == "success"
+
+
+def test_error_ip_rotation_non_200_does_not_retry_page(tmp_path: Path, monkeypatch) -> None:
+    engine = _make_engine(tmp_path)
+    engine.error_ip_rotation_enabled = True
+    engine.error_ip_rotation_url = "https://rotate.example.test/change_ip"
+    engine.error_ip_rotation_wait_seconds = 0.0
+    engine.error_ip_rotation_max_attempts = 1
+
+    session = _CloseableSession(label=0)
+    fetch_calls: list[tuple[int, str, int]] = []
+
+    def fake_fetch_page(*, session: _CloseableSession, query: str, page: int, retry_payload_anomalies: bool = True):
+        fetch_calls.append((session.label, query, page))
+        return (
+            _FakeResponse(429, "blocked"),
+            None,
+            "http_429: blocked",
+            "data/raw/serp/test/page_1_error.json",
+        )
+
+    rotate_response = _JsonResponse(502, {"ok": False}, '{"ok":false}')
+
+    monkeypatch.setattr(engine, "_fetch_page", fake_fetch_page)
+    monkeypatch.setattr("app.serp.engine.requests.get", lambda url, timeout: rotate_response)
+
+    (
+        returned_session,
+        returned_cookie,
+        response,
+        payload,
+        error_message,
+        raw_file,
+        cooldowns_done,
+        ip_rotations,
+    ) = engine._fetch_page_with_payload_anomaly_cooldown(
+        session=session,
+        cookie_value="cookie=1",
+        query="test query",
+        page=1,
+        cooldowns_done=0,
+    )
+
+    assert returned_session is session
+    assert returned_cookie == "cookie=1"
+    assert response is not None
+    assert response.status_code == 429
+    assert payload is None
+    assert error_message == "http_429: blocked"
+    assert raw_file == "data/raw/serp/test/page_1_error.json"
+    assert cooldowns_done == 0
+    assert ip_rotations == 0
+    assert engine._ip_rotation_attempts == 1
+    assert engine._ip_rotation_successes == 0
+    assert engine._ip_rotation_failures == 1
+    assert fetch_calls == [(0, "test query", 1)]
+    assert session.closed is False
+    assert rotate_response.closed is True
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _FakeResponse(200, "not-json"),
+        _JsonResponse(200, {"ok": False}),
+    ],
+)
+def test_error_ip_rotation_rejects_invalid_success_payload(
+    tmp_path: Path,
+    monkeypatch,
+    response: _FakeResponse | _JsonResponse,
+) -> None:
+    engine = _make_engine(tmp_path)
+    engine.error_ip_rotation_url = "https://rotate.example.test/change_ip"
+    engine.error_ip_rotation_wait_seconds = 0.0
+    monkeypatch.setattr("app.serp.engine.requests.get", lambda url, timeout: response)
+
+    rotated = engine._rotate_ip_after_error(
+        query="test query",
+        page=1,
+        http_status=429,
+        error_message="http_429: blocked",
+    )
+
+    assert rotated is False
+    assert engine._ip_rotation_attempts == 1
+    assert engine._ip_rotation_successes == 0
+    assert engine._ip_rotation_failures == 1
+    assert engine._last_ip_rotation_change == ""
+    assert response.closed is True
+
+
+def test_external_ip_mask_rejects_malformed_values() -> None:
+    assert _mask_external_ip("203.0.113.10") == "203.0.x.x"
+    assert _mask_external_ip("2001:db8::1") == "2001:0db8::x"
+    assert _mask_external_ip("credential:fragment:value") == "masked"

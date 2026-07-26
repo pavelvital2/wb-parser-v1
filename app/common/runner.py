@@ -278,6 +278,8 @@ def run_component(config: AppConfig, db: StateDB, target: str, job_id: str = "")
                         "error_code": err_code,
                     },
                 )
+                if ctx.component == COMPONENT_SERP:
+                    break
                 continue
 
             except CriticalPipelineError as exc:
@@ -475,4 +477,4 @@ def run_component(config: AppConfig, db: StateDB, target: str, job_id: str = "")
                 "source_ref": str(report_path),
             },
         )
-        return 0
+        return 1 if final_status == RUN_STATUS_PARTIAL else 0

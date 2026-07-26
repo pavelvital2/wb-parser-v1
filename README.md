@@ -121,6 +121,57 @@ Dry-run / job-id:
 py main.py --config config/config.yaml run serp --dry-run --job-id manual_check
 ```
 
+## Local Pre-Push Check (Linux VPS)
+Before pushing parser_wb changes from `/home/pavel/projects/parser_wb`, run:
+
+```bash
+scripts/run_pre_push_check.sh
+```
+
+The check is local-only. It does not call Wildberries and does not print runtime
+secrets. It runs path safety checks, whitespace checks, shell syntax checks,
+`validate`, warehouse dry-run/check, and `pytest`.
+
+For a quick staged-path guard:
+
+```bash
+scripts/run_pre_push_check.sh --staged-only
+```
+
+The check fails if staged/tracked/untracked git-visible paths include runtime or
+secret-like files such as `state/`, `data/warehouse/`, `data/logs/`,
+`config/*cookie*`, `config/runtime.env*`, `*request_headers*`, browser
+`storage_state`, or handoff scratch files.
+
+## WB Access Runbook (Linux VPS)
+Current WB access/cookie operating rules are documented in:
+
+```text
+docs/WB_ACCESS_COOKIE_RUNBOOK.md
+docs/WB_PROXY_ONLY_RUNBOOK.md
+```
+
+Use it before changing WB proxy/cookie/header runtime, interpreting `429`/`498`,
+or processing a new browser Copy-as-cURL export.
+
+## Isolated WB Regional SERP (Linux VPS)
+
+Versioned query packs, the region registry and collection plans are documented
+in `docs/WB_QUERY_PACKS_REGIONS.md`. A reviewed enabled plan is run only through:
+
+```bash
+scripts/run_wb_collection_plan.sh \
+  --config config/config.yaml \
+  --plan-file config/wb/collection_plans/PLAN.json \
+  --no-publish
+```
+
+The launcher loads the required proxy-only runtime. Regional results stay under
+`data/{raw,staging,marts}/serp_scoped/{plan}/{region}/{run_id}` and never update
+global latest, seller input, run-report latest or Warehouse. Tracked regional
+plans and regions remain disabled until a separate owner-approved enable
+change.
+
 Retention cleanup:
 ```powershell
 py main.py --config config/config.yaml cleanup

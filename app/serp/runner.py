@@ -20,6 +20,17 @@ def _max_error_ratio(config: AppConfig) -> float | None:
     return float(value)
 
 
+def _errors_within_threshold(result: dict[str, int | str], max_error_ratio: float | None) -> bool:
+    items_error = int(result.get("items_error", 0))
+    if items_error <= 0:
+        return True
+    pages_done = int(result.get("pages_done", 0))
+    total_pages = pages_done + items_error
+    if max_error_ratio is None or total_pages <= 0:
+        return False
+    return (items_error / total_pages) <= max_error_ratio
+
+
 def _validate_absolute_positions(path: Path, page_size: int) -> int:
     checked = 0
     for row in read_csv_rows(path):
@@ -85,21 +96,18 @@ def run_serp(config: AppConfig, db: StateDB, ctx: RunContext) -> dict[str, int |
         required_columns=required,
         min_rows=1,
         allowed_statuses=status_set,
-        max_error_ratio=_max_error_ratio(config),
     )
     validate_csv_contract(
         staging_path,
         required_columns=required,
         min_rows=1,
         allowed_statuses=status_set,
-        max_error_ratio=_max_error_ratio(config),
     )
     validate_csv_contract(
         mart_path,
         required_columns=required,
         min_rows=1,
         allowed_statuses=status_set,
-        max_error_ratio=_max_error_ratio(config),
     )
     validate_csv_contract(
         pages_path,
@@ -120,49 +128,51 @@ def run_serp(config: AppConfig, db: StateDB, ctx: RunContext) -> dict[str, int |
         ],
         min_rows=1,
         allowed_statuses=status_set,
-        max_error_ratio=_max_error_ratio(config),
     )
 
-    validate_csv_contract(
-        sellers_input_export,
-        required_columns=required,
-        min_rows=1,
-        allowed_statuses=status_set,
-        max_error_ratio=_max_error_ratio(config),
-    )
+    outputs_published = int(result.get("outputs_published", 0)) == 1
+    if outputs_published:
+        validate_csv_contract(
+            sellers_input_export,
+            required_columns=required,
+            min_rows=1,
+            allowed_statuses=status_set,
+        )
 
-    validate_csv_contract(
-        preview_export,
-        required_columns=[
-            "query",
-            "page",
-            "position_on_page",
-            "absolute_position",
-            "nmId",
-            "product_name",
-            "brand",
-            "supplier_id",
-            "supplier_name",
-            "final_price",
-            "price",
-            "sale_price",
-            "rating",
-            "feedbacks",
-            "raw_file",
-            "run_id",
-            "collected_at_utc",
-        ],
-        min_rows=1,
-    )
+        validate_csv_contract(
+            preview_export,
+            required_columns=[
+                "query",
+                "page",
+                "position_on_page",
+                "absolute_position",
+                "nmId",
+                "product_name",
+                "brand",
+                "supplier_id",
+                "supplier_name",
+                "final_price",
+                "price",
+                "sale_price",
+                "rating",
+                "feedbacks",
+                "raw_file",
+                "run_id",
+                "collected_at_utc",
+            ],
+            min_rows=1,
+        )
 
     if not config.runtime.dry_run:
         checked = _validate_absolute_positions(staging_path, int(config.raw.get("serp", {}).get("page_size", 100)))
         if checked <= 0:
             raise CriticalPipelineError("No success rows found for absolute_position validation")
 
-    if int(result.get("items_error", 0)) > 0:
+    if int(result.get("items_error", 0)) > 0 and not _errors_within_threshold(result, _max_error_ratio(config)):
         raise NonCriticalPipelineError(
-            f"serp completed with partial errors: items_error={result.get('items_error', 0)}"
+            f"serp completed with partial errors above threshold: "
+            f"items_error={result.get('items_error', 0)} pages_done={result.get('pages_done', 0)} "
+            f"max_error_ratio={_max_error_ratio(config)}"
         )
 
     return result

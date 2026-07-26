@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from app.common.exceptions import ConfigValidationError, RunLockedError
 from app.common.runner import run_component
 from app.common.state_db import StateDB
 import app.common.runner as runner_mod
+import app.common.state_db as state_db_mod
 
 
 def _write_text(path: Path, content: str) -> None:
@@ -114,7 +116,7 @@ def test_run_lock_blocks_parallel_run(tmp_path: Path) -> None:
     lock_dir = cfg.paths.STATE_DIR / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_file = lock_dir / "pipeline.lock"
-    lock_file.write_text('{"pid":999,"target":"daily"}', encoding="utf-8")
+    lock_file.write_text(json.dumps({"pid": os.getpid(), "target": "daily"}), encoding="utf-8")
 
     with pytest.raises(RunLockedError):
         run_component(config=cfg, db=db, target="filter")
@@ -138,6 +140,32 @@ def test_state_db_persists_error_code(tmp_path: Path) -> None:
     rows = db.list_errors("r1")
     assert rows
     assert rows[0]["error_code"] == "NETWORK_ERROR"
+
+
+def test_state_db_closes_connections(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    closed: list[sqlite3.Connection] = []
+    real_connect = state_db_mod.sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
+
+    def _connect(*args, **kwargs):
+        kwargs["factory"] = TrackingConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(state_db_mod.sqlite3, "connect", _connect)
+
+    cfg = load_config(str(_make_config(tmp_path)))
+    db = StateDB(cfg.paths.SQLITE_DB)
+    db.init_schema()
+    db.save_checkpoint("sellers", "1001", "success|r1|t", "t")
+    assert db.get_checkpoint("sellers", "1001") == "success|r1|t"
+
+    assert len(closed) >= 3
+    with pytest.raises(sqlite3.ProgrammingError):
+        closed[-1].execute("SELECT 1")
 
 
 def test_cleanup_dry_run_collects_old_files(tmp_path: Path) -> None:

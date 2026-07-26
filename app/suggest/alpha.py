@@ -9,6 +9,7 @@ from app.common.constants import COMPONENT_SUGGEST
 from app.common.csv_io import append_csv_rows
 from app.common.exceptions import CriticalPipelineError
 from app.common.logging_setup import get_logger
+from app.common.proxy_required import require_marketplace_proxy
 from app.common.retry import with_retry
 from app.common.run_context import RunContext, utc_now_iso
 from app.common.state_db import StateDB
@@ -195,6 +196,7 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
     logger = get_logger("suggest")
     if sync_playwright is None:
         raise CriticalPipelineError("playwright is required for suggest component")
+    proxy_route = require_marketplace_proxy(config.raw, browser=True)
 
     settings = config.raw.get("suggest", {})
     prefixes_path = _resolve_path(config, str(settings.get("prefixes_file", "config/prefixes.txt")))
@@ -204,6 +206,8 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
     throttle_ms = int(settings.get("throttle_ms", 900))
     type_delay_ms = int(settings.get("type_delay_ms", 50))
     headless = bool(settings.get("headless", False))
+    browser_channel = str(settings.get("browser_channel", "")).strip()
+    browser_executable_path = str(settings.get("browser_executable_path", "")).strip()
     max_typed = int(settings.get("max_typed_queries", 0))
     full_refresh = bool(settings.get("full_refresh_checkpoints", False)) or bool(settings.get("force_full_refresh", False))
     empty_checkpoint_policy = str(settings.get("empty_checkpoint_policy", "reprocess")).lower().strip()
@@ -266,8 +270,18 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
     rows_written = 0
 
     with sync_playwright() as p:
+        launch_kwargs: dict[str, Any] = {
+            "user_data_dir": str(browser_profile_dir),
+            "headless": headless,
+            "proxy": proxy_route.playwright_proxy(),
+        }
+        if browser_channel:
+            launch_kwargs["channel"] = browser_channel
+        elif browser_executable_path:
+            launch_kwargs["executable_path"] = browser_executable_path
+
         context = with_retry(
-            lambda: p.chromium.launch_persistent_context(user_data_dir=str(browser_profile_dir), headless=headless),
+            lambda: p.chromium.launch_persistent_context(**launch_kwargs),
             attempts=config.runtime.retry_max_attempts,
             base_delay=config.runtime.retry_base_delay_seconds,
             max_delay=config.runtime.retry_max_delay_seconds,
@@ -334,7 +348,7 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
                         )
                     except Exception as exc:
                         status = CHECKPOINT_VALUE_ERROR
-                        error_message = str(exc)
+                        error_message = f"browser_failed:{exc.__class__.__name__}"
                         suggestions = []
 
                     list_size = len(suggestions)
@@ -453,6 +467,3 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
         "raw_path": str(raw_path),
         "staging_path": str(staging_path),
     }
-
-
-
