@@ -11,7 +11,7 @@ from app.common.csv_io import read_csv_rows
 from app.common.exceptions import NonCriticalPipelineError
 from app.common.run_context import RunContext, utc_now_iso
 from app.common.state_db import StateDB
-from app.sellers.engine import SellerSeed, SellersEngine
+from app.sellers.engine import SellerSeed, SellersEngine, SellersRunScope
 from app.sellers.runner import run_sellers
 
 
@@ -288,3 +288,62 @@ def test_bridge_contains_query_product_seller_links(tmp_path: Path, monkeypatch:
     assert ("1001", "кроссовки", "12") in triples
     assert ("2002", "футболка", "21") in triples
 
+
+def test_scoped_sellers_deduplicate_suppliers_without_global_latest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(str(_make_config(tmp_path)))
+    input_path = tmp_path / "data/marts/wb_four_region/plan/run/products_for_sellers.csv"
+    _write_products_csv(
+        input_path,
+        [
+            {
+                "run_id": "regional-run",
+                "query": "q1",
+                "query_group": "pack",
+                "nmId": "11",
+                "supplier_id": "1001",
+                "supplier_name": "A",
+                "status": "success",
+            },
+            {
+                "run_id": "regional-run",
+                "query": "q2",
+                "query_group": "pack",
+                "nmId": "12",
+                "supplier_id": "1001",
+                "supplier_name": "A",
+                "status": "success",
+            },
+        ],
+    )
+    db = StateDB(tmp_path / "state/wb_four_region/plan/run/sellers.sqlite")
+    db.init_schema()
+    ctx = RunContext(
+        run_id="20260726_001600Z",
+        pipeline="wb_four_region_nightly",
+        component="sellers_regional",
+        started_at_utc=utc_now_iso(),
+    )
+    scope = SellersRunScope(
+        input_products_path=input_path,
+        raw_dir=tmp_path / "data/raw/sellers_scoped/plan/run",
+        staging_dir=tmp_path / "data/staging/sellers_scoped/plan/run",
+        mart_dir=tmp_path / "data/marts/sellers_scoped/plan/run",
+        checkpoint_component="sellers_regional:plan",
+    )
+    engine = SellersEngine(config=config, db=db, ctx=ctx, run_scope=scope)
+    calls: list[str] = []
+    monkeypatch.setattr(SellersEngine, "_build_session", lambda self: nullcontext(object()))
+
+    def fake_fetch(self: SellersEngine, session, seller_id: str):
+        calls.append(seller_id)
+        return 200, _success_payload(seller_id), "", ""
+
+    monkeypatch.setattr(SellersEngine, "_fetch_seller", fake_fetch)
+    result = engine.run()
+    assert calls == ["1001"]
+    assert result["latest_mart_sellers_path"] == ""
+    assert not (tmp_path / "data/marts/sellers/latest").exists()
+    assert len(read_csv_rows(Path(str(result["mart_sellers_path"])))) == 1

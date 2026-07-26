@@ -390,3 +390,65 @@ egress IP, cookies, headers, proxy values, credentials or crontab contents.
 An endpoint is usable only when the transport returns the literal boolean
 `suitable=true`, an integer (not boolean) HTTP status `200`, and no error code;
 other truthy or malformed values fail closed.
+
+## Four-Region Phase A
+
+`config/wb/collection_plans/shevron-four-regions-top1000-v2.json` is the
+production-shaped but disabled four-region definition for Moscow,
+Rostov-on-Don, Novosibirsk and Kazan. It uses all 30 pinned `shevron-core`
+queries and maximum depth 1000, so a complete generation contains at most
+1200 pages.
+Depth is a maximum: v2 requires a consistent payload `total` and records
+1-10 pages per query. A terminal short page is valid only when it exactly
+completes `min(total, 1000)`; empty or inconsistent payloads fail closed.
+
+The only future full-pipeline launcher is:
+
+```bash
+scripts/run_wb_four_region_nightly.sh \
+  --config config/config.yaml \
+  --plan-file config/wb/collection_plans/shevron-four-regions-top1000-v2.json \
+  --no-publish
+```
+
+Resume requires the same command plus `--resume-run-id`. The launcher must not
+be scheduled or used live until the owner approves a controlled window and the
+plan plus exactly four regions are enabled in a reviewed change.
+
+If collection is already complete but downstream was stopped by its own
+runtime cutoff, use the same launcher with `--downstream-only-run-id`. It
+revalidates the immutable scoped generation and resumes seller checkpoints
+without another SERP request.
+
+The v2 runtime window is bounded and resumable. A new run can start only in its
+reviewed 00:15-00:45 MSK window. One invocation is capped at six hours and at
+23:00 MSK. The runner estimates the next atomic 10-page query segment, checks
+the deadline before every network attempt and repeats at most the unfinished
+segment after interruption. It does not lower the production timeout and uses
+only production SERP page/query pacing.
+
+Position facts are keyed by run, region, query and absolute position. Repeated
+product IDs at different positions remain separate facts; only seller input is
+deduplicated by product. Reports include actual rows, the 120000 maximum
+capacity and `duplicate_product_positions`.
+
+Regional warehouse facts retain the existing query-position price, brand,
+supplier, rating, stock, status and collection-time fields when present.
+Warehouse-owned `regional_run_quality` and `regional_query_quality` tables
+carry complete run/query terminal, count, egress and source-hash evidence;
+future Parser Data API code must read these facts rather than arbitrary parser
+state files.
+
+Warehouse ingestion uses a bounded DuckDB runtime in production:
+`memory_limit=1GiB`, `threads=2`, with private mode-`700` spill sessions under
+ignored `data/warehouse/wb_regional/tmp`. Each clean close removes its own
+session; only stale named sessions older than 24 hours are eligible for later
+cleanup.
+
+Downstream sellers, regional warehouse and owner-report state start only after
+all four scoped region generations are complete. They never publish global
+latest. Existing global warehouse history is synchronized read-only and
+incrementally into the regional warehouse as legacy `yaroslavl` data using
+stable keys and row hashes. New runs append; mutation or disappearance of an
+already imported fact fails closed. Yaroslavl is not part of the future
+collection plan.

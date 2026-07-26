@@ -26,6 +26,32 @@
       "dest_resolved_at_utc": null,
       "dest_resolution_source": null,
       "dest_resolution_status": "unresolved"
+    },
+    {
+      "region_id": "novosibirsk",
+      "region_name": "Новосибирск",
+      "enabled": false,
+      "resolver": "wb_geo_xinfo",
+      "latitude": "55.0289670",
+      "longitude": "82.9216730",
+      "address_label": "Новосибирск, Россия",
+      "dest_id": null,
+      "dest_resolved_at_utc": null,
+      "dest_resolution_source": null,
+      "dest_resolution_status": "unresolved"
+    },
+    {
+      "region_id": "kazan",
+      "region_name": "Казань",
+      "enabled": false,
+      "resolver": "wb_geo_xinfo",
+      "latitude": "55.7961270",
+      "longitude": "49.1064050",
+      "address_label": "Казань, Россия",
+      "dest_id": null,
+      "dest_resolved_at_utc": null,
+      "dest_resolution_source": null,
+      "dest_resolution_status": "unresolved"
     }
   ]
 }

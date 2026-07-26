@@ -2151,6 +2151,29 @@ def test_ordered_search_falls_back_for_production_nested_promo_anomaly() -> None
 
     assert result.endpoint_id == "fallback-1"
     assert result.attempted_endpoint_ids == ("primary", "fallback-1")
+
+
+def test_ordered_search_rechecks_runtime_deadline_before_each_endpoint_attempt() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(status_code=498),
+            FakeResponse(payload={"products": _products(1_000)}),
+        ]
+    )
+    transport = _ordered_requests_transport(session)
+    checked: list[float] = []
+
+    def deadline_gate(requested: float) -> float:
+        checked.append(requested)
+        return requested
+
+    transport.set_network_timeout_provider(deadline_gate)
+    result = transport.search_ordered(
+        _scoped_search_request(),
+        timeout_seconds=45,
+    )
+    assert result.endpoint_id == "fallback-1"
+    assert checked == [45, 45]
     assert len(session.calls) == 2
 
 

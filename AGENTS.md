@@ -442,6 +442,28 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   this prevents two contenders from unlinking/recreating different
   `pipeline.lock` inodes during empty/corrupt/dead-owner recovery. Do not treat
   the guard file itself as evidence of an active parser run.
+- Phase A four-region work is isolated in the disabled
+  `shevron-four-regions-top1000-v2` collection plan. Its target regions are
+  Moscow, Rostov-on-Don, Novosibirsk and Kazan, with 30 pinned queries and
+  depth 1000. Do not schedule or enable it without a separate owner gate.
+  It uses the exact production SERP page/query pacing and HTTP timeout,
+  bounded resumable invocation deadlines, scoped sellers and a separate
+  regional warehouse. Historical global WB warehouse rows are assigned
+  `region_id=yaroslavl` during regional migration; Yaroslavl is historical
+  provenance, not a future collection region. Depth 1000 is a maximum:
+  bounded v2 query segments require consistent payload-total evidence and may
+  complete in 1-10 pages. Position facts use
+  `(run_id, region_id, query_id, absolute_position)` and preserve repeated
+  product IDs; deduplication is seller-input-only. Legacy Yaroslavl import is
+  an incremental set-based sync with row hashes, not a whole-file hash gate.
+  Regional warehouse must retain the current analytical query/seller fields
+  and materialize run/query quality facts inside DuckDB; future API readers
+  must not depend on incidental parser state files.
+  Regional warehouse/sync DuckDB connections are bounded to `1GiB`, two
+  threads and private spill sessions under ignored
+  `data/warehouse/wb_regional/tmp`; do not bypass this runtime factory.
+  Operational contract:
+  `docs/tasks/WB_FOUR_REGION_NIGHTLY_EXECPLAN_20260726.md`.
 - A WB top-20 product-only SERP run on 2026-06-12
   (`run_id=20260612_195008Z`) collected `9577` product rows, but finished
   `partial`: `96` pages succeeded, `83` pages returned HTTP 429, and `3` pages

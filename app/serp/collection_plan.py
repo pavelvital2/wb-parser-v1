@@ -16,8 +16,10 @@ from typing import Any, Mapping
 QUERY_PACK_SCHEMA_VERSION = "wb_query_pack_v1"
 REGION_REGISTRY_SCHEMA_VERSION = "wb_region_registry_v1"
 COLLECTION_PLAN_SCHEMA_VERSION = "wb_collection_plan_v1"
+BOUNDED_COLLECTION_PLAN_SCHEMA_VERSION = "wb_collection_plan_v2"
 EFFECTIVE_PLAN_SCHEMA_VERSION = "wb_effective_collection_plan_v1"
 RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION = "wb_effective_collection_plan_v2"
+BOUNDED_RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION = "wb_effective_collection_plan_v3"
 PROVENANCE_SCHEMA_VERSION = "wb_query_pack_provenance_v1"
 
 PAGE_SIZE = 100
@@ -96,6 +98,17 @@ class CollectionQuality:
 
 
 @dataclass(frozen=True, slots=True)
+class CollectionRuntimeWindow:
+    mode: str
+    scheduled_start_msk: str
+    new_run_start_grace_seconds: int
+    max_invocation_runtime_seconds: int
+    absolute_cutoff_msk: str
+    minimum_resume_window_seconds: int
+    finalization_reserve_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
 class CollectionPlan:
     source_path: Path
     source_sha256: str
@@ -110,6 +123,7 @@ class CollectionPlan:
     sellers_mode: str
     proxy_rotation_mode: str
     quality: CollectionQuality
+    runtime_window: CollectionRuntimeWindow | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -602,8 +616,102 @@ def _load_quality(value: Any) -> CollectionQuality:
     )
 
 
+def _require_hhmm(value: Any, *, field: str) -> str:
+    text = _require_string(value, field=field)
+    if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", text):
+        raise CollectionPlanValidationError(f"{field} must use HH:MM")
+    return text
+
+
+def _load_runtime_window(value: Any) -> CollectionRuntimeWindow:
+    field = "collection_plan.runtime_window"
+    window = _require_object(value, field=field)
+    _require_keys(
+        window,
+        required={
+            "mode",
+            "scheduled_start_msk",
+            "new_run_start_grace_seconds",
+            "max_invocation_runtime_seconds",
+            "absolute_cutoff_msk",
+            "minimum_resume_window_seconds",
+            "finalization_reserve_seconds",
+        },
+        field=field,
+    )
+    mode = _require_string(window["mode"], field=f"{field}.mode")
+    if mode != "bounded_resumable":
+        raise CollectionPlanValidationError(
+            f"{field}.mode must be bounded_resumable"
+        )
+    scheduled_start_msk = _require_hhmm(
+        window["scheduled_start_msk"],
+        field=f"{field}.scheduled_start_msk",
+    )
+    absolute_cutoff_msk = _require_hhmm(
+        window["absolute_cutoff_msk"],
+        field=f"{field}.absolute_cutoff_msk",
+    )
+    if absolute_cutoff_msk <= scheduled_start_msk:
+        raise CollectionPlanValidationError(
+            f"{field}.absolute_cutoff_msk must be after scheduled_start_msk"
+        )
+    finalization_reserve_seconds = _require_int(
+        window["finalization_reserve_seconds"],
+        field=f"{field}.finalization_reserve_seconds",
+        minimum=5,
+        maximum=900,
+    )
+    minimum_resume_window_seconds = _require_int(
+        window["minimum_resume_window_seconds"],
+        field=f"{field}.minimum_resume_window_seconds",
+        minimum=300,
+        maximum=7200,
+    )
+    max_invocation_runtime_seconds = _require_int(
+        window["max_invocation_runtime_seconds"],
+        field=f"{field}.max_invocation_runtime_seconds",
+        minimum=minimum_resume_window_seconds,
+        maximum=43200,
+    )
+    if minimum_resume_window_seconds <= finalization_reserve_seconds:
+        raise CollectionPlanValidationError(
+            f"{field}.minimum_resume_window_seconds must exceed finalization reserve"
+        )
+    return CollectionRuntimeWindow(
+        mode=mode,
+        scheduled_start_msk=scheduled_start_msk,
+        new_run_start_grace_seconds=_require_int(
+            window["new_run_start_grace_seconds"],
+            field=f"{field}.new_run_start_grace_seconds",
+            minimum=0,
+            maximum=7200,
+        ),
+        max_invocation_runtime_seconds=max_invocation_runtime_seconds,
+        absolute_cutoff_msk=absolute_cutoff_msk,
+        minimum_resume_window_seconds=minimum_resume_window_seconds,
+        finalization_reserve_seconds=finalization_reserve_seconds,
+    )
+
+
 def load_collection_plan(path: Path | str) -> CollectionPlan:
     source_path, payload, source_sha256 = _load_json_document(path)
+    schema_version = _require_string(
+        payload.get("schema_version"),
+        field="collection_plan.schema_version",
+    )
+    if schema_version not in {
+        COLLECTION_PLAN_SCHEMA_VERSION,
+        BOUNDED_COLLECTION_PLAN_SCHEMA_VERSION,
+    }:
+        raise CollectionPlanValidationError(
+            "collection_plan.schema_version is unsupported"
+        )
+    optional = (
+        {"runtime_window"}
+        if schema_version == BOUNDED_COLLECTION_PLAN_SCHEMA_VERSION
+        else set()
+    )
     _require_keys(
         payload,
         required={
@@ -621,12 +729,16 @@ def load_collection_plan(path: Path | str) -> CollectionPlan:
             "quality",
         },
         field="collection_plan",
+        optional=optional,
     )
-    _validate_schema_version(
-        payload,
-        expected=COLLECTION_PLAN_SCHEMA_VERSION,
-        field="collection_plan",
-    )
+    if schema_version == BOUNDED_COLLECTION_PLAN_SCHEMA_VERSION:
+        if "runtime_window" not in payload:
+            raise CollectionPlanValidationError(
+                "collection_plan.runtime_window is required for schema v2"
+            )
+        runtime_window = _load_runtime_window(payload["runtime_window"])
+    else:
+        runtime_window = None
 
     collection_plan_id = _require_id(
         payload["collection_plan_id"],
@@ -722,6 +834,7 @@ def load_collection_plan(path: Path | str) -> CollectionPlan:
         sellers_mode=sellers_mode,
         proxy_rotation_mode=proxy_rotation_mode,
         quality=quality,
+        runtime_window=runtime_window,
     )
 
 
@@ -1203,9 +1316,13 @@ def build_effective_plan_snapshot(
 
     snapshot: dict[str, Any] = {
         "schema_version": (
-            RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION
-            if transport_fingerprint is not None
-            else EFFECTIVE_PLAN_SCHEMA_VERSION
+            BOUNDED_RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION
+            if transport_fingerprint is not None and plan.runtime_window is not None
+            else (
+                RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION
+                if transport_fingerprint is not None
+                else EFFECTIVE_PLAN_SCHEMA_VERSION
+            )
         ),
         "collection_plan_id": plan.collection_plan_id,
         "query_pack_id": bundle.query_pack.query_pack_id,
@@ -1241,6 +1358,16 @@ def build_effective_plan_snapshot(
             "require_distinct_destinations": plan.quality.require_distinct_destinations,
         },
     }
+    if plan.runtime_window is not None:
+        snapshot["runtime_window"] = {
+            "mode": plan.runtime_window.mode,
+            "scheduled_start_msk": plan.runtime_window.scheduled_start_msk,
+            "new_run_start_grace_seconds": plan.runtime_window.new_run_start_grace_seconds,
+            "max_invocation_runtime_seconds": plan.runtime_window.max_invocation_runtime_seconds,
+            "absolute_cutoff_msk": plan.runtime_window.absolute_cutoff_msk,
+            "minimum_resume_window_seconds": plan.runtime_window.minimum_resume_window_seconds,
+            "finalization_reserve_seconds": plan.runtime_window.finalization_reserve_seconds,
+        }
     if transport_fingerprint is not None:
         snapshot["transport_fingerprint"] = dict(transport_fingerprint)
     _validate_effective_plan_snapshot(snapshot)
@@ -1252,6 +1379,7 @@ def _validate_effective_plan_snapshot(snapshot: Mapping[str, Any]) -> None:
     if schema_version not in {
         EFFECTIVE_PLAN_SCHEMA_VERSION,
         RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION,
+        BOUNDED_RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION,
     }:
         raise CollectionPlanValidationError(
             "effective_plan.schema_version is unsupported"
@@ -1275,14 +1403,24 @@ def _validate_effective_plan_snapshot(snapshot: Mapping[str, Any]) -> None:
         "proxy_rotation_mode",
         "quality",
     }
-    if schema_version == RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION:
+    if schema_version in {
+        RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION,
+        BOUNDED_RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION,
+    }:
         required.add("transport_fingerprint")
+    if schema_version == BOUNDED_RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION:
+        required.add("runtime_window")
     _require_keys(
         snapshot,
         required=required,
         field="effective_plan",
     )
-    if schema_version == RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION:
+    if schema_version == BOUNDED_RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION:
+        _load_runtime_window(snapshot["runtime_window"])
+    if schema_version in {
+        RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION,
+        BOUNDED_RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION,
+    }:
         fingerprint = _require_object(
             snapshot["transport_fingerprint"],
             field="effective_plan.transport_fingerprint",
