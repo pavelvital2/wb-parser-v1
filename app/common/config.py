@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ class RuntimeConfig:
 class AppConfig:
     raw: dict[str, Any]
     config_file: Path
+    config_file_sha256: str
     project_root: Path
     paths: ProjectPaths
     runtime: RuntimeConfig
@@ -44,7 +46,9 @@ def load_config(path: str) -> AppConfig:
     if not config_file.exists():
         raise FileNotFoundError(f"Config file not found: {config_file}")
 
-    raw = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+    config_bytes = config_file.read_bytes()
+    config_file_sha256 = hashlib.sha256(config_bytes).hexdigest()
+    raw = yaml.safe_load(config_bytes.decode("utf-8")) or {}
     validate_raw_config(raw)
     project_root = config_file.parent.parent.resolve()
 
@@ -78,6 +82,7 @@ def load_config(path: str) -> AppConfig:
     return AppConfig(
         raw=raw,
         config_file=config_file,
+        config_file_sha256=config_file_sha256,
         project_root=project_root,
         paths=paths,
         runtime=cfg_runtime,

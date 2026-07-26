@@ -872,6 +872,7 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 protected_before
             )
             expected_source_hashes = {
+                "config_file": self.config.config_file_sha256,
                 "collection_plan": bundle.collection_plan_sha256,
                 "region_registry": bundle.region_registry_sha256,
                 "query_pack": bundle.query_pack_sha256,

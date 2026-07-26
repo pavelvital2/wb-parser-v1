@@ -762,6 +762,32 @@ def test_each_pilot_source_change_fails_and_suppresses_comparison(
     assert manifest["region_registry_sha256"] is None
 
 
+def test_config_change_after_load_fails_before_any_transport_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    config_path = root / "config/config.yaml"
+    loaded_bytes = config_path.read_bytes()
+    assert config.config_file_sha256 == hashlib.sha256(loaded_bytes).hexdigest()
+    config_path.write_bytes(loaded_bytes + b"\n# changed after load_config\n")
+    transport = PilotFakeTransport()
+
+    with pytest.raises(
+        CollectionPlanRunError,
+        match="protected pilot source hash changed before network",
+    ):
+        _run(config, plan_path, transport, root=root)
+
+    assert transport.events == []
+    assert transport.egress_calls == 0
+    assert transport.resolve_calls == []
+    assert transport.probe_calls == []
+    assert transport.pin_calls == []
+    assert transport.search_calls == []
+    assert not _state_dir(root).exists()
+
+
 @pytest.mark.parametrize(
     "replacement_kind",
     ["missing", "symlink", "non_regular"],

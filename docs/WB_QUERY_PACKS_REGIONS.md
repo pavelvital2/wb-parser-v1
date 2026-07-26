@@ -213,7 +213,9 @@ the guarded runner performs this fixed sequence:
 
 1. validate and fix the exact config, collection-plan, region-registry and
    query-pack source paths, then hash those sources together with the protected
-   production file set and user crontab without persisting their contents;
+   production file set and user crontab without persisting their contents.
+   The config hash must equal the exact-byte SHA-256 retained by `AppConfig`
+   from the same bytes used for YAML parsing;
 2. check neutral egress and resolve Moscow and Rostov-on-Don destinations;
 3. probe the primary endpoint and at most one fallback, then pin the first
    usable endpoint;
