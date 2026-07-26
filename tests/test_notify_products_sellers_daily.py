@@ -29,6 +29,7 @@ def configure_paths(notify, project: Path) -> None:
     notify.QUERIES_FILE = project / "exports/queries.txt"
     notify.WAREHOUSE_STATE_FILE = project / "state/wb_warehouse/latest.json"
     notify.RUN_REPORT_FILE = project / "state/run_reports/latest.json"
+    notify.RUN_REPORTS_DIR = project / "state/run_reports"
     notify.KEEPER_STATE_FILE = project / "state/wb_session_keeper/latest.json"
     notify.PREFLIGHT_STATE_FILE = project / "state/wb_nightly_preflight/latest.json"
     notify.WATCHDOG_STATE_FILE = project / "state/wb_persistent_session/watchdog.json"
@@ -60,6 +61,29 @@ def test_health_lines_summarize_local_runtime_state(tmp_path: Path) -> None:
         json.dumps({"pipeline": "sellers", "status": "success", "run_id": "sellers_run", "duration_seconds": 294}),
     )
     write(
+        notify.RUN_REPORTS_DIR / "serp_run.json",
+        json.dumps(
+            {
+                "pipeline": "serp",
+                "status": "success",
+                "run_id": "serp_run",
+                "components": [
+                    {
+                        "component": "serp",
+                        "note": (
+                            "queries=1 pages=1 ok=1 err=0 published=1 "
+                            "ip_rotations=1 ip_rotation_attempts=2 "
+                            "ip_rotation_successes=1 ip_rotation_failures=1 "
+                            "ip_rotation_last_change=203.0.x.x->198.51.x.x "
+                            "ip_rotation_last_reason=http_status=429 "
+                            "ip_rotation_last_scope=page=1"
+                        ),
+                    }
+                ],
+            }
+        ),
+    )
+    write(
         notify.WATCHDOG_STATE_FILE,
         json.dumps({"action": "disabled", "reason": "disabled_by_env"}),
     )
@@ -76,9 +100,56 @@ def test_health_lines_summarize_local_runtime_state(tmp_path: Path) -> None:
     assert "pages=3" in text
     assert "429=1" in text
     assert "498=1" in text
+    assert "Proxy rotation" in text
+    assert "attempted=2" in text
+    assert "succeeded=1" in text
+    assert "failed=1" in text
+    assert "203.0.x.x-&gt;198.51.x.x" in text
     assert "products_run=serp_run" in text
     assert "sellers_run=sellers_run" in text
     assert "disabled_by_env" in text
+
+
+def test_proxy_rotation_uses_current_failed_serp_report_over_stale_latest_products(tmp_path: Path) -> None:
+    notify = _load_notify()
+    configure_paths(notify, tmp_path)
+    write(notify.PRODUCTS_FILE, "run_id;product_id\nold_serp;1\n")
+    write(
+        notify.RUN_REPORTS_DIR / "old_serp.json",
+        json.dumps(
+            {
+                "pipeline": "serp",
+                "status": "success",
+                "components": [{"component": "serp", "note": "ip_rotation_attempts=0 ip_rotation_successes=0"}],
+            }
+        ),
+    )
+    write(
+        notify.RUN_REPORT_FILE,
+        json.dumps(
+            {
+                "pipeline": "serp",
+                "status": "failed",
+                "run_id": "current_failed_serp",
+                "components": [
+                    {
+                        "component": "serp",
+                        "note": (
+                            "ip_rotation_attempts=1 ip_rotation_successes=0 "
+                            "ip_rotation_failures=1 ip_rotation_last_reason=http_status=429"
+                        ),
+                    }
+                ],
+            }
+        ),
+    )
+
+    label = notify.proxy_rotation_health_label()
+
+    assert "attempted=1" in label
+    assert "succeeded=0" in label
+    assert "failed=1" in label
+    assert "reason=http_status=429" in label
 
 
 def test_build_message_includes_health_section(tmp_path: Path) -> None:

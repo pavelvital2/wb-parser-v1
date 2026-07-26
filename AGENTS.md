@@ -109,7 +109,8 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   `/home/pavel/.marketplace-proxy.env`, set `PARSER_WB_PROXY_URL` from the
   direct HTTP proxy, set `PARSER_WB_REQUEST_HEADERS_FILE` to ignored mode-`600`
   `config/wb_request_headers.json`, set `PARSER_WB_COOKIE_RENEW_COMMAND=ensure`,
-  and keep stale rotate hooks disabled. Do not print or commit the proxy
+  and use the local Gleb Proxy Gateway rotate endpoint only for SERP page-error
+  repair. Do not print or commit the proxy
   credentials or header values. Verification: keeper smoke through
   `config/config.yaml` returned `3/3` HTTP 200 product responses via direct
   3proxy; preflight passed and saved known-good backup. A clean Playwright
@@ -302,6 +303,20 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   `serp.error_ip_rotation_max_attempts=1`; this prevents infinite loops while
   preserving resume/checkpoint behavior. Keep the rotate API URL only in
   ignored `config/runtime.env`; do not print or commit it.
+- On 2026-07-13, WB proxy rotation was connected to the active local Gleb Proxy
+  Gateway: `PARSER_WB_PROXY_ROTATE_URL=http://127.0.0.1:9810/rotate`,
+  `PARSER_WB_PROXY_ROTATE_TIMEOUT_SECONDS=70`,
+  `PARSER_WB_PROXY_ROTATE_WAIT_SECONDS=120`, and
+  `PARSER_WB_PROXY_ROTATE_MAX_ATTEMPTS_PER_PAGE=1` in ignored
+  `config/runtime.env`. Success is strict: only HTTP `200` with JSON
+  `ok=true`. Non-200, invalid JSON, or `ok!=true` must not mask the original
+  page error or retry through the same run as if rotation succeeded. After a
+  confirmed rotate, SERP closes the old `requests.Session`, reloads current
+  cookies, creates a new session, and retries only the current page. Run report
+  and Telegram health include attempted/succeeded/failed rotation counters and
+  masked IP change when the Rotate API returns old/new external IP fields.
+  Never pass WB query text, cookies, headers, credentials, or tokens to the
+  rotate URL.
 - WB cookie/access maintenance is scheduled through the user's crontab every
   30 minutes at minutes `7` and `37`: `7,37 * * * * /home/pavel/projects/parser_wb/scripts/run_wb_cookie_renewal.sh`
   with output appended to `data/logs/wb_cookie_renewal.log`. Current direct

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -69,6 +70,20 @@ def _max_error_ratio(config: AppConfig) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _mask_external_ip(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = ip_address(text)
+    except ValueError:
+        return "masked"
+    parts = parsed.exploded.split("." if parsed.version == 4 else ":")
+    if parsed.version == 4:
+        return f"{parts[0]}.{parts[1]}.x.x"
+    return f"{parts[0]}:{parts[1]}::x"
 
 
 def _errors_within_threshold(*, items_error: int, pages_done: int, max_error_ratio: float | None) -> bool:
@@ -156,6 +171,12 @@ class SerpEngine:
         )
         if not self.error_ip_rotation_url:
             self.error_ip_rotation_enabled = False
+        self._ip_rotation_attempts = 0
+        self._ip_rotation_successes = 0
+        self._ip_rotation_failures = 0
+        self._last_ip_rotation_change = ""
+        self._last_ip_rotation_reason = ""
+        self._last_ip_rotation_scope = ""
 
         out_cfg = self.serp_cfg.get("output_files", {})
         self.raw_products_name = str(out_cfg.get("raw_products_csv", "products_raw.csv"))
@@ -196,6 +217,12 @@ class SerpEngine:
         consecutive_rate_limits = 0
         payload_anomaly_cooldowns = 0
         ip_rotations = 0
+        self._ip_rotation_attempts = 0
+        self._ip_rotation_successes = 0
+        self._ip_rotation_failures = 0
+        self._last_ip_rotation_change = ""
+        self._last_ip_rotation_reason = ""
+        self._last_ip_rotation_scope = ""
 
         session = self._build_session(cookie_value)
         try:
@@ -463,10 +490,21 @@ class SerpEngine:
             "outputs_published": int(outputs_published),
             "payload_anomaly_cooldowns": payload_anomaly_cooldowns,
             "ip_rotations": ip_rotations,
+            "ip_rotation_attempts": self._ip_rotation_attempts,
+            "ip_rotation_successes": self._ip_rotation_successes,
+            "ip_rotation_failures": self._ip_rotation_failures,
+            "ip_rotation_last_change": self._last_ip_rotation_change,
+            "ip_rotation_last_reason": self._last_ip_rotation_reason,
+            "ip_rotation_last_scope": self._last_ip_rotation_scope,
             "note": (
                 f"queries={len(tasks)} pages={pages_done} ok={items_ok} err={items_error} "
                 f"published={int(outputs_published)} payload_anomaly_cooldowns={payload_anomaly_cooldowns} "
-                f"ip_rotations={ip_rotations}"
+                f"ip_rotations={ip_rotations} ip_rotation_attempts={self._ip_rotation_attempts} "
+                f"ip_rotation_successes={self._ip_rotation_successes} "
+                f"ip_rotation_failures={self._ip_rotation_failures} "
+                f"ip_rotation_last_change={self._last_ip_rotation_change or 'none'} "
+                f"ip_rotation_last_reason={self._last_ip_rotation_reason or 'none'} "
+                f"ip_rotation_last_scope={self._last_ip_rotation_scope or 'none'}"
             ),
         }
 
@@ -721,6 +759,9 @@ class SerpEngine:
         return ip_rotations < self.error_ip_rotation_max_attempts
 
     def _rotate_ip_after_error(self, *, query: str, page: int, http_status: int, error_message: str) -> bool:
+        self._ip_rotation_attempts += 1
+        self._last_ip_rotation_reason = f"http_status={http_status}"
+        self._last_ip_rotation_scope = f"page={page}"
         self.logger.warning(
             "serp_error_ip_rotation_started",
             extra={
@@ -733,9 +774,11 @@ class SerpEngine:
                 "error_message": error_message[:240],
             },
         )
+        response: requests.Response | None = None
         try:
             response = requests.get(self.error_ip_rotation_url, timeout=self.error_ip_rotation_timeout_seconds)
         except Exception as exc:
+            self._ip_rotation_failures += 1
             self.logger.warning(
                 "serp_error_ip_rotation_failed",
                 extra={
@@ -748,32 +791,72 @@ class SerpEngine:
             )
             return False
 
-        if response.status_code < 200 or response.status_code >= 300:
-            self.logger.warning(
-                "serp_error_ip_rotation_non_2xx",
-                extra={
-                    "run_id": self.ctx.run_id,
-                    "component": COMPONENT_SERP,
-                    "query": query,
-                    "page": page,
-                    "rotate_http_status": response.status_code,
-                },
-            )
-            return False
+        try:
+            if response.status_code != 200:
+                self._ip_rotation_failures += 1
+                self.logger.warning(
+                    "serp_error_ip_rotation_http_rejected",
+                    extra={
+                        "run_id": self.ctx.run_id,
+                        "component": COMPONENT_SERP,
+                        "query": query,
+                        "page": page,
+                        "rotate_http_status": response.status_code,
+                    },
+                )
+                return False
 
-        if self.error_ip_rotation_wait_seconds > 0:
-            self.logger.warning(
-                "serp_error_ip_rotation_wait",
-                extra={
-                    "run_id": self.ctx.run_id,
-                    "component": COMPONENT_SERP,
-                    "query": query,
-                    "page": page,
-                    "wait_seconds": self.error_ip_rotation_wait_seconds,
-                },
-            )
-            time.sleep(self.error_ip_rotation_wait_seconds)
-        return True
+            try:
+                payload = response.json()
+            except Exception as exc:
+                self._ip_rotation_failures += 1
+                self.logger.warning(
+                    "serp_error_ip_rotation_invalid_json",
+                    extra={
+                        "run_id": self.ctx.run_id,
+                        "component": COMPONENT_SERP,
+                        "query": query,
+                        "page": page,
+                        "error_class": exc.__class__.__name__,
+                    },
+                )
+                return False
+
+            if not isinstance(payload, dict) or payload.get("ok") is not True:
+                self._ip_rotation_failures += 1
+                self.logger.warning(
+                    "serp_error_ip_rotation_not_ok",
+                    extra={
+                        "run_id": self.ctx.run_id,
+                        "component": COMPONENT_SERP,
+                        "query": query,
+                        "page": page,
+                    },
+                )
+                return False
+
+            previous_ip = _mask_external_ip(payload.get("previous_external_ip"))
+            current_ip = _mask_external_ip(payload.get("current_external_ip"))
+            if previous_ip and current_ip:
+                self._last_ip_rotation_change = f"{previous_ip}->{current_ip}"
+            else:
+                self._last_ip_rotation_change = "not_recorded"
+            self._ip_rotation_successes += 1
+            if self.error_ip_rotation_wait_seconds > 0:
+                self.logger.warning(
+                    "serp_error_ip_rotation_wait",
+                    extra={
+                        "run_id": self.ctx.run_id,
+                        "component": COMPONENT_SERP,
+                        "query": query,
+                        "page": page,
+                        "wait_seconds": self.error_ip_rotation_wait_seconds,
+                    },
+                )
+                time.sleep(self.error_ip_rotation_wait_seconds)
+            return True
+        finally:
+            response.close()
 
     def _run_payload_anomaly_keeper_smoke(self) -> None:
         if not self.payload_anomaly_keeper_smoke_enabled:

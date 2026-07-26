@@ -13,6 +13,7 @@ import csv
 import html
 import json
 import os
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -30,6 +31,7 @@ BRIDGE_FILE = PROJECT_DIR / "data/marts/sellers/latest/seller_query_product_brid
 QUERIES_FILE = PROJECT_DIR / "exports/queries.txt"
 WAREHOUSE_STATE_FILE = PROJECT_DIR / "state/wb_warehouse/latest.json"
 RUN_REPORT_FILE = PROJECT_DIR / "state/run_reports/latest.json"
+RUN_REPORTS_DIR = PROJECT_DIR / "state/run_reports"
 KEEPER_STATE_FILE = PROJECT_DIR / "state/wb_session_keeper/latest.json"
 PREFLIGHT_STATE_FILE = PROJECT_DIR / "state/wb_nightly_preflight/latest.json"
 WATCHDOG_STATE_FILE = PROJECT_DIR / "state/wb_persistent_session/watchdog.json"
@@ -306,6 +308,61 @@ def browser_health_label(
     return ", ".join(parts) if parts else "unknown"
 
 
+def _metric_from_note(note: str, key: str) -> str:
+    match = re.search(rf"(?:^|\s){re.escape(key)}=([^\s]+)", note)
+    return match.group(1) if match else ""
+
+
+def _serp_run_report_path() -> Path:
+    current_report = load_json(RUN_REPORT_FILE)
+    if current_report.get("pipeline") == "serp":
+        return RUN_REPORT_FILE
+    product_run = first_csv_value(PRODUCTS_FILE, "run_id")
+    if product_run:
+        candidate = RUN_REPORTS_DIR / f"{product_run}.json"
+        if candidate.exists():
+            return candidate
+    return RUN_REPORT_FILE
+
+
+def proxy_rotation_health_label(path: Path | None = None) -> str:
+    data = load_json(path or _serp_run_report_path())
+    if not data:
+        return "нет report"
+
+    notes: list[str] = []
+    for key in ("note",):
+        value = data.get(key)
+        if value:
+            notes.append(str(value))
+    for section_name in ("components", "tasks"):
+        section = data.get(section_name)
+        if isinstance(section, list):
+            for item in section:
+                if isinstance(item, dict) and item.get("component") == "serp" and item.get("note"):
+                    notes.append(str(item.get("note")))
+
+    selected_note = next((note for note in notes if "ip_rotation" in note or "ip_rotations=" in note), "")
+    if not selected_note:
+        return "нет данных"
+
+    successes = maybe_int(_metric_from_note(selected_note, "ip_rotation_successes"))
+    if successes is None:
+        successes = maybe_int(_metric_from_note(selected_note, "ip_rotations")) or 0
+    failures = maybe_int(_metric_from_note(selected_note, "ip_rotation_failures")) or 0
+    attempts = maybe_int(_metric_from_note(selected_note, "ip_rotation_attempts"))
+    if attempts is None:
+        attempts = successes + failures
+
+    ip_change = _metric_from_note(selected_note, "ip_rotation_last_change") or "none"
+    reason = _metric_from_note(selected_note, "ip_rotation_last_reason") or "none"
+    scope = _metric_from_note(selected_note, "ip_rotation_last_scope") or "none"
+    return (
+        f"attempted={attempts}, succeeded={successes}, failed={failures}, "
+        f"ip_change={ip_change}, reason={reason}, scope={scope}"
+    )
+
+
 def health_lines() -> list[str]:
     return [
         "",
@@ -315,6 +372,7 @@ def health_lines() -> list[str]:
         f"SERP latest: <code>{html.escape(serp_pages_health_label())}</code>",
         f"Latest: <code>{html.escape(latest_publication_label())}</code>",
         f"Run report: <code>{html.escape(run_report_label())}</code>",
+        f"Proxy rotation: <code>{html.escape(proxy_rotation_health_label())}</code>",
         f"Browser channel: <code>{html.escape(browser_health_label())}</code>",
     ]
 

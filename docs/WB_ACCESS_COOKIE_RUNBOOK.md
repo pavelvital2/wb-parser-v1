@@ -49,6 +49,11 @@ data/logs/cron_products_sellers.log
 - `PARSER_WB_COOKIE_RENEW_COMMAND=ensure`.
 - `PARSER_WB_COOKIE_REQUIRED=0`.
 - `PARSER_WB_COOKIELESS_FALLBACK_OK=1`.
+- `PARSER_WB_PROXY_ROTATE_URL` указывает на локальный Rotate API без
+  credentials: `http://127.0.0.1:9810/rotate`.
+- `PARSER_WB_PROXY_ROTATE_TIMEOUT_SECONDS=70`.
+- `PARSER_WB_PROXY_ROTATE_WAIT_SECONDS=120`.
+- `PARSER_WB_PROXY_ROTATE_MAX_ATTEMPTS_PER_PAGE=1`.
 - `PARSER_WB_PERSISTENT_WATCHDOG_ENABLED=0` допустим для текущего direct-proxy
   режима, если browser HTML blocked, а API/SERP smoke проходит.
 
@@ -144,6 +149,36 @@ Browser `HTTP 498`, API/SERP smoke ok
 : Это rate-limit/anti-bot на сборе. Не повышай скорость. Смотри retry,
   deferred retry и IP rotation logs.
 
+## Proxy Rotation
+
+WB SERP вызывает local Rotate API только как реакцию на ошибку текущей страницы,
+после штатных retry/fallback. Периодической ротации "на всякий случай" нет.
+
+Контракт успешной ротации:
+
+```text
+GET http://127.0.0.1:9810/rotate
+HTTP 200
+JSON ok=true
+```
+
+Если endpoint вернул не `200`, invalid JSON или `ok` не `true`, WB не повторяет
+эту страницу через тот же run как будто ремонт удался: ошибка остается ошибкой,
+дальше работают обычные пороги partial/latest.
+
+После успешного rotate SERP:
+
+- ждет `PARSER_WB_PROXY_ROTATE_WAIT_SECONDS`;
+- закрывает старую `requests.Session`;
+- заново читает текущий cookie file;
+- создает новую `requests.Session`;
+- повторяет только текущую `query|page`;
+- делает не больше одной ротации на страницу.
+
+Rotate URL не должен содержать query, cookies, токены, credentials или значения
+request headers. Старый/новый внешний IP в run report и Telegram health
+показываются только в маскированном виде, если Rotate API вернул эти поля.
+
 ## Безопасное Обновление Из Copy-As-CURL
 
 Используй этот путь только если владелец прислал свежий browser/API
@@ -203,6 +238,7 @@ sellers`, сохраняет known-good backups и пытается восста
 - `SERP latest`
 - `Latest`
 - `Run report`
+- `Proxy rotation`
 - `Browser channel`
 - `Warehouse`
 
