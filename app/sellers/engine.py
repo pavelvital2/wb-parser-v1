@@ -1,11 +1,12 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 import requests
@@ -31,6 +32,18 @@ class SellerSeed:
     nm_ids: set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True, slots=True)
+class SellersRunScope:
+    input_products_path: Path
+    raw_dir: Path
+    staging_dir: Path
+    mart_dir: Path
+    checkpoint_component: str
+    component: str = "sellers_regional"
+    publish_latest: bool = False
+    request_timeout_provider: Callable[[float], float] | None = None
+
+
 class RetryableHttpStatusError(requests.RequestException):
     def __init__(self, response: requests.Response) -> None:
         self.response = response
@@ -54,10 +67,22 @@ def _safe_supplier_id(value: str) -> str:
 
 
 class SellersEngine:
-    def __init__(self, config: AppConfig, db: StateDB, ctx: RunContext) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        db: StateDB,
+        ctx: RunContext,
+        *,
+        run_scope: SellersRunScope | None = None,
+    ) -> None:
         self.config = config
         self.db = db
         self.ctx = ctx
+        self.run_scope = run_scope
+        self.component = run_scope.component if run_scope else COMPONENT_SELLERS
+        self.checkpoint_component = (
+            run_scope.checkpoint_component if run_scope else COMPONENT_SELLERS
+        )
         self.logger = get_logger("sellers")
 
         self.sellers_cfg = self.config.raw.get("sellers", {})
@@ -75,15 +100,66 @@ class SellersEngine:
         self.mart_name = str(out_cfg.get("mart_sellers_daily_csv", "sellers_daily.csv"))
         self.bridge_name = str(out_cfg.get("bridge_csv", "seller_query_product_bridge.csv"))
 
-        self.raw_dir = self.config.paths.layer_component_run_dir("raw", COMPONENT_SELLERS, self.ctx.run_id)
+        if run_scope is None:
+            self.raw_dir = self.config.paths.layer_component_run_dir(
+                "raw",
+                COMPONENT_SELLERS,
+                self.ctx.run_id,
+            )
+            self.staging_dir = self.config.paths.layer_component_run_dir(
+                "staging",
+                COMPONENT_SELLERS,
+                self.ctx.run_id,
+            )
+            self.mart_dir = self.config.paths.layer_component_run_dir(
+                "marts",
+                COMPONENT_SELLERS,
+                self.ctx.run_id,
+            )
+        else:
+            self._validate_run_scope(run_scope)
+            self.raw_dir = run_scope.raw_dir
+            self.staging_dir = run_scope.staging_dir
+            self.mart_dir = run_scope.mart_dir
+            for directory in (self.raw_dir, self.staging_dir, self.mart_dir):
+                directory.mkdir(parents=True, exist_ok=True)
         raw_subdir = str(self.sellers_cfg.get("raw_responses_subdir", "responses"))
         self.raw_responses_dir = self.raw_dir / raw_subdir
         self.raw_responses_dir.mkdir(parents=True, exist_ok=True)
 
+    def _validate_run_scope(self, scope: SellersRunScope) -> None:
+        root = self.config.project_root.resolve()
+        for field_name, path in (
+            ("input_products_path", scope.input_products_path),
+            ("raw_dir", scope.raw_dir),
+            ("staging_dir", scope.staging_dir),
+            ("mart_dir", scope.mart_dir),
+        ):
+            candidate = Path(os.path.abspath(path))
+            try:
+                relative = candidate.relative_to(root)
+            except ValueError as exc:
+                raise CriticalPipelineError(
+                    f"scoped sellers {field_name} must be inside project root"
+                ) from exc
+            current = root
+            for part in relative.parts:
+                current /= part
+                if current.is_symlink():
+                    raise CriticalPipelineError(
+                        f"scoped sellers {field_name} must not use symlinks"
+                    )
+        if scope.publish_latest:
+            raise CriticalPipelineError("scoped sellers cannot publish global latest")
+        if not scope.checkpoint_component.startswith("sellers_regional:"):
+            raise CriticalPipelineError(
+                "scoped sellers checkpoint component is invalid"
+            )
+
     def run(self) -> dict[str, int | str]:
         full_refresh = bool(self.sellers_cfg.get("full_refresh_checkpoints", False))
         if full_refresh:
-            self.db.delete_checkpoints(COMPONENT_SELLERS)
+            self.db.delete_checkpoints(self.checkpoint_component)
 
         products_path = self._resolve_products_input_path()
         product_rows = self._load_products_rows(products_path)
@@ -93,16 +169,16 @@ class SellersEngine:
         if not seeds:
             raise CriticalPipelineError("Sellers has no supplier_id values in products input")
 
-        raw_path = self.config.paths.output_path(layer="raw", component=COMPONENT_SELLERS, run_id=self.ctx.run_id, filename=self.raw_name)
-        staging_path = self.config.paths.output_path(layer="staging", component=COMPONENT_SELLERS, run_id=self.ctx.run_id, filename=self.staging_name)
-        mart_path = self.config.paths.output_path(layer="marts", component=COMPONENT_SELLERS, run_id=self.ctx.run_id, filename=self.mart_name)
-        bridge_path = self.config.paths.output_path(layer="marts", component=COMPONENT_SELLERS, run_id=self.ctx.run_id, filename=self.bridge_name)
+        raw_path = self.raw_dir / self.raw_name
+        staging_path = self.staging_dir / self.staging_name
+        mart_path = self.mart_dir / self.mart_name
+        bridge_path = self.mart_dir / self.bridge_name
 
         raw_fields, staging_fields, mart_fields, bridge_fields = self._fields()
 
         completed: set[str] = set()
-        for key in self.db.list_checkpoint_keys(COMPONENT_SELLERS):
-            value = self.db.get_checkpoint(COMPONENT_SELLERS, key) or ""
+        for key in self.db.list_checkpoint_keys(self.checkpoint_component):
+            value = self.db.get_checkpoint(self.checkpoint_component, key) or ""
             if value.startswith("success|") and f"|{self.ctx.run_id}|" in value:
                 completed.add(key)
 
@@ -153,7 +229,7 @@ class SellersEngine:
                 if status == "success" or status == "dry_run":
                     items_ok += 1
                     self.db.save_checkpoint(
-                        component=COMPONENT_SELLERS,
+                        component=self.checkpoint_component,
                         checkpoint_key=seller_id,
                         checkpoint_value=f"success|{self.ctx.run_id}|{collected_at}",
                         updated_at_utc=collected_at,
@@ -162,7 +238,7 @@ class SellersEngine:
                     items_error += 1
                     self.db.record_error(
                         run_id=self.ctx.run_id,
-                        component=COMPONENT_SELLERS,
+                        component=self.component,
                         severity=ERROR_SEVERITY_NON_CRITICAL,
                         error_class="SellerFetchError",
                         error_message=error_message,
@@ -174,34 +250,151 @@ class SellersEngine:
                 if self.sleep_between_sellers_ms > 0 and not dry_run:
                     time.sleep(self.sleep_between_sellers_ms / 1000.0)
 
+        invocation_processed = processed
         write_csv_rows(bridge_path, bridge_rows, bridge_fields)
 
+        if self.run_scope is not None and not dry_run:
+            items_ok, items_error, processed = self._canonicalize_scoped_mart(
+                mart_path=mart_path,
+                mart_fields=mart_fields,
+                seeds=seeds,
+                completed=completed,
+            )
         if items_ok == 0 and not dry_run:
             raise CriticalPipelineError("Sellers collected zero successful rows")
 
-        latest_raw = self.config.paths.publish_latest_output(layer="raw", component=COMPONENT_SELLERS, source_path=raw_path, filename=self.raw_name)
-        latest_staging = self.config.paths.publish_latest_output(layer="staging", component=COMPONENT_SELLERS, source_path=staging_path, filename=self.staging_name)
-        latest_mart = self.config.paths.publish_latest_output(layer="marts", component=COMPONENT_SELLERS, source_path=mart_path, filename=self.mart_name)
-        latest_bridge = self.config.paths.publish_latest_output(layer="marts", component=COMPONENT_SELLERS, source_path=bridge_path, filename=self.bridge_name)
+        latest_raw = ""
+        latest_staging = ""
+        latest_mart = ""
+        latest_bridge = ""
+        if self.run_scope is None:
+            latest_raw = str(
+                self.config.paths.publish_latest_output(
+                    layer="raw",
+                    component=COMPONENT_SELLERS,
+                    source_path=raw_path,
+                    filename=self.raw_name,
+                )
+            )
+            latest_staging = str(
+                self.config.paths.publish_latest_output(
+                    layer="staging",
+                    component=COMPONENT_SELLERS,
+                    source_path=staging_path,
+                    filename=self.staging_name,
+                )
+            )
+            latest_mart = str(
+                self.config.paths.publish_latest_output(
+                    layer="marts",
+                    component=COMPONENT_SELLERS,
+                    source_path=mart_path,
+                    filename=self.mart_name,
+                )
+            )
+            latest_bridge = str(
+                self.config.paths.publish_latest_output(
+                    layer="marts",
+                    component=COMPONENT_SELLERS,
+                    source_path=bridge_path,
+                    filename=self.bridge_name,
+                )
+            )
 
+        run_status = (
+            "dry_run"
+            if dry_run
+            else (
+                "success"
+                if items_ok == len(seeds) and items_error == 0
+                else "partial"
+            )
+        )
         return {
+            "status": run_status,
             "items_ok": items_ok,
             "items_error": items_error,
             "non_critical_errors": items_error,
             "processed_sellers": processed,
+            "invocation_processed_sellers": invocation_processed,
             "input_products_path": str(products_path),
             "raw_sellers_path": str(raw_path),
             "staging_sellers_path": str(staging_path),
             "mart_sellers_path": str(mart_path),
             "bridge_path": str(bridge_path),
-            "latest_raw_sellers_path": str(latest_raw),
-            "latest_staging_sellers_path": str(latest_staging),
-            "latest_mart_sellers_path": str(latest_mart),
-            "latest_bridge_path": str(latest_bridge),
-            "note": f"sellers={len(seeds)} processed={processed} ok={items_ok} err={items_error}",
+            "latest_raw_sellers_path": latest_raw,
+            "latest_staging_sellers_path": latest_staging,
+            "latest_mart_sellers_path": latest_mart,
+            "latest_bridge_path": latest_bridge,
+            "note": (
+                f"sellers={len(seeds)} processed={processed} "
+                f"invocation_processed={invocation_processed} "
+                f"ok={items_ok} err={items_error}"
+            ),
         }
 
+    def _canonicalize_scoped_mart(
+        self,
+        *,
+        mart_path: Path,
+        mart_fields: list[str],
+        seeds: dict[str, SellerSeed],
+        completed: set[str],
+    ) -> tuple[int, int, int]:
+        if not mart_path.is_file() or mart_path.is_symlink():
+            raise CriticalPipelineError("Scoped sellers mart is unavailable")
+        if not completed.issubset(seeds):
+            raise CriticalPipelineError(
+                "Scoped sellers checkpoints contain an unknown seller"
+            )
+        latest_by_seller: dict[str, dict[str, str]] = {}
+        for row in read_csv_rows(mart_path):
+            seller_id = _safe_supplier_id(row.get("supplier_id", ""))
+            if not seller_id or seller_id not in seeds:
+                raise CriticalPipelineError(
+                    "Scoped sellers mart contains an unknown seller"
+                )
+            latest_by_seller[seller_id] = row
+        if set(latest_by_seller) != set(seeds):
+            raise CriticalPipelineError("Scoped sellers mart is incomplete")
+        for seller_id in completed:
+            if latest_by_seller[seller_id].get("status") != "success":
+                raise CriticalPipelineError(
+                    "Scoped sellers checkpoint does not match successful mart row"
+                )
+
+        canonical_rows = [
+            {
+                field: latest_by_seller[seller_id].get(field, "")
+                for field in mart_fields
+            }
+            for seller_id in seeds
+        ]
+        write_csv_rows(mart_path, canonical_rows, mart_fields)
+        verified_rows = read_csv_rows(mart_path)
+        verified_ids = [
+            _safe_supplier_id(row.get("supplier_id", ""))
+            for row in verified_rows
+        ]
+        if (
+            verified_ids != list(seeds)
+            or len(set(verified_ids)) != len(verified_ids)
+        ):
+            raise CriticalPipelineError("Scoped sellers mart is not canonical")
+        items_ok = sum(
+            row.get("status") == "success" for row in verified_rows
+        )
+        items_error = len(verified_rows) - items_ok
+        return items_ok, items_error, len(verified_rows)
+
     def _resolve_products_input_path(self) -> Path:
+        if self.run_scope is not None:
+            path = self.run_scope.input_products_path
+            if not path.is_file() or path.is_symlink():
+                raise CriticalPipelineError(
+                    "Scoped sellers input products file is unavailable"
+                )
+            return path
         cfg_path = str(self.sellers_cfg.get("input_files", {}).get("products_daily_csv", "")).strip()
         if cfg_path:
             p = _as_path(self.config.project_root, cfg_path)
@@ -284,7 +477,7 @@ class SellersEngine:
             rows.append(
                 {
                     "run_id": self.ctx.run_id,
-                    "component": COMPONENT_SELLERS,
+                    "component": self.component,
                     "collected_at_utc": collected_at,
                     "source_system": self.source_system,
                     "source_type": "seller_query_product_bridge",
@@ -303,7 +496,7 @@ class SellersEngine:
         if not rows:
             rows.append({k: "" for k in bridge_fields})
             rows[0]["run_id"] = self.ctx.run_id
-            rows[0]["component"] = COMPONENT_SELLERS
+            rows[0]["component"] = self.component
             rows[0]["collected_at_utc"] = collected_at
             rows[0]["source_system"] = self.source_system
             rows[0]["source_type"] = "seller_query_product_bridge"
@@ -365,10 +558,16 @@ class SellersEngine:
         referer = f"https://www.wildberries.ru/seller/{quote(seller_id)}"
 
         def _request() -> requests.Response:
+            timeout = float(self.config.runtime.http_timeout_seconds)
+            if (
+                self.run_scope is not None
+                and self.run_scope.request_timeout_provider is not None
+            ):
+                timeout = self.run_scope.request_timeout_provider(timeout)
             resp = session.get(
                 url,
                 headers={"referer": referer},
-                timeout=self.config.runtime.http_timeout_seconds,
+                timeout=timeout,
             )
             if resp.status_code >= 500:
                 raise RetryableHttpStatusError(resp)
@@ -390,6 +589,8 @@ class SellersEngine:
                 return response.status_code, None, f"http_{response.status_code}: {(response.text or '').strip()[:500]}", raw_file
             finally:
                 response.close()
+        except CriticalPipelineError:
+            raise
         except Exception as exc:
             return 0, None, f"request_failed:{exc.__class__.__name__}", ""
 
@@ -435,7 +636,7 @@ class SellersEngine:
         )
         return {
             "run_id": self.ctx.run_id,
-            "component": COMPONENT_SELLERS,
+            "component": self.component,
             "collected_at_utc": collected_at_utc,
             "source_system": self.source_system,
             "source_type": self.source_type,
@@ -515,4 +716,3 @@ class SellersEngine:
             "product_run_id",
         ]
         return base_fields, base_fields, mart_fields, bridge_fields
-

@@ -29,6 +29,7 @@ from app.common.proxy_required import (
 from app.common.run_lock import acquire_advisory_lock, acquire_run_lock
 from app.serp.collection_plan import (
     CollectionPlanBundle,
+    CollectionRuntimeWindow,
     CollectionPlanValidationError,
     EffectiveEndpointPolicy,
     RegionDefinition,
@@ -47,6 +48,8 @@ REGION_STATE_SCHEMA_VERSION = "wb_collection_plan_region_v1"
 CHECKPOINT_SCHEMA_VERSION = "wb_collection_plan_checkpoint_v1"
 RESUMABLE_CHECKPOINT_SCHEMA_VERSION = "wb_collection_plan_checkpoint_v2"
 SEGMENT_SCHEMA_VERSION = "wb_collection_plan_segment_v1"
+BOUNDED_CHECKPOINT_SCHEMA_VERSION = "wb_collection_plan_checkpoint_v3"
+BOUNDED_SEGMENT_SCHEMA_VERSION = "wb_collection_plan_segment_v2"
 REGIONAL_LATEST_SCHEMA_VERSION = "wb_regional_latest_v1"
 REGIONAL_LATEST_REGION_SCHEMA_VERSION = "wb_regional_latest_region_v1"
 COLLECTION_SCOPE = "regional"
@@ -388,6 +391,8 @@ class ScopedPaths:
 class DeadlineGuard:
     deadline_utc: datetime
     now: Callable[[], datetime]
+    finalization_reserve_seconds: int = FINALIZATION_RESERVE_SECONDS
+    enforce_deadline_estimate: bool = False
 
     @classmethod
     def for_current_day(
@@ -408,6 +413,63 @@ class DeadlineGuard:
         guard.ensure_start_window()
         return guard
 
+    @classmethod
+    def for_runtime_window(
+        cls,
+        window: CollectionRuntimeWindow,
+        *,
+        resume: bool,
+        now: Callable[[], datetime] = _default_now,
+    ) -> "DeadlineGuard":
+        current = now()
+        if current.tzinfo is None:
+            raise CollectionPlanRunError("clock must return timezone-aware datetime")
+        current_msk = current.astimezone(MOSCOW_TZ)
+
+        def parse_hhmm(value: str) -> time:
+            hour, minute = (int(item) for item in value.split(":", 1))
+            return time(hour, minute)
+
+        scheduled = datetime.combine(
+            current_msk.date(),
+            parse_hhmm(window.scheduled_start_msk),
+            tzinfo=MOSCOW_TZ,
+        )
+        cutoff = datetime.combine(
+            current_msk.date(),
+            parse_hhmm(window.absolute_cutoff_msk),
+            tzinfo=MOSCOW_TZ,
+        )
+        if not resume:
+            latest_new_start = scheduled + timedelta(
+                seconds=window.new_run_start_grace_seconds
+            )
+            if current_msk < scheduled or current_msk > latest_new_start:
+                raise CollectionPlanRunError(
+                    "new bounded collection run is outside its reviewed start window"
+                )
+        invocation_deadline = min(
+            current_msk
+            + timedelta(seconds=window.max_invocation_runtime_seconds),
+            cutoff,
+        )
+        guard = cls(
+            deadline_utc=invocation_deadline.astimezone(timezone.utc),
+            now=now,
+            finalization_reserve_seconds=window.finalization_reserve_seconds,
+            enforce_deadline_estimate=True,
+        )
+        minimum_window = (
+            window.minimum_resume_window_seconds
+            if resume
+            else window.finalization_reserve_seconds + 1
+        )
+        if guard.remaining_seconds() < minimum_window:
+            raise CollectionPlanRunError(
+                "bounded collection invocation has insufficient time before cutoff"
+            )
+        return guard
+
     def remaining_seconds(self) -> float:
         return (self.deadline_utc - self.now().astimezone(timezone.utc)).total_seconds()
 
@@ -418,19 +480,28 @@ class DeadlineGuard:
             )
 
     def ensure_active(self) -> None:
-        if self.remaining_seconds() <= FINALIZATION_RESERVE_SECONDS:
+        if self.remaining_seconds() <= self.finalization_reserve_seconds:
             raise CollectionPlanRunError(
-                "collection plan deadline reached before 23:45 MSK"
+                "collection plan runtime deadline reached"
             )
 
     def request_timeout(self, configured_timeout: float) -> float:
         self.ensure_active()
-        available = self.remaining_seconds() - FINALIZATION_RESERVE_SECONDS
+        available = self.remaining_seconds() - self.finalization_reserve_seconds
         return max(0.1, min(float(configured_timeout), available))
 
     def ensure_estimated_window(self, estimated_seconds: float) -> None:
         if estimated_seconds < 0:
             raise CollectionPlanRunError("estimated runtime must not be negative")
+        current_utc = self.now().astimezone(timezone.utc)
+        if (
+            self.enforce_deadline_estimate
+            and current_utc + timedelta(seconds=estimated_seconds)
+            > self.deadline_utc
+        ):
+            raise CollectionPlanRunError(
+                "estimated safe work unit exceeds collection runtime deadline"
+            )
         current = self.now().astimezone(MOSCOW_TZ)
         nightly = datetime.combine(
             current.date(),
@@ -751,6 +822,21 @@ class RequestsScopedTransport:
             pinned_endpoint_id=endpoint_ids[0],
         )
         self._endpoint_pin_finalized = False
+        self._network_timeout_provider: Callable[[float], float] | None = None
+
+    def set_network_timeout_provider(
+        self,
+        provider: Callable[[float], float],
+    ) -> None:
+        self._network_timeout_provider = provider
+
+    def _network_timeout(self, requested_timeout: float) -> float:
+        value = min(self.timeout_seconds, requested_timeout)
+        if self._network_timeout_provider is not None:
+            value = self._network_timeout_provider(value)
+        if value <= 0:
+            raise CollectionPlanRunError("network timeout must be positive")
+        return value
 
     @classmethod
     def from_config(cls, config: AppConfig) -> "RequestsScopedTransport":
@@ -888,7 +974,7 @@ class RequestsScopedTransport:
                     "accept": "text/plain",
                     "user-agent": "parser-wb-egress-check/1",
                 },
-                timeout=min(self.timeout_seconds, timeout_seconds),
+                timeout=self._network_timeout(timeout_seconds),
             )
         except requests.RequestException as exc:
             raise ScopedTransportError("egress_network_error") from exc
@@ -918,7 +1004,7 @@ class RequestsScopedTransport:
                     "address": region.address_label,
                 },
                 headers=self.request_headers,
-                timeout=min(self.timeout_seconds, timeout_seconds),
+                timeout=self._network_timeout(timeout_seconds),
             )
         except requests.RequestException as exc:
             raise ScopedTransportError("resolver_network_error") from exc
@@ -971,7 +1057,7 @@ class RequestsScopedTransport:
                 endpoint_url,
                 params=dict(request.params),
                 headers=headers,
-                timeout=min(self.timeout_seconds, timeout_seconds),
+                timeout=self._network_timeout(timeout_seconds),
             )
         except requests.RequestException:
             return EndpointProbeResult(
@@ -1067,7 +1153,7 @@ class RequestsScopedTransport:
                 endpoint_url,
                 params=dict(request.params),
                 headers=headers,
-                timeout=min(self.timeout_seconds, timeout_seconds),
+                timeout=self._network_timeout(timeout_seconds),
             )
         except requests.RequestException as exc:
             raise ScopedTransportError(
@@ -1146,7 +1232,7 @@ class RequestsScopedTransport:
                     endpoint_url,
                     params=dict(request.params),
                     headers=headers,
-                    timeout=min(self.timeout_seconds, timeout_seconds),
+                    timeout=self._network_timeout(timeout_seconds),
                 )
             except requests.RequestException as exc:
                 raise ScopedTransportError(
@@ -1273,6 +1359,8 @@ def _egress_hash(value: str, *, salt: bytes) -> str:
 
 PRODUCT_FIELDS = (
     "run_id",
+    "collected_at_utc",
+    "status",
     "collection_scope",
     "collection_plan_id",
     "query_pack_id",
@@ -1294,9 +1382,16 @@ PRODUCT_FIELDS = (
     "position_on_page",
     "absolute_position",
     "nmId",
+    "imtId",
     "product_name",
     "brand",
+    "brandId",
     "supplier_id",
+    "supplier_name",
+    "final_price",
+    "price",
+    "sale_price",
+    "discount",
     "rating",
     "feedbacks",
     "total_quantity",
@@ -1348,6 +1443,56 @@ def _extract_products(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return products
 
 
+@dataclass(frozen=True, slots=True)
+class BoundedPageContract:
+    products: list[Mapping[str, Any]]
+    payload_total: int
+    capped_total: int
+    expected_pages: int
+    terminal: bool
+    terminal_reason: str | None
+
+
+def _bounded_page_contract(
+    payload: Mapping[str, Any],
+    *,
+    page: int,
+    depth: int,
+    page_size: int = 100,
+) -> BoundedPageContract:
+    products = _extract_products(payload)
+    nested = payload.get("data")
+    raw_total = payload.get("total")
+    if raw_total is None and isinstance(nested, Mapping):
+        raw_total = nested.get("total")
+    if type(raw_total) is not int or raw_total <= 0:
+        raise CollectionPlanRunError("search_payload_total_invalid")
+    capped_total = min(raw_total, depth)
+    expected_pages = (capped_total + page_size - 1) // page_size
+    if page < 1 or page > expected_pages:
+        raise CollectionPlanRunError("search_page_exceeds_payload_total")
+    expected_count = min(page_size, capped_total - ((page - 1) * page_size))
+    if len(products) != expected_count:
+        raise CollectionPlanRunError(
+            "search_products_count_inconsistent_with_total "
+            f"expected={expected_count} actual={len(products)}"
+        )
+    terminal = page == expected_pages
+    terminal_reason = None
+    if terminal:
+        terminal_reason = (
+            "depth_cap_reached" if raw_total > depth else "payload_total_reached"
+        )
+    return BoundedPageContract(
+        products=products,
+        payload_total=raw_total,
+        capped_total=capped_total,
+        expected_pages=expected_pages,
+        terminal=terminal,
+        terminal_reason=terminal_reason,
+    )
+
+
 def _normalize_product_id(product: Mapping[str, Any]) -> str:
     raw = product.get("id")
     if raw in {None, ""}:
@@ -1358,6 +1503,24 @@ def _normalize_product_id(product: Mapping[str, Any]) -> str:
     if not _PRODUCT_ID_RE.fullmatch(value):
         raise CollectionPlanRunError("search_product_id_malformed")
     return value
+
+
+def _product_prices(
+    product: Mapping[str, Any],
+) -> tuple[float | None, float | None, float | None]:
+    sizes = product.get("sizes")
+    price: float | None = None
+    sale_price: float | None = None
+    if isinstance(sizes, list) and sizes and isinstance(sizes[0], Mapping):
+        price_object = sizes[0].get("price")
+        if isinstance(price_object, Mapping):
+            basic = price_object.get("basic")
+            sale = price_object.get("product")
+            if isinstance(basic, (int, float)) and not isinstance(basic, bool):
+                price = round(float(basic) / 100.0, 2)
+            if isinstance(sale, (int, float)) and not isinstance(sale, bool):
+                sale_price = round(float(sale) / 100.0, 2)
+    return sale_price if sale_price is not None else price, price, sale_price
 
 
 def _relative(path: Path, root: Path) -> str:
@@ -1400,6 +1563,25 @@ class CollectionPlanRunner:
         self.write_event_hook = write_event_hook
         self.egress_hash_salt = egress_hash_salt or secrets.token_bytes(32)
         self.sleeper = sleeper
+
+    def _configure_runtime_deadline(self, bundle: CollectionPlanBundle) -> None:
+        window = bundle.collection_plan.runtime_window
+        if window is not None:
+            self.deadline = DeadlineGuard.for_runtime_window(
+                window,
+                resume=self.resume,
+                now=self.now,
+            )
+        setter = getattr(self.transport, "set_network_timeout_provider", None)
+        if callable(setter):
+            setter(
+                lambda requested: self.deadline.request_timeout(
+                    min(
+                        requested,
+                        float(self.config.runtime.http_timeout_seconds),
+                    )
+                )
+            )
 
     def _load_bundle(self) -> CollectionPlanBundle:
         return load_collection_plan_bundle(
@@ -1497,7 +1679,7 @@ class CollectionPlanRunner:
         if final_manifest:
             if (
                 self.deadline.remaining_seconds()
-                <= FINALIZATION_RESERVE_SECONDS
+                <= self.deadline.finalization_reserve_seconds
             ):
                 raise CollectionPlanRunError(
                     "collection plan deadline reserve reached before final manifest"
@@ -1519,7 +1701,10 @@ class CollectionPlanRunner:
         final_manifest: bool = False,
     ) -> None:
         if final_manifest:
-            if self.deadline.remaining_seconds() <= FINALIZATION_RESERVE_SECONDS:
+            if (
+                self.deadline.remaining_seconds()
+                <= self.deadline.finalization_reserve_seconds
+            ):
                 raise CollectionPlanRunError(
                     "collection plan deadline reserve reached before final manifest"
                 )
@@ -1562,6 +1747,20 @@ class CollectionPlanRunner:
             + page_sleep
             + ESTIMATED_REQUEST_OVERHEAD_SECONDS
         )
+        runtime_window = bundle.collection_plan.runtime_window
+        if runtime_window is not None:
+            segment_pages = min(
+                bundle.collection_plan.quality.expected_pages_per_query,
+                pending_pages,
+            )
+            resolver_and_egress_calls = len(bundle.enabled_regions) + 2
+            return (
+                segment_pages * request_seconds
+                + query_sleep
+                + resolver_and_egress_calls
+                * float(self.config.runtime.http_timeout_seconds)
+                + runtime_window.finalization_reserve_seconds
+            )
         pending_queries = min(
             len(bundle.enabled_queries) * len(bundle.enabled_regions),
             pending_pages,
@@ -1863,22 +2062,32 @@ class CollectionPlanRunner:
         products: list[Mapping[str, Any]],
         raw_path: Path,
         endpoint_id: str,
+        expected_products_count: int | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        if len(products) != task.page_size:
+        expected_count = (
+            task.page_size
+            if expected_products_count is None
+            else expected_products_count
+        )
+        if len(products) != expected_count:
             raise CollectionPlanRunError(
-                f"search_products_short expected={task.page_size} actual={len(products)}"
+                f"search_products_short expected={expected_count} actual={len(products)}"
             )
         seen: set[str] = set()
         rows: list[dict[str, Any]] = []
         raw_file = _relative(raw_path, self.config.project_root)
+        collected_at_utc = _utc_iso(self.now())
         for index, product in enumerate(products, start=1):
             product_id = _normalize_product_id(product)
             if product_id in seen:
                 raise CollectionPlanRunError("search_product_duplicate")
             seen.add(product_id)
+            final_price, price, sale_price = _product_prices(product)
             rows.append(
                 {
                     "run_id": self.run_id,
+                    "collected_at_utc": collected_at_utc,
+                    "status": "success",
                     "collection_scope": COLLECTION_SCOPE,
                     "collection_plan_id": task.collection_plan_id,
                     "query_pack_id": task.query_pack_id,
@@ -1900,9 +2109,22 @@ class CollectionPlanRunner:
                     "position_on_page": index,
                     "absolute_position": ((task.page - 1) * task.page_size) + index,
                     "nmId": product_id,
+                    "imtId": product.get("imtId") or "",
                     "product_name": product.get("name") or "",
                     "brand": product.get("brand") or "",
+                    "brandId": product.get("brandId") or "",
                     "supplier_id": product.get("supplierId") or "",
+                    "supplier_name": product.get("supplier") or "",
+                    "final_price": (
+                        final_price if final_price is not None else ""
+                    ),
+                    "price": price if price is not None else "",
+                    "sale_price": sale_price if sale_price is not None else "",
+                    "discount": (
+                        product.get("discount")
+                        if product.get("discount") is not None
+                        else ""
+                    ),
                     "rating": product.get("rating")
                     if product.get("rating") is not None
                     else "",
@@ -1981,6 +2203,10 @@ class CollectionPlanRunner:
         effective_plan_sha256: str | None = None,
         bundle: CollectionPlanBundle | None = None,
         segment_id: str | None = None,
+        products_count: int | None = None,
+        payload_total: int | None = None,
+        capped_total: int | None = None,
+        terminal: bool | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -2009,14 +2235,22 @@ class CollectionPlanRunner:
                     "resumable checkpoint provenance is incomplete"
                 )
             assert bundle is not None
+            bounded = bundle.collection_plan.runtime_window is not None
+            actual_products_count = (
+                task.page_size if products_count is None else products_count
+            )
             payload.update(
                 {
-                    "schema_version": RESUMABLE_CHECKPOINT_SCHEMA_VERSION,
+                    "schema_version": (
+                        BOUNDED_CHECKPOINT_SCHEMA_VERSION
+                        if bounded
+                        else RESUMABLE_CHECKPOINT_SCHEMA_VERSION
+                    ),
                     "query": task.query,
                     "page_size": task.page_size,
                     "depth": task.depth,
                     "raw_sha256": raw_sha256,
-                    "products_count": task.page_size,
+                    "products_count": actual_products_count,
                     "query_pack_sha256": bundle.query_pack_sha256,
                     "collection_plan_sha256": bundle.collection_plan_sha256,
                     "region_registry_sha256": bundle.region_registry_sha256,
@@ -2024,6 +2258,22 @@ class CollectionPlanRunner:
                     "segment_id": segment_id,
                 }
             )
+            if bounded:
+                if (
+                    type(payload_total) is not int
+                    or type(capped_total) is not int
+                    or type(terminal) is not bool
+                ):
+                    raise CollectionPlanRunError(
+                        "bounded checkpoint completion evidence is incomplete"
+                    )
+                payload.update(
+                    {
+                        "payload_total": payload_total,
+                        "capped_total": capped_total,
+                        "terminal": terminal,
+                    }
+                )
         return payload
 
     def _load_reusable_page(
@@ -2051,8 +2301,21 @@ class CollectionPlanRunner:
             ),
             field="checkpoint",
         )
+        bounded = bundle.collection_plan.runtime_window is not None
+        checkpoint_products_count = checkpoint.get("products_count")
+        if (
+            type(checkpoint_products_count) is not int
+            or not 1 <= checkpoint_products_count <= task.page_size
+        ):
+            raise CollectionPlanRunError(
+                f"resume checkpoint products count invalid: {task.checkpoint_key}"
+            )
         expected = {
-            "schema_version": RESUMABLE_CHECKPOINT_SCHEMA_VERSION,
+            "schema_version": (
+                BOUNDED_CHECKPOINT_SCHEMA_VERSION
+                if bounded
+                else RESUMABLE_CHECKPOINT_SCHEMA_VERSION
+            ),
             "checkpoint_key": task.checkpoint_key,
             "collection_plan_id": task.collection_plan_id,
             "query_pack_id": task.query_pack_id,
@@ -2066,7 +2329,7 @@ class CollectionPlanRunner:
             "dest_id_observed": resolution.dest_id_observed,
             "dest_resolution_status": "resolved_and_sent",
             "raw_file": _relative(raw_path, self.config.project_root),
-            "products_count": task.page_size,
+            "products_count": checkpoint_products_count,
             "query_pack_sha256": bundle.query_pack_sha256,
             "collection_plan_sha256": bundle.collection_plan_sha256,
             "region_registry_sha256": bundle.region_registry_sha256,
@@ -2103,12 +2366,35 @@ class CollectionPlanRunner:
                 f"resume raw checksum mismatch: {task.checkpoint_key}"
             )
         payload = _json_object_from_bytes(raw_bytes, field="raw page")
+        if bounded:
+            page_contract = _bounded_page_contract(
+                payload,
+                page=task.page,
+                depth=task.depth,
+                page_size=task.page_size,
+            )
+            for key, expected_value in {
+                "payload_total": page_contract.payload_total,
+                "capped_total": page_contract.capped_total,
+                "terminal": page_contract.terminal,
+            }.items():
+                if (
+                    checkpoint.get(key) != expected_value
+                    or type(checkpoint.get(key)) is not type(expected_value)
+                ):
+                    raise CollectionPlanRunError(
+                        f"resume checkpoint completion mismatch: {task.checkpoint_key}:{key}"
+                    )
+            products = page_contract.products
+        else:
+            products = _extract_products(payload)
         rows, page_row = self._rows_for_page(
             task=task,
             resolution=resolution,
-            products=_extract_products(payload),
+            products=products,
             raw_path=raw_path,
             endpoint_id=endpoint_id,
+            expected_products_count=checkpoint_products_count,
         )
         return rows, page_row, segment_id
 
@@ -2220,6 +2506,7 @@ class CollectionPlanRunner:
         expected_pages = (
             bundle.collection_plan.quality.expected_pages_per_query
         )
+        bounded = bundle.collection_plan.runtime_window is not None
 
         def validate_egress_item(
             value: Any,
@@ -2258,7 +2545,7 @@ class CollectionPlanRunner:
             }
 
         for expected_ref in expected_refs:
-            if not isinstance(expected_ref, dict) or set(expected_ref) != {
+            expected_ref_fields = {
                 "segment_id",
                 "region_id",
                 "query_id",
@@ -2266,7 +2553,10 @@ class CollectionPlanRunner:
                 "sha256",
                 "egress",
                 "pages_count",
-            }:
+            }
+            if bounded:
+                expected_ref_fields.update({"products_count", "completion"})
+            if not isinstance(expected_ref, dict) or set(expected_ref) != expected_ref_fields:
                 raise CollectionPlanRunError("segment reference structure is invalid")
             segment_id = expected_ref.get("segment_id")
             expected_sha256 = expected_ref.get("sha256")
@@ -2289,7 +2579,7 @@ class CollectionPlanRunner:
             if expected_sha256 != payload_sha256:
                 raise CollectionPlanRunError("segment reference checksum mismatch")
             segment = _json_object_from_bytes(payload_bytes, field="segment")
-            if set(segment) != {
+            segment_fields = {
                 "schema_version",
                 "run_id",
                 "segment_id",
@@ -2303,10 +2593,17 @@ class CollectionPlanRunner:
                 "pages",
                 "endpoint_usage",
                 "egress",
-            }:
+            }
+            if bounded:
+                segment_fields.add("completion")
+            if set(segment) != segment_fields:
                 raise CollectionPlanRunError("segment structure is invalid")
             identity = {
-                "schema_version": SEGMENT_SCHEMA_VERSION,
+                "schema_version": (
+                    BOUNDED_SEGMENT_SCHEMA_VERSION
+                    if bounded
+                    else SEGMENT_SCHEMA_VERSION
+                ),
                 "run_id": self.run_id,
                 "collection_plan_id": bundle.collection_plan.collection_plan_id,
                 "query_pack_sha256": bundle.query_pack_sha256,
@@ -2350,9 +2647,82 @@ class CollectionPlanRunner:
                 or type(egress.get("checks_expected")) is not int
                 or egress.get("checks_expected") != 2
                 or not isinstance(pages, list)
-                or len(pages) != expected_pages
+                or (
+                    not 1 <= len(pages) <= expected_pages
+                    if bounded
+                    else len(pages) != expected_pages
+                )
             ):
                 raise CollectionPlanRunError("segment is not complete and verified")
+            completion: dict[str, Any] | None = None
+            if bounded:
+                raw_completion = segment.get("completion")
+                if not isinstance(raw_completion, dict) or set(raw_completion) != {
+                    "payload_total",
+                    "capped_total",
+                    "pages_count",
+                    "products_count",
+                    "terminal_page",
+                    "terminal_reason",
+                    "complete",
+                    "duplicate_product_positions",
+                }:
+                    raise CollectionPlanRunError(
+                        "bounded segment completion evidence is invalid"
+                    )
+                payload_total = raw_completion.get("payload_total")
+                capped_total = raw_completion.get("capped_total")
+                pages_count = raw_completion.get("pages_count")
+                products_count = raw_completion.get("products_count")
+                terminal_page = raw_completion.get("terminal_page")
+                terminal_reason = raw_completion.get("terminal_reason")
+                duplicate_positions = raw_completion.get(
+                    "duplicate_product_positions"
+                )
+                expected_capped_total = (
+                    min(payload_total, bundle.collection_plan.depth)
+                    if type(payload_total) is int and payload_total > 0
+                    else -1
+                )
+                expected_page_count = (
+                    (expected_capped_total + 99) // 100
+                    if expected_capped_total > 0
+                    else -1
+                )
+                expected_reason = (
+                    "depth_cap_reached"
+                    if type(payload_total) is int
+                    and payload_total > bundle.collection_plan.depth
+                    else "payload_total_reached"
+                )
+                if (
+                    type(capped_total) is not int
+                    or capped_total != expected_capped_total
+                    or type(pages_count) is not int
+                    or pages_count != expected_page_count
+                    or pages_count != len(pages)
+                    or type(products_count) is not int
+                    or products_count != capped_total
+                    or type(terminal_page) is not int
+                    or terminal_page != pages_count
+                    or terminal_reason != expected_reason
+                    or raw_completion.get("complete") is not True
+                    or type(duplicate_positions) is not int
+                    or not 0 <= duplicate_positions < products_count
+                ):
+                    raise CollectionPlanRunError(
+                        "bounded segment completion evidence is inconsistent"
+                    )
+                completion = {
+                    "payload_total": payload_total,
+                    "capped_total": capped_total,
+                    "pages_count": pages_count,
+                    "products_count": products_count,
+                    "terminal_page": terminal_page,
+                    "terminal_reason": terminal_reason,
+                    "complete": True,
+                    "duplicate_product_positions": duplicate_positions,
+                }
             start_egress = validate_egress_item(
                 egress.get("start"),
                 field="egress start",
@@ -2417,7 +2787,7 @@ class CollectionPlanRunner:
             if sum(
                 counters["pages_ok"]
                 for counters in normalized_usage.values()
-            ) != expected_pages:
+            ) != len(pages):
                 raise CollectionPlanRunError(
                     "verified segment pages do not match endpoint counters"
                 )
@@ -2483,6 +2853,102 @@ class CollectionPlanRunner:
                     )
                 normalized_pages.append(expected_page_ref)
 
+            if bounded:
+                actual_product_ids: list[str] = []
+                observed_total: int | None = None
+                for page_ref in normalized_pages:
+                    page = int(page_ref["page"])
+                    raw_bytes = _read_regular_bytes(
+                        paths.project_root / page_ref["pending_raw_path"],
+                        project_root=paths.project_root,
+                    )
+                    if _sha256_bytes(raw_bytes) != page_ref["raw_sha256"]:
+                        raise CollectionPlanRunError(
+                            "bounded segment raw checksum mismatch"
+                        )
+                    raw_payload = _json_object_from_bytes(
+                        raw_bytes,
+                        field="bounded segment raw page",
+                    )
+                    page_contract = _bounded_page_contract(
+                        raw_payload,
+                        page=page,
+                        depth=bundle.collection_plan.depth,
+                    )
+                    if (
+                        observed_total is not None
+                        and observed_total != page_contract.payload_total
+                    ):
+                        raise CollectionPlanRunError(
+                            "bounded segment payload total changed"
+                        )
+                    observed_total = page_contract.payload_total
+                    page_product_ids = [
+                        _normalize_product_id(product)
+                        for product in page_contract.products
+                    ]
+                    if len(page_product_ids) != len(set(page_product_ids)):
+                        raise CollectionPlanRunError(
+                            "bounded segment contains duplicate product on one page"
+                        )
+                    actual_product_ids.extend(page_product_ids)
+                    checkpoint_bytes = _read_regular_bytes(
+                        paths.project_root
+                        / page_ref["pending_checkpoint_path"],
+                        project_root=paths.project_root,
+                    )
+                    if (
+                        _sha256_bytes(checkpoint_bytes)
+                        != page_ref["checkpoint_sha256"]
+                    ):
+                        raise CollectionPlanRunError(
+                            "bounded segment checkpoint checksum mismatch"
+                        )
+                    checkpoint = _json_object_from_bytes(
+                        checkpoint_bytes,
+                        field="bounded segment checkpoint",
+                    )
+                    for key, expected_value in {
+                        "schema_version": BOUNDED_CHECKPOINT_SCHEMA_VERSION,
+                        "page": page,
+                        "products_count": len(page_contract.products),
+                        "payload_total": page_contract.payload_total,
+                        "capped_total": page_contract.capped_total,
+                        "terminal": page_contract.terminal,
+                        "segment_id": segment_id,
+                    }.items():
+                        if (
+                            checkpoint.get(key) != expected_value
+                            or type(checkpoint.get(key))
+                            is not type(expected_value)
+                        ):
+                            raise CollectionPlanRunError(
+                                "bounded segment checkpoint metadata mismatch"
+                            )
+                actual_completion = {
+                    "payload_total": observed_total,
+                    "capped_total": min(
+                        int(observed_total),
+                        bundle.collection_plan.depth,
+                    ),
+                    "pages_count": len(normalized_pages),
+                    "products_count": len(actual_product_ids),
+                    "terminal_page": len(normalized_pages),
+                    "terminal_reason": (
+                        "depth_cap_reached"
+                        if int(observed_total) > bundle.collection_plan.depth
+                        else "payload_total_reached"
+                    ),
+                    "complete": True,
+                    "duplicate_product_positions": (
+                        len(actual_product_ids) - len(set(actual_product_ids))
+                    ),
+                }
+                if completion != actual_completion:
+                    raise CollectionPlanRunError(
+                        "bounded segment completion does not match page artifacts"
+                    )
+
             normalized_segment = {
                 **identity,
                 "segment_id": segment_id,
@@ -2492,6 +2958,8 @@ class CollectionPlanRunner:
                 "endpoint_usage": normalized_usage,
                 "egress": normalized_egress,
             }
+            if bounded:
+                normalized_segment["completion"] = completion
             if segment != normalized_segment:
                 raise CollectionPlanRunError(
                     "verified segment canonical content mismatch"
@@ -2503,8 +2971,15 @@ class CollectionPlanRunner:
                 "path": expected_path,
                 "sha256": payload_sha256,
                 "egress": normalized_egress,
-                "pages_count": expected_pages,
+                "pages_count": len(pages),
             }
+            if bounded:
+                record.update(
+                    {
+                        "products_count": completion["products_count"],
+                        "completion": completion,
+                    }
+                )
             if expected_ref != record:
                 raise CollectionPlanRunError(
                     "segment reference does not match canonical segment"
@@ -2710,6 +3185,21 @@ class CollectionPlanRunner:
                         raise CollectionPlanRunError(
                             f"resume effective plan mismatch: {key}"
                         )
+                runtime_window = bundle.collection_plan.runtime_window
+                if runtime_window is not None:
+                    expected_runtime_window = {
+                        "mode": runtime_window.mode,
+                        "scheduled_start_msk": runtime_window.scheduled_start_msk,
+                        "new_run_start_grace_seconds": runtime_window.new_run_start_grace_seconds,
+                        "max_invocation_runtime_seconds": runtime_window.max_invocation_runtime_seconds,
+                        "absolute_cutoff_msk": runtime_window.absolute_cutoff_msk,
+                        "minimum_resume_window_seconds": runtime_window.minimum_resume_window_seconds,
+                        "finalization_reserve_seconds": runtime_window.finalization_reserve_seconds,
+                    }
+                    if snapshot.get("runtime_window") != expected_runtime_window:
+                        raise CollectionPlanRunError(
+                            "resume effective plan mismatch: runtime_window"
+                        )
                 resume_state = prior_manifest.get("resume")
                 prior_refs = (
                     resume_state.get("segments")
@@ -2732,12 +3222,17 @@ class CollectionPlanRunner:
                     verified_segment_ids=verified_segment_ids,
                 )
 
-            confirmed_pages = sum(
-                int(ref.get("pages_count", 0)) for ref in segment_refs
+            expected_scopes = len(bundle.enabled_regions) * len(
+                bundle.enabled_queries
             )
-            pending_pages = planned_pages - confirmed_pages
-            if pending_pages < 0:
-                raise CollectionPlanRunError("resume has more pages than the plan")
+            confirmed_scopes = len(segment_refs)
+            if confirmed_scopes > expected_scopes:
+                raise CollectionPlanRunError(
+                    "resume has more query segments than the plan"
+                )
+            pending_pages = (
+                expected_scopes - confirmed_scopes
+            ) * bundle.collection_plan.quality.expected_pages_per_query
             self.deadline.ensure_estimated_window(
                 self._estimated_remaining_seconds(
                     bundle=bundle,
@@ -2747,7 +3242,7 @@ class CollectionPlanRunner:
 
             publication_reconcile_only = (
                 self.resume
-                and pending_pages == 0
+                and confirmed_scopes == expected_scopes
                 and prior_manifest is not None
                 and prior_manifest.get("status") == "publication_pending"
             )
@@ -2890,6 +3385,11 @@ class CollectionPlanRunner:
             manifest_regions: list[dict[str, Any]] = []
             region_rows: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
             totals = {"regions_ok": 0, "pages_ok": 0, "products_ok": 0}
+            bounded = bundle.collection_plan.runtime_window is not None
+            verified_refs_by_scope = {
+                (ref["region_id"], ref["query_id"]): ref
+                for ref in segment_refs
+            }
             boundary_egress: str | None = None
             failed_segment: dict[str, Any] | None = None
             caught: Exception | None = None
@@ -2909,6 +3409,14 @@ class CollectionPlanRunner:
                     }
                     manifest_regions.append(region_manifest)
                     for query in bundle.enabled_queries:
+                        verified_ref = verified_refs_by_scope.get(
+                            (region.region_id, query.query_id)
+                        )
+                        task_count = (
+                            int(verified_ref["pages_count"])
+                            if verified_ref is not None
+                            else bundle.collection_plan.quality.expected_pages_per_query
+                        )
                         tasks = [
                             self._task(
                                 bundle=bundle,
@@ -2918,7 +3426,7 @@ class CollectionPlanRunner:
                             )
                             for page in range(
                                 1,
-                                bundle.collection_plan.quality.expected_pages_per_query + 1,
+                                task_count + 1,
                             )
                         ]
                         loaded = [
@@ -2966,6 +3474,8 @@ class CollectionPlanRunner:
                         }
                         last_attempts: tuple[str, ...] = ()
                         last_endpoint_id = ""
+                        bounded_completion: dict[str, Any] | None = None
+                        segment_product_ids: list[str] = []
                         try:
                             for task in tasks:
                                 last_attempts = ()
@@ -3005,12 +3515,33 @@ class CollectionPlanRunner:
                                 )
                                 raw_bytes = _json_bytes(result.payload)
                                 self._write(pending_raw, raw_bytes)
+                                page_contract = (
+                                    _bounded_page_contract(
+                                        result.payload,
+                                        page=task.page,
+                                        depth=task.depth,
+                                        page_size=task.page_size,
+                                    )
+                                    if bounded
+                                    else None
+                                )
+                                products = (
+                                    page_contract.products
+                                    if page_contract is not None
+                                    else _extract_products(result.payload)
+                                )
                                 rows, page_row = self._rows_for_page(
                                     task=task,
                                     resolution=resolved[region.region_id],
-                                    products=_extract_products(result.payload),
+                                    products=products,
                                     raw_path=paths.raw_page_path(task),
                                     endpoint_id=result.endpoint_id,
+                                    expected_products_count=(
+                                        len(products) if bounded else task.page_size
+                                    ),
+                                )
+                                segment_product_ids.extend(
+                                    str(row["nmId"]) for row in rows
                                 )
                                 segment_usage[result.endpoint_id]["pages_ok"] += 1
                                 checkpoint = self._checkpoint_payload(
@@ -3023,6 +3554,22 @@ class CollectionPlanRunner:
                                     effective_plan_sha256=effective_sha256,
                                     bundle=bundle,
                                     segment_id=segment_id,
+                                    products_count=len(products),
+                                    payload_total=(
+                                        page_contract.payload_total
+                                        if page_contract is not None
+                                        else None
+                                    ),
+                                    capped_total=(
+                                        page_contract.capped_total
+                                        if page_contract is not None
+                                        else None
+                                    ),
+                                    terminal=(
+                                        page_contract.terminal
+                                        if page_contract is not None
+                                        else None
+                                    ),
                                 )
                                 checkpoint_bytes = _json_bytes(checkpoint)
                                 pending_checkpoint = (
@@ -3055,6 +3602,47 @@ class CollectionPlanRunner:
                                 )
                                 self._sleep_from_serp_config(
                                     "sleep_between_pages_ms"
+                                )
+                                if page_contract is not None:
+                                    if bounded_completion is None:
+                                        bounded_completion = {
+                                            "payload_total": page_contract.payload_total,
+                                            "capped_total": page_contract.capped_total,
+                                        }
+                                    elif (
+                                        bounded_completion["payload_total"]
+                                        != page_contract.payload_total
+                                        or bounded_completion["capped_total"]
+                                        != page_contract.capped_total
+                                    ):
+                                        raise CollectionPlanRunError(
+                                            "search_payload_total_changed_between_pages"
+                                        )
+                                    if page_contract.terminal:
+                                        bounded_completion.update(
+                                            {
+                                                "pages_count": len(page_refs),
+                                                "products_count": len(
+                                                    segment_product_ids
+                                                ),
+                                                "terminal_page": task.page,
+                                                "terminal_reason": (
+                                                    page_contract.terminal_reason
+                                                ),
+                                                "complete": True,
+                                                "duplicate_product_positions": (
+                                                    len(segment_product_ids)
+                                                    - len(set(segment_product_ids))
+                                                ),
+                                            }
+                                        )
+                                        break
+                            if bounded and (
+                                bounded_completion is None
+                                or bounded_completion.get("complete") is not True
+                            ):
+                                raise CollectionPlanRunError(
+                                    "bounded query segment has no proven terminal page"
                                 )
                             end_egress = self._check_egress()
                             if end_egress != start_egress:
@@ -3170,7 +3758,11 @@ class CollectionPlanRunner:
                             raise exc
 
                         segment_payload = {
-                            "schema_version": SEGMENT_SCHEMA_VERSION,
+                            "schema_version": (
+                                BOUNDED_SEGMENT_SCHEMA_VERSION
+                                if bounded
+                                else SEGMENT_SCHEMA_VERSION
+                            ),
                             "run_id": self.run_id,
                             "segment_id": segment_id,
                             "collection_plan_id": bundle.collection_plan.collection_plan_id,
@@ -3209,22 +3801,35 @@ class CollectionPlanRunner:
                                 },
                             },
                         }
+                        if bounded:
+                            segment_payload["completion"] = bounded_completion
                         segment_bytes = _json_bytes(segment_payload)
                         self._write(paths.segment_path(segment_id), segment_bytes)
-                        segment_refs.append(
-                            {
-                                "segment_id": segment_id,
-                                "region_id": region.region_id,
-                                "query_id": query.query_id,
-                                "path": _relative(
-                                    paths.segment_path(segment_id),
-                                    paths.project_root,
-                                ),
-                                "sha256": _sha256_bytes(segment_bytes),
-                                "egress": segment_payload["egress"],
-                                "pages_count": len(page_refs),
-                            }
-                        )
+                        segment_ref = {
+                            "segment_id": segment_id,
+                            "region_id": region.region_id,
+                            "query_id": query.query_id,
+                            "path": _relative(
+                                paths.segment_path(segment_id),
+                                paths.project_root,
+                            ),
+                            "sha256": _sha256_bytes(segment_bytes),
+                            "egress": segment_payload["egress"],
+                            "pages_count": len(page_refs),
+                        }
+                        if bounded:
+                            segment_ref.update(
+                                {
+                                    "products_count": bounded_completion[
+                                        "products_count"
+                                    ],
+                                    "completion": bounded_completion,
+                                }
+                            )
+                        segment_refs.append(segment_ref)
+                        verified_refs_by_scope[
+                            (region.region_id, query.query_id)
+                        ] = segment_ref
                         write_progress_manifest()
                         self._promote_verified_segment(
                             paths=paths,
@@ -3234,7 +3839,7 @@ class CollectionPlanRunner:
                         for endpoint_id, usage in segment_usage.items():
                             endpoint_usage[endpoint_id]["attempts"] += usage["attempts"]
                             endpoint_usage[endpoint_id]["pages_ok"] += usage["pages_ok"]
-                        for task in tasks:
+                        for task in tasks[: len(page_refs)]:
                             reused = self._load_reusable_page(
                                 paths=paths,
                                 task=task,
@@ -3254,14 +3859,38 @@ class CollectionPlanRunner:
 
                     region_manifest["pages_ok"] = len(pages_all)
                     region_manifest["products_ok"] = len(products_all)
-                    expected_region_pages = (
-                        len(bundle.enabled_queries)
-                        * bundle.collection_plan.quality.expected_pages_per_query
+                    region_segment_refs = [
+                        ref
+                        for ref in segment_refs
+                        if ref["region_id"] == region.region_id
+                    ]
+                    region_manifest["queries_ok"] = len(region_segment_refs)
+                    region_manifest["duplicate_product_positions"] = sum(
+                        int(ref.get("completion", {}).get(
+                            "duplicate_product_positions", 0
+                        ))
+                        for ref in region_segment_refs
                     )
-                    region_manifest["complete"] = (
-                        len(pages_all) == expected_region_pages
-                        and len(products_all) == expected_region_pages * 100
-                    )
+                    if bounded:
+                        region_manifest["complete"] = (
+                            len(region_segment_refs) == len(bundle.enabled_queries)
+                            and len(pages_all)
+                            == sum(int(ref["pages_count"]) for ref in region_segment_refs)
+                            and len(products_all)
+                            == sum(
+                                int(ref["products_count"])
+                                for ref in region_segment_refs
+                            )
+                        )
+                    else:
+                        expected_region_pages = (
+                            len(bundle.enabled_queries)
+                            * bundle.collection_plan.quality.expected_pages_per_query
+                        )
+                        region_manifest["complete"] = (
+                            len(pages_all) == expected_region_pages
+                            and len(products_all) == expected_region_pages * 100
+                        )
                     if not region_manifest["complete"]:
                         raise CollectionPlanRunError(
                             f"region scope incomplete: {region.region_id}"
@@ -3294,6 +3923,15 @@ class CollectionPlanRunner:
             canonical_pages = sum(
                 int(ref["pages_count"]) for ref in segment_refs
             )
+            canonical_products = sum(
+                int(
+                    ref.get(
+                        "products_count",
+                        int(ref["pages_count"]) * 100,
+                    )
+                )
+                for ref in segment_refs
+            )
             verified_queries_by_region: dict[str, set[str]] = {}
             for ref in segment_refs:
                 verified_queries_by_region.setdefault(
@@ -3306,14 +3944,42 @@ class CollectionPlanRunner:
                     for query_ids in verified_queries_by_region.values()
                 ),
                 "pages_ok": canonical_pages,
-                "products_ok": canonical_pages * 100,
+                "products_ok": canonical_products,
             }
+            if bounded:
+                totals.update({
+                    "queries_ok": len(segment_refs),
+                    "duplicate_product_positions": sum(
+                    int(
+                        ref.get("completion", {}).get(
+                            "duplicate_product_positions",
+                            0,
+                        )
+                    )
+                    for ref in segment_refs
+                ),
+                })
             expected_regions = len(bundle.enabled_regions)
             collection_complete = (
                 caught is None
                 and totals["regions_ok"] == expected_regions
-                and totals["pages_ok"] == planned_pages
-                and totals["products_ok"] == planned_pages * 100
+                and (
+                    totals.get("queries_ok")
+                    == expected_regions * len(bundle.enabled_queries)
+                    if bounded
+                    else True
+                )
+                and (
+                    (
+                        0 < totals["pages_ok"] <= planned_pages
+                        and 0 < totals["products_ok"] <= planned_pages * 100
+                    )
+                    if bounded
+                    else (
+                        totals["pages_ok"] == planned_pages
+                        and totals["products_ok"] == planned_pages * 100
+                    )
+                )
             )
             manifest = {
                 "schema_version": RESUMABLE_MANIFEST_SCHEMA_VERSION,
@@ -3376,6 +4042,11 @@ class CollectionPlanRunner:
                     )
                 },
             }
+            if bounded:
+                manifest["capacity"] = {
+                    "pages_max": planned_pages,
+                    "products_max": planned_pages * 100,
+                }
             self._replace(paths.manifest_path, _json_bytes(manifest), final_manifest=True)
             if caught is not None:
                 raise caught
@@ -3409,6 +4080,7 @@ class CollectionPlanRunner:
 
     def run(self) -> dict[str, Any]:
         initial_bundle = self._load_bundle()
+        self._configure_runtime_deadline(initial_bundle)
         self._validate_mode(initial_bundle)
         paths = ScopedPaths.build(
             project_root=self.config.project_root,

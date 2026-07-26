@@ -442,6 +442,70 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   this prevents two contenders from unlinking/recreating different
   `pipeline.lock` inodes during empty/corrupt/dead-owner recovery. Do not treat
   the guard file itself as evidence of an active parser run.
+- Phase A four-region work is isolated in the disabled
+  `shevron-four-regions-top1000-v2` collection plan. Its target regions are
+  Moscow, Rostov-on-Don, Novosibirsk and Kazan, with 30 pinned queries and
+  depth 1000. Do not schedule or enable it without a separate owner gate.
+  It uses the exact production SERP page/query pacing and HTTP timeout,
+  bounded resumable invocation deadlines, scoped sellers and a separate
+  regional warehouse. Historical global WB warehouse rows are assigned
+  `region_id=yaroslavl` during regional migration; Yaroslavl is historical
+  provenance, not a future collection region. Depth 1000 is a maximum:
+  bounded v2 query segments require consistent payload-total evidence and may
+  complete in 1-10 pages. Position facts use
+  `(run_id, region_id, query_id, absolute_position)` and preserve repeated
+  product IDs; deduplication is seller-input-only. Legacy Yaroslavl import is
+  an incremental set-based sync with row hashes, not a whole-file hash gate.
+  Regional warehouse must retain the current analytical query/seller fields
+  and materialize run/query quality facts inside DuckDB; future API readers
+  must not depend on incidental parser state files.
+  Regional warehouse/sync DuckDB connections are bounded to `1GiB`, two
+  threads and private spill sessions under ignored
+  `data/warehouse/wb_regional/tmp`; do not bypass this runtime factory. Verify
+  the engine's actual `current_setting(...)` values rather than trusting an
+  application marker. Legacy Yaroslavl run-quality query/page/position counts
+  are observed from imported position facts; source
+  `daily_run_quality.items_ok` remains a separate metric. Scoped regional
+  seller resume must canonicalize one final row per expected supplier, require
+  successful checkpoint/output agreement and report full verified-mart totals.
+  Critical deadline/cancellation pipeline exceptions from scoped sellers must
+  abort the loop immediately; they must not be downgraded to ordinary seller
+  network errors.
+  For duplicate `nmId` occurrences, seller input chooses the first plan-ordered
+  row with a non-empty `supplier_id`; all-missing products retain their first
+  row and increment `missing_supplier_products`. The position bridge remains
+  unchanged.
+  Before final cutover, four-region downstream uses the explicit
+  `pre_cutover_legacy_nightly_protected_v1` mode. It must reject protected or
+  insufficient-clearance starts before acquiring any shared lock; changing
+  this mode belongs to a separately reviewed supervisor/cutover change.
+  Its versioned legacy boundary is fixed at `00:15` MSK and must never be
+  derived from mutable collection-plan runtime fields. The v2 plan runtime
+  window must exact-match its reviewed contract; any drift fails before locks.
+  Downstream may write authoritative run state only while it owns all
+  collection-plan exclusion locks. Completed/published run state is immutable,
+  and `latest.json` pins its exact SHA-256. Rejected resumes, preflight
+  failures and lock contention must not mutate run state or latest; they use
+  unique immutable sanitized attempt artifacts below
+  `state/wb_four_region_nightly/<plan>/attempts/<run_id>/`. Diagnostic write
+  failure must not mask the original pipeline error.
+  State-to-latest publication uses exact canonical writer bytes and atomic
+  replace while the complete shared lock set is held. A strict completed-state
+  validator covers the execution contract, four regions, totals, sellers,
+  warehouse evidence, artifact hashes, timestamps and collection lineage.
+  The monotonic lineage order is the verified collection
+  `started_at_utc` from the immutable scoped manifest; an older or
+  equal-time different run must never replace a newer latest. State and latest
+  are verified through no-follow file descriptors after publication. There is
+  no compensating rename rollback: a crash before latest leaves an immutable
+  completed-but-unpublished state for same-run reconciliation, while a durable
+  exact latest remains authoritative. Non-cooperating writers are outside this
+  lock-based authority model and must not be "repaired" with an unsafe
+  pseudo-CAS.
+  Scoped `regional_run_quality.source_row_sha256` must cover every retained
+  row field except the hash itself.
+  Operational contract:
+  `docs/tasks/WB_FOUR_REGION_NIGHTLY_EXECPLAN_20260726.md`.
 - A WB top-20 product-only SERP run on 2026-06-12
   (`run_id=20260612_195008Z`) collected `9577` product rows, but finished
   `partial`: `96` pages succeeded, `83` pages returned HTTP 429, and `3` pages

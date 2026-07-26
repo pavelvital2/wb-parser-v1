@@ -118,6 +118,8 @@ def test_committed_stage1_bundle_is_valid_and_disabled() -> None:
     assert [region.region_id for region in bundle.region_registry.regions] == [
         "moscow",
         "rostov-on-don",
+        "novosibirsk",
+        "kazan",
     ]
     assert all(not region.enabled for region in bundle.region_registry.regions)
     assert all(region.dest_id is None for region in bundle.region_registry.regions)
