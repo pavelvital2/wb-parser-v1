@@ -397,6 +397,21 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   non-zero, then starts sellers only after a successful SERP. Current defaults:
   `PARSER_WB_SERP_MAX_ATTEMPTS=2` and
   `PARSER_WB_SERP_RETRY_SLEEP_SECONDS=3600`.
+- On 2026-07-14, `state/locks/pipeline.lock` recovery was hardened after an
+  empty lock with no owner blocked the nightly retry path until
+  `runtime.lock_stale_seconds`. A working lock must not be removed: active is
+  detected by an advisory file lock or a live metadata PID. Empty, corrupt, or
+  dead-owner lock files are recoverable immediately, without waiting 6 hours.
+  New lock metadata includes lock version, PID, PPID, hostname, target, run_id,
+  and start time, and the process holds an advisory lock for the run lifetime.
+  Do not manually delete `pipeline.lock` unless process/owner checks prove it is
+  not active.
+- `state/locks/pipeline.lock.guard` is a persistent recovery mutex, not a
+  pipeline run lock. Every lock acquire takes this guard while checking,
+  recovering, creating, flocking, and fsyncing metadata for `pipeline.lock`;
+  this prevents two contenders from unlinking/recreating different
+  `pipeline.lock` inodes during empty/corrupt/dead-owner recovery. Do not treat
+  the guard file itself as evidence of an active parser run.
 - A WB top-20 product-only SERP run on 2026-06-12
   (`run_id=20260612_195008Z`) collected `9577` product rows, but finished
   `partial`: `96` pages succeeded, `83` pages returned HTTP 429, and `3` pages

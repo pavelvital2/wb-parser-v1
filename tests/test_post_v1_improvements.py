@@ -116,7 +116,7 @@ def test_run_lock_blocks_parallel_run(tmp_path: Path) -> None:
     lock_dir = cfg.paths.STATE_DIR / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_file = lock_dir / "pipeline.lock"
-    lock_file.write_text('{"pid":999,"target":"daily"}', encoding="utf-8")
+    lock_file.write_text(json.dumps({"pid": os.getpid(), "target": "daily"}), encoding="utf-8")
 
     with pytest.raises(RunLockedError):
         run_component(config=cfg, db=db, target="filter")

@@ -56,6 +56,10 @@ Recommended task options:
 
 Note:
 - Pipeline-level singleton lock (`state/locks/pipeline.lock`) also prevents conflicting parallel starts.
+- The lock file contains PID/run metadata and is also held with an advisory
+  file lock while a run is active.
+- `state/locks/pipeline.lock.guard` is a persistent recovery guard used only to
+  serialize lock acquire/recovery/create; it is not an active run marker.
 
 ## 4. Verification Checklist (Windows)
 After first trigger run, verify:
@@ -250,3 +254,10 @@ Even with scheduler rules, keep lock enabled in config:
 
 If a run crashes and lock remains stale, stale handling is controlled by:
 - `runtime.lock_stale_seconds`
+
+Empty, corrupt, or dead-owner `state/locks/pipeline.lock` files are recovered
+immediately after verifying that no advisory lock is held and the metadata PID
+is not alive. Do not remove a lock manually while a parser process is active or
+the lock is held by the OS. Recovery is serialized through
+`state/locks/pipeline.lock.guard` until the new `pipeline.lock` is created,
+flocked, and fsynced with metadata.
