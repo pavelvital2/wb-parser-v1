@@ -173,8 +173,9 @@ The runner:
 - never claims that the search server applied the destination;
 - refuses to start within five minutes of the 23:45 MSK preflight cutoff;
 - for plans deeper than 500, estimates the remaining worst-case request and
-  pacing window and refuses to start when that window plus a 15-minute safety
-  reserve would overlap the nightly 00:15 MSK collection.
+  pacing window using every configured endpoint as a possible sequential
+  attempt per page, and refuses to start when that window plus a 15-minute
+  safety reserve would overlap the nightly 00:15 MSK collection.
 
 All outputs remain under:
 
@@ -207,6 +208,14 @@ to canonical raw/checkpoint paths. An interrupted segment is not reusable and
 is recollected in full, limiting automatic repetition to one query (10 pages).
 Confirmed segments are validated by exact source/effective hashes, metadata
 and raw/checkpoint checksums before reuse.
+
+Failed or discarded segment attempts remain in a cumulative sanitized history
+across every resume. `endpoint_usage` therefore reports actual HTTP attempts
+and successful page responses, including discarded work, while `totals`
+reports only canonical confirmed pages. Segment IDs are deduplicated and all
+history counters, scopes and endpoint IDs are validated before resolver or
+search traffic. If the end egress differs, both checks are retained only as
+masked values and run-local hashes; that segment is never reusable.
 
 Resume is explicit and keeps the original run identity:
 

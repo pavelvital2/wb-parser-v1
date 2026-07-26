@@ -8,7 +8,7 @@ import shutil
 import socket
 import sys
 from contextlib import ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -24,11 +24,13 @@ from app.serp.collection_plan import (
     EffectiveEndpointPolicy,
     canonical_effective_plan_sha256,
     exact_file_sha256,
+    load_collection_plan_bundle,
 )
 from app.serp.collection_plan_runner import (
     CollectionPlanRunner,
     CollectionPlanRunError,
     DeadlineGuard,
+    EgressIdentityChangedError,
     RequestsScopedTransport,
     ScopedPaths,
     ScopedSearchRequest,
@@ -538,6 +540,11 @@ def test_top1000_resume_repeats_only_unfinished_query_segment(
     }
     assert manifest["resume"]["verified_segments"] == 6
     assert manifest["resume"]["maximum_repeated_pages"] == 10
+    assert len(manifest["resume"]["discarded_segments"]) == 1
+    assert manifest["endpoint_usage"]["primary"] == {
+        "attempts": 65,
+        "pages_ok": 64,
+    }
 
     mart_path = (
         root
@@ -583,6 +590,201 @@ def test_top1000_resume_repeats_only_unfinished_query_segment(
         ref["egress"]["start"]["masked"] for ref in segment_refs
     } == {"203.0.x.x", "198.51.x.x"}
     assert resumed.egress_calls == 5
+
+
+def test_top1000_multiple_resume_failures_do_not_double_count_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=25),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=5),
+            resume_run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=FakeTransport(),
+        resume_run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+    )
+
+    discarded = manifest["resume"]["discarded_segments"]
+    assert len(discarded) == 2
+    assert len({item["segment_id"] for item in discarded}) == 2
+    assert manifest["endpoint_usage"]["primary"] == {
+        "attempts": 70,
+        "pages_ok": 68,
+    }
+    assert manifest["totals"]["pages_ok"] == 60
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "negative_counter",
+        "boolean_counter",
+        "unknown_endpoint",
+        "unknown_scope",
+        "duplicate_segment_id",
+    ],
+)
+def test_top1000_resume_rejects_invalid_discarded_history_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=1),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+
+    manifest_path = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+        / "manifest.json"
+    )
+    manifest = _read_json(manifest_path)
+    history = manifest["resume"]["discarded_segments"]
+    if corruption == "negative_counter":
+        history[0]["endpoint_usage"]["primary"]["attempts"] = -1
+    elif corruption == "boolean_counter":
+        history[0]["endpoint_usage"]["primary"]["attempts"] = True
+    elif corruption == "unknown_endpoint":
+        history[0]["endpoint_usage"]["unknown"] = {
+            "attempts": 0,
+            "pages_ok": 0,
+        }
+    elif corruption == "unknown_scope":
+        history[0]["region_id"] = "unknown-region"
+    elif corruption == "duplicate_segment_id":
+        history.append(dict(history[0]))
+    _write_json(manifest_path, manifest)
+
+    transport = FakeTransport()
+    with pytest.raises(CollectionPlanRunError, match="discarded segment"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=transport,
+            resume_run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    assert transport.resolve_calls == []
+    assert transport.search_calls == []
+    assert transport.egress_calls == 0
+
+
+def test_top1000_changed_end_egress_is_honest_and_segment_is_repeated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+
+    first = FakeTransport(
+        egress_values=["203.0.113.10", "198.51.100.20"],
+    )
+    with pytest.raises(EgressIdentityChangedError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=first,
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            egress_hash_salt=b"changed-egress",
+        )
+    assert len(first.search_calls) == 10
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    failed = _read_json(state_dir / "manifest.json")
+    evidence = failed["resume"]["discarded_segments"][0]["egress"]
+    assert evidence["verification_status"] == "changed"
+    assert evidence["constant"] is False
+    assert evidence["checks_completed"] == 2
+    assert evidence["start"]["masked"] == "203.0.x.x"
+    assert evidence["end"]["masked"] == "198.51.x.x"
+    assert evidence["start"]["ephemeral_sha256"] != evidence["end"][
+        "ephemeral_sha256"
+    ]
+    assert failed["resume"]["segments"] == []
+    assert not (
+        root
+        / "data/raw/serp_scoped"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "moscow"
+        / RUN_ID
+        / "pages/shevron/page_001.json"
+    ).exists()
+    assert not (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "latest.json"
+    ).exists()
+
+    resumed = FakeTransport(egress_values=["192.0.2.30"] * 8)
+    manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=resumed,
+        resume_run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+        egress_hash_salt=b"changed-egress",
+    )
+    assert len(resumed.search_calls) == 60
+    assert manifest["complete"] is True
+    assert manifest["totals"]["pages_ok"] == 60
+    assert len(manifest["resume"]["discarded_segments"]) == 1
 
 
 def test_top1000_resume_rejects_corrupt_confirmed_raw_before_network(
@@ -790,22 +992,79 @@ def test_top1000_estimated_window_rejects_before_network(
     plan = _read_json(plan_path)
     plan["enabled"] = True
     _write_json(plan_path, plan)
-    late_now = datetime(2026, 7, 26, 16, 0, 0, tzinfo=timezone.utc)
-    transport = FakeTransport()
+    bundle = load_collection_plan_bundle(
+        project_root=root,
+        plan_path=plan_path,
+        region_registry_path=root / REGIONS_RELATIVE,
+    )
+    single = FakeTransport()
+    single.endpoint_policy = EffectiveEndpointPolicy(
+        selection_mode="ordered_fallbacks",
+        endpoint_ids=("primary",),
+        pinned_endpoint_id="primary",
+    )
+    double = FakeTransport()
+    one_runner = CollectionPlanRunner(
+        config=config,
+        plan_path=plan_path,
+        transport=single,
+        no_publish=True,
+        run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+    )
+    two_runner = CollectionPlanRunner(
+        config=config,
+        plan_path=plan_path,
+        transport=double,
+        no_publish=True,
+        run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+    )
+    planned_pages = 600
+    one_estimate = one_runner._estimated_remaining_seconds(
+        bundle=bundle,
+        pending_pages=planned_pages,
+    )
+    two_estimate = two_runner._estimated_remaining_seconds(
+        bundle=bundle,
+        pending_pages=planned_pages,
+    )
+    assert two_estimate - one_estimate == pytest.approx(
+        planned_pages * config.runtime.http_timeout_seconds
+    )
+    latest_safe_finish = datetime(
+        2026,
+        7,
+        26,
+        21,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    )
+    gate_now = latest_safe_finish - timedelta(
+        seconds=(one_estimate + two_estimate) / 2
+    )
+    DeadlineGuard.for_current_day(
+        now=lambda: gate_now
+    ).ensure_estimated_window(one_estimate)
+    with pytest.raises(CollectionPlanRunError, match="overlaps nightly 00:15"):
+        DeadlineGuard.for_current_day(
+            now=lambda: gate_now
+        ).ensure_estimated_window(two_estimate)
 
     with pytest.raises(CollectionPlanRunError, match="overlaps nightly 00:15"):
         run_collection_plan(
             config=config,
             plan_path=plan_path,
             no_publish=True,
-            transport=transport,
+            transport=double,
             run_id=RUN_ID,
-            now=lambda: late_now,
+            now=lambda: gate_now,
             sleeper=lambda _seconds: None,
         )
-    assert transport.resolve_calls == []
-    assert transport.search_calls == []
-    assert transport.egress_calls == 0
+    assert double.resolve_calls == []
+    assert double.search_calls == []
+    assert double.egress_calls == 0
 
 def test_runner_uses_production_serp_pacing_values(
     tmp_path: Path,

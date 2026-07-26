@@ -64,6 +64,7 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _RUN_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}Z$")
 _DEST_RE = re.compile(r"^[+-]?[0-9]{1,16}$")
 _PRODUCT_ID_RE = re.compile(r"^[1-9][0-9]{0,19}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 LockEventHook = Callable[[str, str, Path], None]
 WriteEventHook = Callable[[str, Path], None]
@@ -1504,8 +1505,11 @@ class CollectionPlanRunner:
         serp = self.config.raw.get("serp", {})
         page_sleep = max(0.0, float(serp.get("sleep_between_pages_ms", 0))) / 1000.0
         query_sleep = max(0.0, float(serp.get("sleep_between_queries_ms", 0))) / 1000.0
+        endpoint_count = len(self.transport.endpoint_policy.endpoint_ids)
+        if endpoint_count < 1:
+            raise CollectionPlanRunError("endpoint policy must not be empty")
         request_seconds = (
-            float(self.config.runtime.http_timeout_seconds)
+            float(self.config.runtime.http_timeout_seconds) * endpoint_count
             + page_sleep
             + ESTIMATED_REQUEST_OVERHEAD_SECONDS
         )
@@ -1518,6 +1522,205 @@ class CollectionPlanRunner:
             + pending_queries * query_sleep
             + NIGHTLY_SAFETY_RESERVE_SECONDS
         )
+
+    def _validate_discarded_segments(
+        self,
+        *,
+        value: Any,
+        bundle: CollectionPlanBundle,
+        verified_segment_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            raise CollectionPlanRunError("discarded segment history must be a list")
+        endpoint_ids = self.transport.endpoint_policy.endpoint_ids
+        allowed_endpoints = set(endpoint_ids)
+        allowed_regions = {region.region_id for region in bundle.enabled_regions}
+        allowed_queries = {query.query_id for query in bundle.enabled_queries}
+        seen_ids = set(verified_segment_ids)
+        normalized: list[dict[str, Any]] = []
+
+        def validate_egress_item(item: Any, *, field: str) -> dict[str, str]:
+            if not isinstance(item, dict) or set(item) != {
+                "source",
+                "masked",
+                "ephemeral_sha256",
+            }:
+                raise CollectionPlanRunError(f"{field} is invalid")
+            source = item.get("source")
+            masked = item.get("masked")
+            digest = item.get("ephemeral_sha256")
+            if (
+                source not in {"segment_start_check", "previous_segment_end", "segment_end_check"}
+                or not isinstance(masked, str)
+                or len(masked) > 64
+                or "x" not in masked
+                or any(character in masked for character in "\r\n")
+                or not isinstance(digest, str)
+                or not _SHA256_RE.fullmatch(digest)
+            ):
+                raise CollectionPlanRunError(f"{field} is invalid")
+            return {
+                "source": source,
+                "masked": masked,
+                "ephemeral_sha256": digest,
+            }
+
+        for item in value:
+            if not isinstance(item, dict):
+                raise CollectionPlanRunError("discarded segment entry is invalid")
+            segment_id = item.get("segment_id")
+            region_id = item.get("region_id")
+            query_id = item.get("query_id")
+            pages_written = item.get("pages_written")
+            if (
+                not isinstance(segment_id, str)
+                or not _ID_RE.fullmatch(segment_id)
+                or segment_id in seen_ids
+            ):
+                raise CollectionPlanRunError(
+                    "discarded segment identity is invalid or duplicated"
+                )
+            if region_id not in allowed_regions or query_id not in allowed_queries:
+                raise CollectionPlanRunError("discarded segment scope is invalid")
+            if item.get("status") != "incomplete_not_reusable":
+                raise CollectionPlanRunError("discarded segment status is invalid")
+            if (
+                type(pages_written) is not int
+                or not 0
+                <= pages_written
+                <= bundle.collection_plan.quality.expected_pages_per_query
+            ):
+                raise CollectionPlanRunError(
+                    "discarded segment pages_written is invalid"
+                )
+            usage = item.get("endpoint_usage")
+            if not isinstance(usage, dict) or set(usage) != allowed_endpoints:
+                raise CollectionPlanRunError(
+                    "discarded segment endpoint usage is invalid"
+                )
+            normalized_usage: dict[str, dict[str, int]] = {}
+            for endpoint_id in endpoint_ids:
+                counters = usage.get(endpoint_id)
+                if not isinstance(counters, dict) or set(counters) != {
+                    "attempts",
+                    "pages_ok",
+                }:
+                    raise CollectionPlanRunError(
+                        "discarded segment endpoint counters are invalid"
+                    )
+                attempts = counters.get("attempts")
+                pages_ok = counters.get("pages_ok")
+                if (
+                    type(attempts) is not int
+                    or type(pages_ok) is not int
+                    or attempts < 0
+                    or pages_ok < 0
+                    or pages_ok > attempts
+                ):
+                    raise CollectionPlanRunError(
+                        "discarded segment endpoint counters are invalid"
+                    )
+                normalized_usage[endpoint_id] = {
+                    "attempts": attempts,
+                    "pages_ok": pages_ok,
+                }
+            if sum(
+                counters["pages_ok"] for counters in normalized_usage.values()
+            ) != pages_written:
+                raise CollectionPlanRunError(
+                    "discarded segment pages do not match endpoint counters"
+                )
+
+            attempted = item.get("attempted_endpoint_ids", [])
+            endpoint_id = item.get("endpoint_id")
+            if (
+                not isinstance(attempted, list)
+                or any(type(entry) is not str for entry in attempted)
+                or len(set(attempted)) != len(attempted)
+                or any(entry not in allowed_endpoints for entry in attempted)
+                or endpoint_id is not None
+                and endpoint_id not in allowed_endpoints
+                or endpoint_id is not None
+                and endpoint_id not in attempted
+            ):
+                raise CollectionPlanRunError(
+                    "discarded segment endpoint evidence is invalid"
+                )
+            error_code = item.get("error_code")
+            if (
+                not isinstance(error_code, str)
+                or not 1 <= len(error_code) <= 100
+                or any(character in error_code for character in "\r\n")
+            ):
+                raise CollectionPlanRunError(
+                    "discarded segment error code is invalid"
+                )
+            egress = item.get("egress")
+            if not isinstance(egress, dict):
+                raise CollectionPlanRunError(
+                    "discarded segment egress evidence is invalid"
+                )
+            verification_status = egress.get("verification_status")
+            constant = egress.get("constant")
+            checks_completed = egress.get("checks_completed")
+            checks_expected = egress.get("checks_expected")
+            start = validate_egress_item(
+                egress.get("start"),
+                field="discarded segment egress start",
+            )
+            end_value = egress.get("end")
+            if verification_status == "unverified":
+                if (
+                    constant is not None
+                    or checks_completed != 1
+                    or checks_expected != 2
+                    or end_value is not None
+                ):
+                    raise CollectionPlanRunError(
+                        "discarded unverified egress evidence is invalid"
+                    )
+                end = None
+            elif verification_status == "changed":
+                if (
+                    constant is not False
+                    or checks_completed != 2
+                    or checks_expected != 2
+                ):
+                    raise CollectionPlanRunError(
+                        "discarded changed egress evidence is invalid"
+                    )
+                end = validate_egress_item(
+                    end_value,
+                    field="discarded segment egress end",
+                )
+            else:
+                raise CollectionPlanRunError(
+                    "discarded segment egress status is invalid"
+                )
+
+            seen_ids.add(segment_id)
+            normalized.append(
+                {
+                    "segment_id": segment_id,
+                    "region_id": region_id,
+                    "query_id": query_id,
+                    "pages_written": pages_written,
+                    "status": "incomplete_not_reusable",
+                    "endpoint_id": endpoint_id,
+                    "attempted_endpoint_ids": list(attempted),
+                    "error_code": error_code,
+                    "endpoint_usage": normalized_usage,
+                    "egress": {
+                        "verification_status": verification_status,
+                        "constant": constant,
+                        "checks_completed": checks_completed,
+                        "checks_expected": checks_expected,
+                        "start": start,
+                        "end": end,
+                    },
+                }
+            )
+        return normalized
 
     def _task(
         self,
@@ -1993,8 +2196,17 @@ class CollectionPlanRunner:
                 else:
                     self._write(canonical, pending_bytes)
 
-    def _next_segment_id(self, paths: ScopedPaths) -> str:
+    def _next_segment_id(
+        self,
+        paths: ScopedPaths,
+        *,
+        reserved_ids: set[str] | None = None,
+    ) -> str:
         indices: list[int] = []
+        for segment_id in reserved_ids or set():
+            match = re.fullmatch(r"segment-([0-9]{3,6})", segment_id)
+            if match:
+                indices.append(int(match.group(1)))
         for base in (paths.segment_dir, paths.state_run_dir / "pending_segments"):
             if not base.exists():
                 continue
@@ -2066,6 +2278,7 @@ class CollectionPlanRunner:
             effective_sha256 = ""
             segment_refs: list[dict[str, Any]] = []
             verified_segment_ids: set[str] = set()
+            discarded_segments: list[dict[str, Any]] = []
             if self.resume:
                 snapshot_bytes = _read_regular_bytes(
                     paths.effective_plan_path,
@@ -2105,6 +2318,11 @@ class CollectionPlanRunner:
                     bundle=bundle,
                     effective_plan_sha256=effective_sha256,
                     expected_refs=tuple(prior_refs),
+                )
+                discarded_segments = self._validate_discarded_segments(
+                    value=resume_state.get("discarded_segments", []),
+                    bundle=bundle,
+                    verified_segment_ids=verified_segment_ids,
                 )
 
             confirmed_pages = sum(
@@ -2201,6 +2419,10 @@ class CollectionPlanRunner:
                     endpoint_usage[endpoint_id]["pages_ok"] += int(
                         usage.get("pages_ok", 0)
                     )
+            for discarded in discarded_segments:
+                for endpoint_id, usage in discarded["endpoint_usage"].items():
+                    endpoint_usage[endpoint_id]["attempts"] += usage["attempts"]
+                    endpoint_usage[endpoint_id]["pages_ok"] += usage["pages_ok"]
 
             def write_progress_manifest() -> None:
                 progress = {
@@ -2233,6 +2455,7 @@ class CollectionPlanRunner:
                         "resumed": self.resume,
                         "segments": segment_refs,
                         "verified_segments": len(segment_refs),
+                        "discarded_segments": discarded_segments,
                         "failed_segment": None,
                         "maximum_repeated_pages": bundle.collection_plan.quality.expected_pages_per_query,
                     },
@@ -2301,8 +2524,18 @@ class CollectionPlanRunner:
                                 pages_all.append(page_row)
                             continue
 
-                        segment_id = self._next_segment_id(paths)
+                        segment_id = self._next_segment_id(
+                            paths,
+                            reserved_ids={
+                                *verified_segment_ids,
+                                *(
+                                    item["segment_id"]
+                                    for item in discarded_segments
+                                ),
+                            },
+                        )
                         start_egress = boundary_egress or self._check_egress()
+                        end_egress: str | None = None
                         page_refs: list[dict[str, Any]] = []
                         segment_usage = {
                             endpoint_id: {"attempts": 0, "pages_ok": 0}
@@ -2394,8 +2627,16 @@ class CollectionPlanRunner:
                                 self._sleep_from_serp_config(
                                     "sleep_between_pages_ms"
                                 )
-                            end_egress = self._check_egress(start_egress)
+                            end_egress = self._check_egress()
+                            if end_egress != start_egress:
+                                raise EgressIdentityChangedError(
+                                    "egress identity changed during query segment"
+                                )
                         except Exception as exc:
+                            egress_changed = (
+                                end_egress is not None
+                                and end_egress != start_egress
+                            )
                             failed_segment = {
                                 "segment_id": segment_id,
                                 "region_id": region.region_id,
@@ -2403,9 +2644,13 @@ class CollectionPlanRunner:
                                 "pages_written": len(page_refs),
                                 "status": "incomplete_not_reusable",
                                 "egress": {
-                                    "verification_status": "unverified",
-                                    "constant": None,
-                                    "checks_completed": 1,
+                                    "verification_status": (
+                                        "changed"
+                                        if egress_changed
+                                        else "unverified"
+                                    ),
+                                    "constant": False if egress_changed else None,
+                                    "checks_completed": 2 if egress_changed else 1,
                                     "checks_expected": 2,
                                     "start": {
                                         "source": (
@@ -2419,7 +2664,18 @@ class CollectionPlanRunner:
                                             salt=self.egress_hash_salt,
                                         ),
                                     },
-                                    "end": None,
+                                    "end": (
+                                        {
+                                            "source": "segment_end_check",
+                                            "masked": _mask_egress(end_egress),
+                                            "ephemeral_sha256": _egress_hash(
+                                                end_egress,
+                                                salt=self.egress_hash_salt,
+                                            ),
+                                        }
+                                        if egress_changed
+                                        else None
+                                    ),
                                 },
                             }
                             if isinstance(exc, ScopedTransportError):
@@ -2435,6 +2691,31 @@ class CollectionPlanRunner:
                                         "error_code": exc.code,
                                     }
                                 )
+                            else:
+                                failed_segment.update(
+                                    {
+                                        "endpoint_id": None,
+                                        "attempted_endpoint_ids": [],
+                                        "error_code": (
+                                            "egress_identity_changed"
+                                            if isinstance(
+                                                exc,
+                                                EgressIdentityChangedError,
+                                            )
+                                            else exc.__class__.__name__
+                                        ),
+                                    }
+                                )
+                            failed_segment["endpoint_usage"] = {
+                                endpoint_id: dict(usage)
+                                for endpoint_id, usage in segment_usage.items()
+                            }
+                            discarded_segments = self._validate_discarded_segments(
+                                value=[*discarded_segments, failed_segment],
+                                bundle=bundle,
+                                verified_segment_ids=verified_segment_ids,
+                            )
+                            failed_segment = discarded_segments[-1]
                             for endpoint_id, usage in segment_usage.items():
                                 endpoint_usage[endpoint_id]["attempts"] += usage[
                                     "attempts"
@@ -2610,6 +2891,7 @@ class CollectionPlanRunner:
                     "resumed": self.resume,
                     "segments": segment_refs,
                     "verified_segments": len(segment_refs),
+                    "discarded_segments": discarded_segments,
                     "failed_segment": failed_segment,
                     "maximum_repeated_pages": bundle.collection_plan.quality.expected_pages_per_query,
                 },
