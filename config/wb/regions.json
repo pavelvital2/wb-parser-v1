@@ -4,7 +4,7 @@
     {
       "region_id": "moscow",
       "region_name": "Москва",
-      "enabled": true,
+      "enabled": false,
       "resolver": "wb_geo_xinfo",
       "latitude": "55.6255780",
       "longitude": "37.6063916",
@@ -17,7 +17,7 @@
     {
       "region_id": "rostov-on-don",
       "region_name": "Ростов-на-Дону",
-      "enabled": true,
+      "enabled": false,
       "resolver": "wb_geo_xinfo",
       "latitude": "47.2222596",
       "longitude": "39.7198736",
