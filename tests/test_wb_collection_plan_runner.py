@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import socket
+import sys
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,12 +19,14 @@ from app.common.cli import build_parser
 from app.common.config import load_config
 from app.common.exceptions import RunLockedError
 from app.common.run_lock import acquire_advisory_lock, acquire_run_lock
+from app.serp import collection_plan_runner as runner_module
 from app.serp.collection_plan import (
     EffectiveEndpointPolicy,
     canonical_effective_plan_sha256,
     exact_file_sha256,
 )
 from app.serp.collection_plan_runner import (
+    CollectionPlanRunner,
     CollectionPlanRunError,
     DeadlineGuard,
     RequestsScopedTransport,
@@ -34,6 +37,7 @@ from app.serp.collection_plan_runner import (
     acquire_collection_plan_locks,
     run_collection_plan,
 )
+from scripts import run_wb_collection_plan as dedicated_launcher
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -112,6 +116,7 @@ class FakeTransport:
         *,
         destinations: Mapping[str, str] | None = None,
         egress_values: list[str] | None = None,
+        egress_failure_calls: set[int] | None = None,
         failure_call: int | None = None,
         failure_code: str = "search_http_498",
         product_count: int = 100,
@@ -127,6 +132,7 @@ class FakeTransport:
             }
         )
         self.egress_values = list(egress_values or ["203.0.113.10"] * 3)
+        self.egress_failure_calls = set(egress_failure_calls or ())
         self.failure_call = failure_call
         self.failure_code = failure_code
         self.product_count = product_count
@@ -142,8 +148,11 @@ class FakeTransport:
 
     def egress_identity(self, *, timeout_seconds: float) -> str:
         self.events.append("egress")
+        call_number = self.egress_calls + 1
         index = min(self.egress_calls, len(self.egress_values) - 1)
         self.egress_calls += 1
+        if call_number in self.egress_failure_calls:
+            raise ScopedTransportError("egress_network_error")
         return self.egress_values[index]
 
     def resolve_destination(self, region, *, timeout_seconds: float) -> str:
@@ -248,6 +257,10 @@ def test_successful_runner_writes_only_scoped_outputs_and_provenance(
         "resolved_and_sent",
     ]
     assert manifest["egress"]["masked"] == "203.0.x.x"
+    assert manifest["egress"]["verification_status"] == "verified_constant"
+    assert manifest["egress"]["constant"] is True
+    assert manifest["egress"]["checks_completed"] == 3
+    assert manifest["egress"]["checks_expected"] == 3
     assert "203.0.113.10" not in json.dumps(manifest)
 
     assert transport.resolve_calls == ["moscow", "rostov-on-don"]
@@ -599,6 +612,10 @@ def test_partial_http_failure_has_no_retry_and_cannot_be_complete(
     manifest = _read_json(state_dir / "manifest.json")
     assert manifest["status"] == "failed"
     assert manifest["complete"] is False
+    assert manifest["egress"]["verification_status"] == "unverified"
+    assert manifest["egress"]["constant"] is None
+    assert manifest["egress"]["checks_completed"] == 1
+    assert manifest["egress"]["checks_expected"] == 3
     assert manifest["regions"][0]["dest_resolution_status"] == "resolved_and_sent"
     assert manifest["regions"][0]["pages_ok"] == 1
     assert manifest["regions"][1]["status"] == "pending"
@@ -634,6 +651,10 @@ def test_payload_failures_are_fail_closed_without_retry(
         / "manifest.json"
     )
     assert manifest["complete"] is False
+    assert manifest["egress"]["verification_status"] == "unverified"
+    assert manifest["egress"]["constant"] is None
+    assert manifest["egress"]["checks_completed"] == 1
+    assert manifest["egress"]["checks_expected"] == 3
 
 
 def test_equal_destinations_fail_before_search(
@@ -675,7 +696,45 @@ def test_changed_egress_stops_before_second_region(
         / "manifest.json"
     )
     assert manifest["complete"] is False
+    assert manifest["egress"]["verification_status"] == "changed"
     assert manifest["egress"]["constant"] is False
+    assert manifest["egress"]["checks_completed"] == 2
+    assert manifest["egress"]["checks_expected"] == 3
+
+
+@pytest.mark.parametrize(
+    ("failure_call", "expected_completed", "expected_search_calls"),
+    [
+        (2, 1, 3),
+        (3, 2, 6),
+    ],
+)
+def test_egress_transport_failure_is_unverified_not_changed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_call: int,
+    expected_completed: int,
+    expected_search_calls: int,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    transport = FakeTransport(egress_failure_calls={failure_call})
+
+    with pytest.raises(ScopedTransportError, match="egress_network_error"):
+        _run(config, plan_path, transport)
+
+    manifest = _read_json(
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+        / "manifest.json"
+    )
+    assert len(transport.search_calls) == expected_search_calls
+    assert manifest["complete"] is False
+    assert manifest["egress"]["verification_status"] == "unverified"
+    assert manifest["egress"]["constant"] is None
+    assert manifest["egress"]["checks_completed"] == expected_completed
+    assert manifest["egress"]["checks_expected"] == 3
 
 
 def test_effective_snapshot_is_immutable(
@@ -725,6 +784,70 @@ def test_deadline_bounds_request_timeout() -> None:
     now = datetime(2026, 7, 26, 20, 35, 0, tzinfo=timezone.utc)
     guard = DeadlineGuard.for_current_day(now=lambda: now)
     assert 0 < guard.request_timeout(3_600) < 600
+
+
+def test_final_manifest_write_is_rejected_inside_deadline_reserve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+
+    class MutableClock:
+        current = FIXED_NOW
+
+        def __call__(self) -> datetime:
+            return self.current
+
+    clock = MutableClock()
+    runner = CollectionPlanRunner(
+        config=config,
+        plan_path=plan_path,
+        transport=FakeTransport(),
+        no_publish=True,
+        run_id=RUN_ID,
+        now=clock,
+    )
+    target = root / "state/wb_collection_plans/test/manifest.json"
+
+    def forbidden_write(*args, **kwargs):
+        raise AssertionError("late final manifest write must not be attempted")
+
+    monkeypatch.setattr(runner_module, "_write_new_bytes", forbidden_write)
+    clock.current = datetime(2026, 7, 26, 20, 44, 56, tzinfo=timezone.utc)
+    with pytest.raises(CollectionPlanRunError, match="deadline reserve"):
+        runner._write(target, b"{}", final_manifest=True)
+    assert not target.exists()
+
+
+def test_dedicated_launcher_handles_lock_contention_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_wb_collection_plan.py",
+            "--config",
+            str(root / "config/config.yaml"),
+            "--plan-file",
+            str(plan_path),
+            "--no-publish",
+        ],
+    )
+    monkeypatch.setattr(dedicated_launcher, "load_config", lambda _path: config)
+
+    def locked(**kwargs):
+        raise RunLockedError("collection plan lock is busy")
+
+    monkeypatch.setattr(dedicated_launcher, "run_collection_plan", locked)
+
+    assert dedicated_launcher.main() == 1
+    captured = capsys.readouterr()
+    assert "collection plan lock is busy" in captured.err
+    assert "Traceback" not in captured.err
 
 
 class FakeResponse:

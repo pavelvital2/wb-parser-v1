@@ -11,8 +11,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.common.config import load_config
+from app.common.exceptions import ConfigValidationError, CriticalPipelineError
 from app.serp.collection_plan import CollectionPlanValidationError
-from app.serp.collection_plan_runner import CollectionPlanRunError, run_collection_plan
+from app.serp.collection_plan_runner import run_collection_plan
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,17 +28,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    config = load_config(args.config)
-    plan_path = Path(args.plan_file)
-    if not plan_path.is_absolute():
-        plan_path = config.project_root / plan_path
     try:
+        config = load_config(args.config)
+        plan_path = Path(args.plan_file)
+        if not plan_path.is_absolute():
+            plan_path = config.project_root / plan_path
         manifest = run_collection_plan(
             config=config,
             plan_path=plan_path,
             no_publish=args.no_publish,
         )
-    except (CollectionPlanRunError, CollectionPlanValidationError) as exc:
+    except (
+        CriticalPipelineError,
+        CollectionPlanValidationError,
+        ConfigValidationError,
+        FileNotFoundError,
+    ) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(

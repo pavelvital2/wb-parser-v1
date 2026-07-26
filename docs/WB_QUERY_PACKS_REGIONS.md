@@ -145,9 +145,11 @@ The runner:
 
 - acquires daily, pipeline, warehouse-refresh and collection-plan locks
   non-blockingly in that order and retains them through final manifest fsync;
-- resolves `xinfo.dest` before each serial region scope;
-- checks one unchanged egress identity through the same proxy session and stores
-  only a masked value plus an experiment-local salted hash;
+- resolves all configured `xinfo.dest` values under the held locks, writes the
+  immutable effective-plan snapshot, then collects the region scopes serially;
+- checks one unchanged egress identity through the same proxy route/channel
+  using a separate secret-free session and stores only a masked value plus an
+  experiment-local salted hash;
 - sends the exact resolved value as the search `dest`;
 - performs one request per task against one pinned endpoint, without retry,
   fallback switching or proxy rotation;

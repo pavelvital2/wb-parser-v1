@@ -59,6 +59,10 @@ class CollectionPlanRunError(CriticalPipelineError):
     pass
 
 
+class EgressIdentityChangedError(CollectionPlanRunError):
+    pass
+
+
 class ScopedTransportError(CollectionPlanRunError):
     def __init__(
         self,
@@ -870,7 +874,9 @@ class CollectionPlanRunner:
         except ValueError as exc:
             raise CollectionPlanRunError("egress identity is not an IP address") from exc
         if expected is not None and normalized != expected:
-            raise CollectionPlanRunError("egress identity changed during scoped run")
+            raise EgressIdentityChangedError(
+                "egress identity changed during scoped run"
+            )
         return normalized
 
     def _write(
@@ -881,9 +887,12 @@ class CollectionPlanRunner:
         final_manifest: bool = False,
     ) -> None:
         if final_manifest:
-            if self.deadline.remaining_seconds() <= 0:
+            if (
+                self.deadline.remaining_seconds()
+                <= FINALIZATION_RESERVE_SECONDS
+            ):
                 raise CollectionPlanRunError(
-                    "collection plan deadline passed before final manifest"
+                    "collection plan deadline reserve reached before final manifest"
                 )
         else:
             self.deadline.ensure_active()
@@ -1099,7 +1108,12 @@ class CollectionPlanRunner:
                 provenance_path=paths.provenance_path,
                 query_pack=bundle.query_pack,
             )
+            egress_checks_expected = len(bundle.enabled_regions) + 1
+            egress_checks_completed = 0
+            egress_verification_status = "unverified"
+            egress_constant: bool | None = None
             initial_egress = self._check_egress()
+            egress_checks_completed += 1
 
             resolved: dict[str, ResolvedDestination] = {}
             for region in bundle.enabled_regions:
@@ -1148,16 +1162,28 @@ class CollectionPlanRunner:
             totals = {"regions_ok": 0, "pages_ok": 0, "products_ok": 0}
             error: dict[str, Any] | None = None
             caught: Exception | None = None
-            egress_constant = True
+
+            def verify_egress() -> None:
+                nonlocal egress_checks_completed
+                nonlocal egress_constant
+                nonlocal egress_verification_status
+                try:
+                    self._check_egress(initial_egress)
+                except EgressIdentityChangedError:
+                    egress_checks_completed += 1
+                    egress_verification_status = "changed"
+                    egress_constant = False
+                    raise
+                except CollectionPlanRunError:
+                    egress_verification_status = "unverified"
+                    egress_constant = None
+                    raise
+                egress_checks_completed += 1
 
             try:
                 for region_index, region in enumerate(bundle.enabled_regions):
                     if region_index > 0:
-                        try:
-                            self._check_egress(initial_egress)
-                        except CollectionPlanRunError:
-                            egress_constant = False
-                            raise
+                        verify_egress()
                     region_manifest = next(
                         item
                         for item in manifest_regions
@@ -1281,11 +1307,10 @@ class CollectionPlanRunner:
                             }
                         ),
                     )
-                try:
-                    self._check_egress(initial_egress)
-                except CollectionPlanRunError:
-                    egress_constant = False
-                    raise
+                verify_egress()
+                if egress_checks_completed == egress_checks_expected:
+                    egress_verification_status = "verified_constant"
+                    egress_constant = True
             except Exception as exc:
                 caught = exc
                 error_code = str(
@@ -1304,6 +1329,8 @@ class CollectionPlanRunner:
                 and totals["regions_ok"] == expected_regions
                 and totals["pages_ok"] == expected_pages
                 and totals["products_ok"] == expected_pages * 100
+                and egress_verification_status == "verified_constant"
+                and egress_checks_completed == egress_checks_expected
                 and all(
                     item["dest_resolution_status"] == "resolved_and_sent"
                     for item in manifest_regions
@@ -1336,7 +1363,10 @@ class CollectionPlanRunner:
                         initial_egress,
                         salt=self.egress_hash_salt,
                     ),
+                    "verification_status": egress_verification_status,
                     "constant": egress_constant,
+                    "checks_completed": egress_checks_completed,
+                    "checks_expected": egress_checks_expected,
                 },
                 "status": "success" if complete else "failed",
                 "complete": complete,
