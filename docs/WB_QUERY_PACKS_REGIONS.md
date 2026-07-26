@@ -213,7 +213,12 @@ check succeeds does an immutable segment record authorize idempotent promotion
 to canonical raw/checkpoint paths. An interrupted segment is not reusable and
 is recollected in full, limiting automatic repetition to one query (10 pages).
 Confirmed segments are validated by exact source/effective hashes, metadata
-and raw/checkpoint checksums before reuse.
+and raw/checkpoint checksums before reuse. On resume, each manifest reference
+must exactly match its canonical segment record. Enabled region/query scope,
+pages `1..N`, task-derived scoped paths, endpoint counters and constant
+hash-only egress evidence are validated for every segment before any promotion
+or network I/O. All segments and artifacts are validated before canonical
+promotion starts, so a later corrupt reference cannot cause partial recovery.
 
 Deep resumable runs use effective-plan schema v2. It binds resume to
 hash-only provenance for the ordered endpoint URLs, canonical request

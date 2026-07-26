@@ -939,6 +939,123 @@ def test_top1000_resume_rejects_checkpoint_metadata_mismatch(
     assert transport.search_calls == []
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "unknown_scope",
+        "mismatched_page",
+        "mismatched_path",
+        "negative_endpoint_counter",
+        "boolean_endpoint_counter",
+        "changed_end_hash",
+        "changed_end_masked",
+        "full_ip_masked",
+        "manifest_ref_mismatch",
+    ],
+)
+def test_top1000_resume_rejects_tampered_verified_segment_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=11),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            egress_hash_salt=b"segment-integrity",
+        )
+
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    manifest_path = state_dir / "manifest.json"
+    manifest = _read_json(manifest_path)
+    reference = manifest["resume"]["segments"][0]
+    segment_path = root / reference["path"]
+    segment = _read_json(segment_path)
+    canonical_raw = (
+        root
+        / "data/raw/serp_scoped"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "moscow"
+        / RUN_ID
+        / "pages/shevron/page_001.json"
+    )
+    canonical_checkpoint = (
+        state_dir / "checkpoints/moscow/shevron/page_001.json"
+    )
+    checkpoint_before = canonical_checkpoint.read_bytes()
+    canonical_raw.unlink()
+    outside = tmp_path / "outside-sentinel.json"
+    outside.write_bytes(b"outside-unchanged")
+
+    if corruption == "unknown_scope":
+        segment["region_id"] = "unknown-region"
+    elif corruption == "mismatched_page":
+        segment["pages"][0]["page"] = 2
+    elif corruption == "mismatched_path":
+        segment["pages"][0]["canonical_raw_path"] = "../outside-sentinel.json"
+    elif corruption == "negative_endpoint_counter":
+        segment["endpoint_usage"]["primary"]["attempts"] = -1
+    elif corruption == "boolean_endpoint_counter":
+        segment["endpoint_usage"]["primary"]["pages_ok"] = True
+    elif corruption == "changed_end_hash":
+        segment["egress"]["end"]["ephemeral_sha256"] = hashlib.sha256(
+            b"different-egress"
+        ).hexdigest()
+    elif corruption == "changed_end_masked":
+        segment["egress"]["end"]["masked"] = "198.51.x.x"
+    elif corruption == "full_ip_masked":
+        segment["egress"]["end"]["masked"] = "198.51.100.20"
+    elif corruption == "manifest_ref_mismatch":
+        reference["region_id"] = "rostov-on-don"
+
+    if corruption != "manifest_ref_mismatch":
+        _write_json(segment_path, segment)
+        reference.update(
+            {
+                "region_id": segment["region_id"],
+                "query_id": segment["query_id"],
+                "sha256": hashlib.sha256(segment_path.read_bytes()).hexdigest(),
+                "egress": json.loads(json.dumps(segment["egress"])),
+                "pages_count": len(segment["pages"]),
+            }
+        )
+    _write_json(manifest_path, manifest)
+
+    transport = FakeTransport()
+    with pytest.raises(CollectionPlanRunError, match="segment"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=transport,
+            resume_run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            egress_hash_salt=b"segment-integrity",
+        )
+    assert transport.resolve_calls == []
+    assert transport.search_calls == []
+    assert transport.egress_calls == 0
+    assert not canonical_raw.exists()
+    assert canonical_checkpoint.read_bytes() == checkpoint_before
+    assert outside.read_bytes() == b"outside-unchanged"
+
+
 def test_top1000_failed_run_leaves_previous_dual_region_latest_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

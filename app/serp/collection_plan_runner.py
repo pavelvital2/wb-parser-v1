@@ -65,6 +65,11 @@ _RUN_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}Z$")
 _DEST_RE = re.compile(r"^[+-]?[0-9]{1,16}$")
 _PRODUCT_ID_RE = re.compile(r"^[1-9][0-9]{0,19}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MASKED_IPV4_RE = re.compile(
+    r"^(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\."
+    r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.x\.x$"
+)
+_MASKED_IPV6_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{4}::x$")
 
 LockEventHook = Callable[[str, str, Path], None]
 WriteEventHook = Callable[[str, Path], None]
@@ -2205,20 +2210,101 @@ class CollectionPlanRunner:
         records: list[dict[str, Any]] = []
         verified_ids: set[str] = set()
         scopes: set[tuple[str, str]] = set()
+        validated_segments: list[dict[str, Any]] = []
         if not expected_refs:
             return records, verified_ids
+        allowed_regions = {region.region_id for region in bundle.enabled_regions}
+        allowed_queries = {query.query_id for query in bundle.enabled_queries}
+        endpoint_ids = self.transport.endpoint_policy.endpoint_ids
+        allowed_endpoints = set(endpoint_ids)
+        expected_pages = (
+            bundle.collection_plan.quality.expected_pages_per_query
+        )
+
+        def validate_egress_item(
+            value: Any,
+            *,
+            field: str,
+            allowed_sources: set[str],
+        ) -> dict[str, str]:
+            if not isinstance(value, dict) or set(value) != {
+                "source",
+                "masked",
+                "ephemeral_sha256",
+            }:
+                raise CollectionPlanRunError(
+                    f"verified segment {field} is invalid"
+                )
+            source = value.get("source")
+            masked = value.get("masked")
+            digest = value.get("ephemeral_sha256")
+            if (
+                source not in allowed_sources
+                or type(masked) is not str
+                or not (
+                    _MASKED_IPV4_RE.fullmatch(masked)
+                    or _MASKED_IPV6_RE.fullmatch(masked)
+                )
+                or type(digest) is not str
+                or not _SHA256_RE.fullmatch(digest)
+            ):
+                raise CollectionPlanRunError(
+                    f"verified segment {field} is invalid"
+                )
+            return {
+                "source": source,
+                "masked": masked,
+                "ephemeral_sha256": digest,
+            }
+
         for expected_ref in expected_refs:
+            if not isinstance(expected_ref, dict) or set(expected_ref) != {
+                "segment_id",
+                "region_id",
+                "query_id",
+                "path",
+                "sha256",
+                "egress",
+                "pages_count",
+            }:
+                raise CollectionPlanRunError("segment reference structure is invalid")
             segment_id = expected_ref.get("segment_id")
-            if not isinstance(segment_id, str):
+            expected_sha256 = expected_ref.get("sha256")
+            if (
+                type(segment_id) is not str
+                or not _ID_RE.fullmatch(segment_id)
+                or type(expected_sha256) is not str
+                or not _SHA256_RE.fullmatch(expected_sha256)
+            ):
                 raise CollectionPlanRunError("segment reference identity is invalid")
             path = paths.segment_path(segment_id)
+            expected_path = _relative(path, paths.project_root)
+            if expected_ref.get("path") != expected_path:
+                raise CollectionPlanRunError("segment reference path mismatch")
             payload_bytes = _read_regular_bytes(
                 path,
                 project_root=self.config.project_root,
             )
-            if expected_ref.get("sha256") != _sha256_bytes(payload_bytes):
+            payload_sha256 = _sha256_bytes(payload_bytes)
+            if expected_sha256 != payload_sha256:
                 raise CollectionPlanRunError("segment reference checksum mismatch")
             segment = _json_object_from_bytes(payload_bytes, field="segment")
+            if set(segment) != {
+                "schema_version",
+                "run_id",
+                "segment_id",
+                "collection_plan_id",
+                "query_pack_sha256",
+                "collection_plan_sha256",
+                "region_registry_sha256",
+                "effective_plan_sha256",
+                "region_id",
+                "query_id",
+                "pages",
+                "endpoint_usage",
+                "egress",
+            }:
+                raise CollectionPlanRunError("segment structure is invalid")
             identity = {
                 "schema_version": SEGMENT_SCHEMA_VERSION,
                 "run_id": self.run_id,
@@ -2234,12 +2320,14 @@ class CollectionPlanRunner:
             region_id = segment.get("region_id")
             query_id = segment.get("query_id")
             if (
-                not isinstance(segment_id, str)
+                type(segment_id) is not str
                 or path != paths.segment_path(segment_id)
-                or not isinstance(region_id, str)
-                or not isinstance(query_id, str)
+                or type(region_id) is not str
+                or type(query_id) is not str
             ):
                 raise CollectionPlanRunError("segment identity is invalid")
+            if region_id not in allowed_regions or query_id not in allowed_queries:
+                raise CollectionPlanRunError("segment scope is outside enabled plan")
             scope = (region_id, query_id)
             if scope in scopes:
                 raise CollectionPlanRunError("multiple verified segments for one query scope")
@@ -2247,29 +2335,222 @@ class CollectionPlanRunner:
             pages = segment.get("pages")
             if (
                 not isinstance(egress, dict)
+                or set(egress) != {
+                    "verification_status",
+                    "constant",
+                    "checks_completed",
+                    "checks_expected",
+                    "start",
+                    "end",
+                }
                 or egress.get("verification_status") != "verified_constant"
                 or egress.get("constant") is not True
+                or type(egress.get("checks_completed")) is not int
                 or egress.get("checks_completed") != 2
+                or type(egress.get("checks_expected")) is not int
+                or egress.get("checks_expected") != 2
                 or not isinstance(pages, list)
-                or len(pages)
-                != bundle.collection_plan.quality.expected_pages_per_query
+                or len(pages) != expected_pages
             ):
                 raise CollectionPlanRunError("segment is not complete and verified")
+            start_egress = validate_egress_item(
+                egress.get("start"),
+                field="egress start",
+                allowed_sources={
+                    "segment_start_check",
+                    "previous_segment_end",
+                },
+            )
+            end_egress = validate_egress_item(
+                egress.get("end"),
+                field="egress end",
+                allowed_sources={"segment_end_check"},
+            )
+            if (
+                start_egress["masked"] != end_egress["masked"]
+                or start_egress["ephemeral_sha256"]
+                != end_egress["ephemeral_sha256"]
+            ):
+                raise CollectionPlanRunError(
+                    "verified segment egress is not constant"
+                )
+            normalized_egress = {
+                "verification_status": "verified_constant",
+                "constant": True,
+                "checks_completed": 2,
+                "checks_expected": 2,
+                "start": start_egress,
+                "end": end_egress,
+            }
+
+            usage = segment.get("endpoint_usage")
+            if not isinstance(usage, dict) or set(usage) != allowed_endpoints:
+                raise CollectionPlanRunError(
+                    "verified segment endpoint usage is invalid"
+                )
+            normalized_usage: dict[str, dict[str, int]] = {}
+            for endpoint_id in endpoint_ids:
+                counters = usage.get(endpoint_id)
+                if not isinstance(counters, dict) or set(counters) != {
+                    "attempts",
+                    "pages_ok",
+                }:
+                    raise CollectionPlanRunError(
+                        "verified segment endpoint counters are invalid"
+                    )
+                attempts = counters.get("attempts")
+                pages_ok = counters.get("pages_ok")
+                if (
+                    type(attempts) is not int
+                    or type(pages_ok) is not int
+                    or attempts < 0
+                    or pages_ok < 0
+                    or pages_ok > attempts
+                ):
+                    raise CollectionPlanRunError(
+                        "verified segment endpoint counters are invalid"
+                    )
+                normalized_usage[endpoint_id] = {
+                    "attempts": attempts,
+                    "pages_ok": pages_ok,
+                }
+            if sum(
+                counters["pages_ok"]
+                for counters in normalized_usage.values()
+            ) != expected_pages:
+                raise CollectionPlanRunError(
+                    "verified segment pages do not match endpoint counters"
+                )
+
+            normalized_pages: list[dict[str, Any]] = []
+            for expected_page, page_ref in enumerate(pages, start=1):
+                if not isinstance(page_ref, dict) or set(page_ref) != {
+                    "page",
+                    "pending_raw_path",
+                    "canonical_raw_path",
+                    "raw_sha256",
+                    "pending_checkpoint_path",
+                    "canonical_checkpoint_path",
+                    "checkpoint_sha256",
+                }:
+                    raise CollectionPlanRunError(
+                        "verified segment page reference is invalid"
+                    )
+                page = page_ref.get("page")
+                raw_sha256 = page_ref.get("raw_sha256")
+                checkpoint_sha256 = page_ref.get("checkpoint_sha256")
+                if (
+                    type(page) is not int
+                    or page != expected_page
+                    or type(raw_sha256) is not str
+                    or not _SHA256_RE.fullmatch(raw_sha256)
+                    or type(checkpoint_sha256) is not str
+                    or not _SHA256_RE.fullmatch(checkpoint_sha256)
+                ):
+                    raise CollectionPlanRunError(
+                        "verified segment page identity is invalid"
+                    )
+                task = self._task(
+                    bundle=bundle,
+                    query_id=query_id,
+                    region_id=region_id,
+                    page=page,
+                )
+                expected_page_ref = {
+                    "page": page,
+                    "pending_raw_path": _relative(
+                        paths.segment_pending_raw_path(segment_id, task),
+                        paths.project_root,
+                    ),
+                    "canonical_raw_path": _relative(
+                        paths.raw_page_path(task),
+                        paths.project_root,
+                    ),
+                    "raw_sha256": raw_sha256,
+                    "pending_checkpoint_path": _relative(
+                        paths.segment_pending_checkpoint_path(segment_id, task),
+                        paths.project_root,
+                    ),
+                    "canonical_checkpoint_path": _relative(
+                        paths.checkpoint_path(task),
+                        paths.project_root,
+                    ),
+                    "checkpoint_sha256": checkpoint_sha256,
+                }
+                if page_ref != expected_page_ref:
+                    raise CollectionPlanRunError(
+                        "verified segment page path mismatch"
+                    )
+                normalized_pages.append(expected_page_ref)
+
+            normalized_segment = {
+                **identity,
+                "segment_id": segment_id,
+                "region_id": region_id,
+                "query_id": query_id,
+                "pages": normalized_pages,
+                "endpoint_usage": normalized_usage,
+                "egress": normalized_egress,
+            }
+            if segment != normalized_segment:
+                raise CollectionPlanRunError(
+                    "verified segment canonical content mismatch"
+                )
+            record = {
+                "segment_id": segment_id,
+                "region_id": region_id,
+                "query_id": query_id,
+                "path": expected_path,
+                "sha256": payload_sha256,
+                "egress": normalized_egress,
+                "pages_count": expected_pages,
+            }
+            if expected_ref != record:
+                raise CollectionPlanRunError(
+                    "segment reference does not match canonical segment"
+                )
             scopes.add(scope)
             verified_ids.add(segment_id)
-            records.append(
-                {
-                    "segment_id": segment_id,
-                    "region_id": region_id,
-                    "query_id": query_id,
-                    "path": _relative(path, paths.project_root),
-                    "sha256": _sha256_bytes(payload_bytes),
-                    "egress": egress,
-                    "pages_count": len(pages),
-                }
+            records.append(record)
+            validated_segments.append(normalized_segment)
+
+        for segment in validated_segments:
+            self._validate_verified_segment_artifacts(
+                paths=paths,
+                segment=segment,
             )
+        for segment in validated_segments:
             self._promote_verified_segment(paths=paths, segment=segment)
         return records, verified_ids
+
+    def _validate_verified_segment_artifacts(
+        self,
+        *,
+        paths: ScopedPaths,
+        segment: Mapping[str, Any],
+    ) -> None:
+        for page in segment["pages"]:
+            for kind in ("raw", "checkpoint"):
+                pending = paths.project_root / page[f"pending_{kind}_path"]
+                canonical = paths.project_root / page[f"canonical_{kind}_path"]
+                expected_hash = page[f"{kind}_sha256"]
+                pending_bytes = _read_regular_bytes(
+                    pending,
+                    project_root=paths.project_root,
+                )
+                if _sha256_bytes(pending_bytes) != expected_hash:
+                    raise CollectionPlanRunError(
+                        f"segment pending {kind} checksum mismatch"
+                    )
+                if canonical.exists():
+                    canonical_bytes = _read_regular_bytes(
+                        canonical,
+                        project_root=paths.project_root,
+                    )
+                    if _sha256_bytes(canonical_bytes) != expected_hash:
+                        raise CollectionPlanRunError(
+                            f"canonical {kind} conflicts with verified segment"
+                        )
 
     def _promote_verified_segment(
         self,
