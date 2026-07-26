@@ -36,6 +36,7 @@ from app.serp.collection_plan_runner import (
     _extract_products,
     _json_bytes,
     _mask_egress,
+    _normalize_product_id,
     _relative,
     _utc_iso,
     acquire_collection_plan_locks,
@@ -85,11 +86,11 @@ class PilotRequestBudget:
         default_factory=lambda: {
             "geo": 2,
             "endpoint_probe": 2,
-            "regional_search": 6,
+            "regional_search": 5,
             "repeat_search": 1,
         }
     )
-    total_limit: int = 11
+    total_limit: int = 10
     used: dict[str, int] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -130,7 +131,7 @@ class PilotRequestBudget:
         return (
             self.used["geo"] == 2
             and 1 <= self.used["endpoint_probe"] <= 2
-            and self.used["regional_search"] == 6
+            and self.used["regional_search"] == 5
             and self.used["repeat_search"] == 1
             and self.total_used <= self.total_limit
         )
@@ -447,6 +448,12 @@ def _membership_comparison(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class ReusableProbePage:
+    request: ScopedSearchRequest
+    result: ScopedSearchResult
+
+
 class GuardedRegionalPilotRunner(CollectionPlanRunner):
     def __init__(
         self,
@@ -524,7 +531,7 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
         *,
         bundle: CollectionPlanBundle,
         resolved: Mapping[str, ResolvedDestination],
-    ) -> tuple[dict[str, Any], str]:
+    ) -> tuple[dict[str, Any], ReusableProbePage]:
         first_task = self._task(
             bundle=bundle,
             query_id=PILOT_QUERY_IDS[0],
@@ -536,6 +543,7 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
         )
         attempts: list[dict[str, Any]] = []
         pinned_endpoint_id: str | None = None
+        reusable_page: ReusableProbePage | None = None
         for endpoint_id in self.transport.endpoint_policy.endpoint_ids[:2]:
             timeout_seconds = self.deadline.request_timeout(
                 self.config.runtime.http_timeout_seconds
@@ -554,7 +562,10 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
             )
             if not isinstance(result, EndpointProbeResult):
                 raise CollectionPlanRunError("endpoint probe result is invalid")
-            if result.endpoint_id != endpoint_id:
+            if (
+                type(result.endpoint_id) is not str
+                or result.endpoint_id != endpoint_id
+            ):
                 raise CollectionPlanRunError("endpoint probe identity mismatch")
             http_status = (
                 result.http_status
@@ -578,6 +589,18 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 and result.http_status == 200
                 and error_code is None
             )
+            candidate_page: ReusableProbePage | None = None
+            if suitable:
+                try:
+                    candidate_page = self._validate_reusable_probe_page(
+                        expected_request=request,
+                        probe_result=result,
+                        endpoint_id=endpoint_id,
+                    )
+                except CollectionPlanRunError:
+                    candidate_page = None
+                    suitable = False
+                    error_code = "endpoint_probe_reusable_invalid"
             if not suitable and error_code is None:
                 error_code = "endpoint_probe_unsuitable"
             attempts.append(
@@ -587,21 +610,127 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                     "outcome": "usable" if suitable else "unusable",
                     "status": http_status,
                     "error_code": error_code,
+                    "reused_as_first_page": suitable,
+                    "reuse_task": (
+                        {
+                            "region_id": first_task.region_id,
+                            "query_id": first_task.query_id,
+                            "page": first_task.page,
+                        }
+                        if suitable
+                        else None
+                    ),
                 }
             )
             if suitable:
                 self.transport.pin_endpoint(endpoint_id)
                 pinned_endpoint_id = endpoint_id
+                reusable_page = candidate_page
                 break
         evidence = {
             "schema_version": ENDPOINT_EVIDENCE_SCHEMA_VERSION,
             "status": "success" if pinned_endpoint_id is not None else "failed",
             "attempts": attempts,
             "pinned_endpoint_id": pinned_endpoint_id,
+            "reuse": {
+                "reused_as_first_page": reusable_page is not None,
+                "region_id": (
+                    reusable_page.request.task.region_id
+                    if reusable_page is not None
+                    else None
+                ),
+                "query_id": (
+                    reusable_page.request.task.query_id
+                    if reusable_page is not None
+                    else None
+                ),
+                "page": (
+                    reusable_page.request.task.page
+                    if reusable_page is not None
+                    else None
+                ),
+            },
         }
-        if pinned_endpoint_id is None:
+        if pinned_endpoint_id is None or reusable_page is None:
             raise EndpointPreflightFailed(evidence)
-        return evidence, pinned_endpoint_id
+        return evidence, reusable_page
+
+    @staticmethod
+    def _same_search_request(
+        left: ScopedSearchRequest,
+        right: ScopedSearchRequest,
+    ) -> bool:
+        return (
+            left.task == right.task
+            and left.dest_id_observed == right.dest_id_observed
+            and left.endpoint_id == right.endpoint_id
+            and dict(left.params) == dict(right.params)
+        )
+
+    def _validate_reusable_probe_page(
+        self,
+        *,
+        expected_request: ScopedSearchRequest,
+        probe_result: EndpointProbeResult,
+        endpoint_id: str,
+    ) -> ReusableProbePage:
+        request = probe_result.reusable_request
+        result = probe_result.reusable_result
+        if (
+            not isinstance(request, ScopedSearchRequest)
+            or request is not expected_request
+        ):
+            raise CollectionPlanRunError("endpoint probe reusable request is invalid")
+        if not self._same_search_request(request, expected_request):
+            raise CollectionPlanRunError(
+                "endpoint probe reusable request identity mismatch"
+            )
+        if (
+            type(request.endpoint_id) is not str
+            or request.endpoint_id != endpoint_id
+            or type(request.dest_id_observed) is not str
+            or request.dest_id_observed != expected_request.dest_id_observed
+        ):
+            raise CollectionPlanRunError(
+                "endpoint probe reusable request route mismatch"
+            )
+        if not isinstance(result, ScopedSearchResult):
+            raise CollectionPlanRunError("endpoint probe reusable result is missing")
+        if type(result.http_status) is not int or result.http_status != 200:
+            raise CollectionPlanRunError("endpoint probe reusable status is invalid")
+        if (
+            type(result.endpoint_id) is not str
+            or result.endpoint_id != endpoint_id
+            or type(result.dest_id_sent) is not str
+            or result.dest_id_sent != expected_request.dest_id_observed
+        ):
+            raise CollectionPlanRunError(
+                "endpoint probe reusable response route mismatch"
+            )
+        if not isinstance(result.payload, Mapping):
+            raise CollectionPlanRunError("endpoint probe reusable payload is invalid")
+        products = _extract_products(result.payload)
+        if len(products) != 100:
+            raise CollectionPlanRunError(
+                "endpoint probe reusable products count is invalid"
+            )
+        product_ids: set[str] = set()
+        for product in products:
+            if not isinstance(product, Mapping):
+                raise CollectionPlanRunError(
+                    "endpoint probe reusable product is invalid"
+                )
+            product_id = _normalize_product_id(product)
+            if product_id in product_ids:
+                raise CollectionPlanRunError(
+                    "endpoint probe reusable product ID is duplicated"
+                )
+            product_ids.add(product_id)
+        if len(product_ids) != 100:
+            raise CollectionPlanRunError(
+                "endpoint probe reusable product IDs are incomplete"
+            )
+        return ReusableProbePage(request=request, result=result)
 
     def _validate_search_result(
         self,
@@ -609,8 +738,12 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
         request: ScopedSearchRequest,
         result: ScopedSearchResult,
     ) -> None:
-        if result.http_status != 200:
+        if not isinstance(result, ScopedSearchResult):
+            raise CollectionPlanRunError("search result is invalid")
+        if type(result.http_status) is not int or result.http_status != 200:
             raise CollectionPlanRunError("search response is not HTTP 200")
+        if not isinstance(result.payload, Mapping):
+            raise CollectionPlanRunError("search payload is invalid")
         if result.dest_id_sent != request.dest_id_observed:
             raise CollectionPlanRunError("search destination evidence mismatch")
         if result.endpoint_id != self.transport.endpoint_policy.pinned_endpoint_id:
@@ -626,11 +759,13 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
         resolution: ResolvedDestination,
         region_manifest: dict[str, Any],
         totals: dict[str, int],
+        reusable_first_page: ReusableProbePage | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         product_rows: list[dict[str, Any]] = []
         page_rows: list[dict[str, Any]] = []
         rows_by_query: dict[str, list[dict[str, Any]]] = {}
         region_error: Exception | None = None
+        reusable_consumed = False
         for query in bundle.enabled_queries:
             task = self._task(
                 bundle=bundle,
@@ -644,12 +779,23 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
             timeout_seconds = self.deadline.request_timeout(
                 self.config.runtime.http_timeout_seconds
             )
-            self.request_budget.reserve("regional_search")
             try:
-                result = self.transport.search(
-                    request,
-                    timeout_seconds=timeout_seconds,
-                )
+                if reusable_first_page is not None and not reusable_consumed:
+                    if not self._same_search_request(
+                        reusable_first_page.request,
+                        request,
+                    ):
+                        raise CollectionPlanRunError(
+                            "reusable endpoint probe task identity mismatch"
+                        )
+                    result = reusable_first_page.result
+                    reusable_consumed = True
+                else:
+                    self.request_budget.reserve("regional_search")
+                    result = self.transport.search(
+                        request,
+                        timeout_seconds=timeout_seconds,
+                    )
                 self._validate_search_result(request=request, result=result)
                 region_manifest["dest_resolution_status"] = "resolved_and_sent"
                 raw_path = paths.raw_page_path(task)
@@ -698,6 +844,10 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
             page_rows=page_rows,
         )
         expected_pages = len(bundle.enabled_queries)
+        if reusable_first_page is not None and not reusable_consumed:
+            region_error = region_error or CollectionPlanRunError(
+                "reusable endpoint probe page was not consumed"
+            )
         region_manifest["complete"] = (
             region_error is None
             and region_manifest["pages_ok"] == expected_pages
@@ -929,7 +1079,7 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                             "dest_resolution_status": "resolved_not_sent",
                         }
                     )
-                endpoint_evidence, _pinned_endpoint_id = self._probe_and_pin_endpoint(
+                endpoint_evidence, reusable_probe_page = self._probe_and_pin_endpoint(
                     bundle=bundle,
                     resolved=resolved,
                 )
@@ -957,6 +1107,11 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                         resolution=resolved[region_id],
                         region_manifest=region_manifest,
                         totals=totals,
+                        reusable_first_page=(
+                            reusable_probe_page
+                            if region_id == PILOT_REGION_IDS[0]
+                            else None
+                        ),
                     )
                     egress.verify(self)
 

@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import socket
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -92,13 +93,43 @@ def _products(ids: list[int]) -> list[dict[str, Any]]:
     ]
 
 
+def _usable_probe_result(
+    request: ScopedSearchRequest,
+    *,
+    endpoint_id: str | None = None,
+    payload: Mapping[str, Any] | None = None,
+) -> EndpointProbeResult:
+    selected_endpoint = endpoint_id or request.endpoint_id
+    reusable = ScopedSearchResult(
+        payload=payload
+        if payload is not None
+        else {"products": _products(list(range(100_001, 100_101)))},
+        endpoint_id=selected_endpoint,
+        dest_id_sent=request.dest_id_observed,
+        http_status=200,
+    )
+    return EndpointProbeResult(
+        endpoint_id=selected_endpoint,
+        suitable=True,
+        http_status=200,
+        error_code=None,
+        reusable_request=request,
+        reusable_result=reusable,
+    )
+
+
 class PilotFakeTransport:
     request_params = {"appType": "1", "dest": "-legacy", "curr": "rub"}
 
     def __init__(
         self,
         *,
-        probe_results: Mapping[str, EndpointProbeResult] | None = None,
+        probe_results: Mapping[
+            str,
+            EndpointProbeResult
+            | Callable[[ScopedSearchRequest], EndpointProbeResult],
+        ]
+        | None = None,
         repeat_overlap: int = 100,
         repeat_failure: bool = False,
         repeat_product_count: int = 100,
@@ -112,17 +143,8 @@ class PilotFakeTransport:
             endpoint_ids=("primary", "fallback-1", "fallback-2"),
             pinned_endpoint_id="primary",
         )
-        self.probe_results = dict(
-            probe_results
-            or {
-                "primary": EndpointProbeResult(
-                    endpoint_id="primary",
-                    suitable=True,
-                    http_status=200,
-                    error_code=None,
-                )
-            }
-        )
+        self.default_primary_probe = probe_results is None
+        self.probe_results = dict(probe_results or {})
         self.repeat_overlap = repeat_overlap
         self.repeat_failure = repeat_failure
         self.repeat_product_count = repeat_product_count
@@ -164,14 +186,18 @@ class PilotFakeTransport:
     ) -> EndpointProbeResult:
         self.events.append(f"probe:{endpoint_id}")
         self.probe_calls.append(endpoint_id)
-        return self.probe_results.get(
-            endpoint_id,
-            EndpointProbeResult(
-                endpoint_id=endpoint_id,
-                suitable=False,
-                http_status=498,
-                error_code="endpoint_probe_http_498",
-            ),
+        configured = self.probe_results.get(endpoint_id)
+        if callable(configured):
+            return configured(request)
+        if configured is not None:
+            return configured
+        if self.default_primary_probe and endpoint_id == "primary":
+            return _usable_probe_result(request)
+        return EndpointProbeResult(
+            endpoint_id=endpoint_id,
+            suitable=False,
+            http_status=498,
+            error_code="endpoint_probe_http_498",
         )
 
     def pin_endpoint(self, endpoint_id: str) -> None:
@@ -188,8 +214,10 @@ class PilotFakeTransport:
         )
 
     def _search_ids(self, request: ScopedSearchRequest) -> list[int]:
-        call_number = len(self.search_calls)
-        if call_number == 7:
+        if (
+            request.task.region_id == "moscow"
+            and request.task.query_id == "shevron"
+        ):
             initial = list(range(100_001, 100_101))
             retained = initial[: self.repeat_overlap]
             replacements = list(
@@ -224,7 +252,11 @@ class PilotFakeTransport:
             self.on_search(call_number)
         if request.endpoint_id != self.endpoint_policy.pinned_endpoint_id:
             raise ScopedTransportError("search_endpoint_not_pinned")
-        if self.repeat_failure and call_number == 7:
+        if (
+            self.repeat_failure
+            and request.task.region_id == "moscow"
+            and request.task.query_id == "shevron"
+        ):
             raise ScopedTransportError(
                 "search_http_498",
                 request_sent=True,
@@ -325,16 +357,28 @@ def test_primary_probe_success_runs_exact_a_b_a_contract(
             "outcome": "usable",
             "status": 200,
             "error_code": None,
+            "reused_as_first_page": True,
+            "reuse_task": {
+                "region_id": "moscow",
+                "query_id": "shevron",
+                "page": 1,
+            },
         }
     ]
+    assert endpoint["reuse"] == {
+        "reused_as_first_page": True,
+        "region_id": "moscow",
+        "query_id": "shevron",
+        "page": 1,
+    }
     assert endpoint["pinned_endpoint_id"] == "primary"
     assert snapshot["endpoint_policy"]["pinned_endpoint_id"] == "primary"
     assert budget["used"] == {
         "geo": 2,
         "endpoint_probe": 1,
-        "regional_search": 6,
+        "regional_search": 5,
         "repeat_search": 1,
-        "total_wb": 10,
+        "total_wb": 9,
     }
     assert manifest["egress"]["verification_status"] == "verified_constant"
     assert manifest["egress"]["constant"] is True
@@ -354,24 +398,30 @@ def test_primary_probe_success_runs_exact_a_b_a_contract(
         ).hexdigest()
         if name != "config_file":
             assert manifest[f"{name}_sha256"] == evidence["after_sha256"]
-    assert len(transport.search_calls) == 7
+    assert len(transport.search_calls) == 6
     assert transport.events == [
         "egress:1",
         "resolve:moscow",
         "resolve:rostov-on-don",
         "probe:primary",
         "pin:primary",
-        "search:moscow:shevron:1",
-        "search:moscow:shevrony:2",
-        "search:moscow:shevron-na-lipuchke:3",
+        "search:moscow:shevrony:1",
+        "search:moscow:shevron-na-lipuchke:2",
         "egress:2",
-        "search:rostov-on-don:shevron:4",
-        "search:rostov-on-don:shevrony:5",
-        "search:rostov-on-don:shevron-na-lipuchke:6",
+        "search:rostov-on-don:shevron:3",
+        "search:rostov-on-don:shevrony:4",
+        "search:rostov-on-don:shevron-na-lipuchke:5",
         "egress:3",
-        "search:moscow:shevron:7",
+        "search:moscow:shevron:6",
         "egress:4",
     ]
+    assert all(
+        not (
+            call.task.region_id == "moscow"
+            and call.task.query_id == "shevron"
+        )
+        for call in transport.search_calls[:-1]
+    )
     assert all(call.params["page"] == "1" for call in transport.search_calls)
     assert all(call.endpoint_id == "primary" for call in transport.search_calls)
     serialized_state = "\n".join(
@@ -392,6 +442,22 @@ def test_primary_probe_success_runs_exact_a_b_a_contract(
         with mart_path.open(encoding="utf-8", newline="") as handle:
             rows = list(csv.DictReader(handle))
         assert len(rows) == 300
+    reused_raw = (
+        root
+        / "data/raw/serp_scoped"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "moscow"
+        / RUN_ID
+        / "pages/shevron/page_001.json"
+    )
+    reused_payload = _read_json(reused_raw)
+    assert len(reused_payload["products"]) == 100
+    assert len({str(row["id"]) for row in reused_payload["products"]}) == 100
+    assert list(reused_raw.parent.glob("page_001.json")) == [reused_raw]
+    reused_checkpoint = _read_json(
+        state_dir / "checkpoints/moscow/shevron/page_001.json"
+    )
+    assert reused_checkpoint["raw_file"] == reused_raw.relative_to(root).as_posix()
     assert (
         root
         / "data/raw/serp_scoped"
@@ -415,14 +481,14 @@ def test_primary_failure_pins_one_fallback_for_all_searches(
             "primary": EndpointProbeResult(
                 endpoint_id="primary",
                 suitable=False,
-                http_status=498,
+                http_status=403,
                 error_code="unsafe error code",
             ),
-            "fallback-1": EndpointProbeResult(
-                endpoint_id="fallback-1",
-                suitable=True,
-                http_status=200,
-                error_code=None,
+            "fallback-1": (
+                lambda request: _usable_probe_result(
+                    request,
+                    endpoint_id="fallback-1",
+                )
             ),
         }
     )
@@ -444,7 +510,16 @@ def test_primary_failure_pins_one_fallback_for_all_searches(
     assert "unsafe error code" not in json.dumps(endpoint)
     assert snapshot["endpoint_policy"]["pinned_endpoint_id"] == "fallback-1"
     assert budget["used"]["endpoint_probe"] == 2
-    assert budget["used"]["total_wb"] == 11
+    assert budget["used"]["regional_search"] == 5
+    assert budget["used"]["total_wb"] == 10
+    assert len(transport.search_calls) == 6
+    assert all(
+        not (
+            call.task.region_id == "moscow"
+            and call.task.query_id == "shevron"
+        )
+        for call in transport.search_calls[:-1]
+    )
 
 
 def test_both_endpoint_probes_fail_without_regional_search(
@@ -518,6 +593,96 @@ def test_malformed_truthy_probe_never_pins_or_starts_regional_search(
     )
 
 
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing_payload",
+        "wrong_endpoint",
+        "wrong_destination",
+        "wrong_status",
+        "wrong_task",
+        "short_payload",
+        "duplicate_products",
+        "non_mapping_payload",
+    ],
+)
+def test_successful_looking_probe_requires_valid_reusable_page_before_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    malformation: str,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+
+    def malformed(request: ScopedSearchRequest) -> EndpointProbeResult:
+        probe = _usable_probe_result(request)
+        reusable_request = probe.reusable_request
+        reusable_result = probe.reusable_result
+        assert reusable_request is not None
+        assert reusable_result is not None
+        if malformation == "missing_payload":
+            reusable_result = None
+        elif malformation == "wrong_endpoint":
+            reusable_result = replace(reusable_result, endpoint_id="wrong")
+        elif malformation == "wrong_destination":
+            reusable_result = replace(reusable_result, dest_id_sent="-1")
+        elif malformation == "wrong_status":
+            reusable_result = replace(reusable_result, http_status=True)
+        elif malformation == "wrong_task":
+            reusable_request = replace(
+                reusable_request,
+                task=replace(reusable_request.task, query_id="wrong-query"),
+            )
+        elif malformation == "short_payload":
+            reusable_result = replace(
+                reusable_result,
+                payload={"products": _products(list(range(1, 100)))},
+            )
+        elif malformation == "duplicate_products":
+            product_ids = list(range(1, 100)) + [1]
+            reusable_result = replace(
+                reusable_result,
+                payload={"products": _products(product_ids)},
+            )
+        elif malformation == "non_mapping_payload":
+            reusable_result = replace(  # type: ignore[arg-type]
+                reusable_result,
+                payload=[],
+            )
+        return replace(
+            probe,
+            reusable_request=reusable_request,
+            reusable_result=reusable_result,
+        )
+
+    transport = PilotFakeTransport(
+        probe_results={
+            "primary": malformed,
+            "fallback-1": malformed,
+        }
+    )
+
+    with pytest.raises(EndpointPreflightFailed):
+        _run(config, plan_path, transport, root=root)
+
+    endpoint = _read_json(_state_dir(root) / "endpoint_preflight.json")
+    assert transport.probe_calls == ["primary", "fallback-1"]
+    assert transport.pin_calls == []
+    assert transport.search_calls == []
+    assert endpoint["status"] == "failed"
+    assert endpoint["reuse"]["reused_as_first_page"] is False
+    assert all(
+        attempt["error_code"] == "endpoint_probe_reusable_invalid"
+        and attempt["reused_as_first_page"] is False
+        and attempt["reuse_task"] is None
+        for attempt in endpoint["attempts"]
+    )
+    serialized_state = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in _state_dir(root).rglob("*.json")
+    )
+    assert '"products"' not in serialized_state
+
+
 def test_budget_exceed_fails_before_the_disallowed_search_http(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -528,7 +693,7 @@ def test_budget_exceed_fails_before_the_disallowed_search_http(
         limits={
             "geo": 2,
             "endpoint_probe": 2,
-            "regional_search": 5,
+            "regional_search": 4,
             "repeat_search": 1,
         }
     )
@@ -542,10 +707,10 @@ def test_budget_exceed_fails_before_the_disallowed_search_http(
             request_budget=budget,
         )
 
-    assert len(transport.search_calls) == 5
+    assert len(transport.search_calls) == 4
     artifact = _read_json(_state_dir(root) / "request_budget.json")
-    assert artifact["used"]["regional_search"] == 5
-    assert artifact["used"]["total_wb"] == 8
+    assert artifact["used"]["regional_search"] == 4
+    assert artifact["used"]["total_wb"] == 7
     assert _read_json(_state_dir(root) / "manifest.json")["complete"] is False
 
 
@@ -615,9 +780,9 @@ def test_repeat_failure_cannot_complete(
         "expected_search_calls",
     ),
     [
-        ({3}, None, "unverified", None, 2, 6),
-        ({4}, None, "unverified", None, 3, 7),
-        (set(), ["203.0.113.10"] * 3 + ["203.0.113.11"], "changed", False, 4, 7),
+        ({3}, None, "unverified", None, 2, 5),
+        ({4}, None, "unverified", None, 3, 6),
+        (set(), ["203.0.113.10"] * 3 + ["203.0.113.11"], "changed", False, 4, 6),
     ],
 )
 def test_egress_evidence_covers_before_and_after_repeat(
@@ -964,15 +1129,52 @@ def test_requests_transport_probe_validates_primary_without_pinning() -> None:
         timeout_seconds=10,
     )
 
-    assert result == EndpointProbeResult(
-        endpoint_id="primary",
-        suitable=True,
-        http_status=200,
-        error_code=None,
-    )
+    assert result.endpoint_id == "primary"
+    assert result.suitable is True
+    assert result.http_status == 200
+    assert result.error_code is None
+    assert result.reusable_request is request
+    assert result.reusable_result is not None
+    assert result.reusable_result.endpoint_id == "primary"
+    assert result.reusable_result.dest_id_sent == "-535680"
+    assert result.reusable_result.http_status == 200
+    assert len(result.reusable_result.payload["products"]) == 100
     assert session.calls == ["https://primary.example.test"]
     transport.pin_endpoint("fallback-1")
     assert transport.endpoint_policy.pinned_endpoint_id == "fallback-1"
+
+
+def test_requests_transport_failed_probe_has_no_reusable_page() -> None:
+    session = FakeSession([FakeResponse(status_code=403)])
+    transport = RequestsScopedTransport(
+        session=session,  # type: ignore[arg-type]
+        request_params={"appType": "1"},
+        endpoint_urls=(
+            "https://primary.example.test",
+            "https://fallback.example.test",
+        ),
+        timeout_seconds=45,
+        referer_base="https://www.wildberries.ru/search?query=",
+        egress_session=session,  # type: ignore[arg-type]
+    )
+    task = type("Task", (), {"query": "шеврон", "page_size": 100})()
+    request = ScopedSearchRequest(
+        task=task,  # type: ignore[arg-type]
+        dest_id_observed="-535680",
+        endpoint_id="primary",
+        params={"query": "шеврон", "page": "1", "dest": "-535680"},
+    )
+
+    result = transport.probe_endpoint(
+        request,
+        endpoint_id="primary",
+        timeout_seconds=10,
+    )
+
+    assert result.suitable is False
+    assert result.http_status == 403
+    assert result.reusable_request is None
+    assert result.reusable_result is None
 
 
 def test_requests_transport_uses_pinned_fallback_url_and_rejects_switch() -> None:

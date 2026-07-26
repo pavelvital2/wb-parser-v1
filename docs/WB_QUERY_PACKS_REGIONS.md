@@ -218,11 +218,14 @@ the guarded runner performs this fixed sequence:
    from the same bytes used for YAML parsing;
 2. check neutral egress and resolve Moscow and Rostov-on-Don destinations;
 3. probe the primary endpoint and at most one fallback, then pin the first
-   usable endpoint;
+   usable endpoint. A usable 100-product probe is retained only in memory and
+   reused as the first Moscow/shevron page after independent identity and
+   payload validation; probe evidence never contains the payload;
 4. write an immutable effective snapshot containing the actual pinned endpoint;
-5. collect three Moscow pages, check egress, collect three Rostov-on-Don pages,
-   check egress, repeat the first Moscow query, then perform the final egress
-   check;
+5. persist the reused first Moscow page through the ordinary scoped
+   raw/checkpoint/output path, collect the other two Moscow pages, check egress,
+   collect three Rostov-on-Don pages, check egress, repeat the first Moscow
+   query, then perform the final egress check;
 6. write endpoint, request-budget, repeat-control and comparison evidence;
 7. re-hash the same fixed source and production path set, fail on any missing,
    changed, symlinked or non-regular source, and retain all locks through final
@@ -230,9 +233,11 @@ the guarded runner performs this fixed sequence:
    from this confirmed after-snapshot rather than only from initial loading.
 
 The WB request budget is fail-closed and counts attempts before transport I/O:
-`geo<=2`, `endpoint_probe<=2`, `regional_search=6`, `repeat_search=1`,
-`total_wb<=11`. Neutral egress checks are recorded separately. There are no
-retries, second pages, endpoint switches after pinning, proxy rotations,
+`geo<=2`, `endpoint_probe<=2`, `regional_search=5`, `repeat_search=1`,
+`total_wb<=10`. The primary route uses `9` WB requests and the fallback route
+uses `10`; the reused probe is one of the six main regional pages, while the
+repeat remains separate. Neutral egress checks are recorded separately. There
+are no retries, second pages, endpoint switches after pinning, proxy rotations,
 sellers, warehouse refreshes, publication or notification.
 
 The Moscow repeat is stored under the Moscow scoped raw run and in a separate

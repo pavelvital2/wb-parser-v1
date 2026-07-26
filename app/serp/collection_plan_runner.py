@@ -129,6 +129,8 @@ class EndpointProbeResult:
     suitable: bool
     http_status: int | None
     error_code: str | None
+    reusable_request: ScopedSearchRequest | None = None
+    reusable_result: ScopedSearchResult | None = None
 
 
 class ScopedTransport(Protocol):
@@ -743,6 +745,13 @@ class RequestsScopedTransport:
             suitable=True,
             http_status=200,
             error_code=None,
+            reusable_request=request,
+            reusable_result=ScopedSearchResult(
+                payload=payload,
+                endpoint_id=endpoint_id,
+                dest_id_sent=request.dest_id_observed,
+                http_status=200,
+            ),
         )
 
     def pin_endpoint(self, endpoint_id: str) -> None:
