@@ -13,10 +13,18 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
-
+from urllib.parse import quote
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.common.proxy_required import (
+    build_requests_session,
+    require_marketplace_proxy,
+)
+
+
 KEEPER_PATH = PROJECT_ROOT / "scripts" / "wb_cookie_keeper.py"
 DEFAULT_URL = "https://www.wildberries.ru/catalog/0/search.aspx?search={query}"
 ANDROID_CHROME_UA = (
@@ -163,9 +171,8 @@ def public_ip_urls() -> list[str]:
     return [url.strip() for url in raw_urls.split(",") if url.strip()]
 
 
-def _public_ip_error_label(url: str, error: str) -> str:
-    host = urlsplit(url).netloc or "public_ip"
-    return f"{host}:{error}"
+def _public_ip_error_label(endpoint_index: int, error: str) -> str:
+    return f"egress_endpoint_{endpoint_index}:{error}"
 
 
 def fetch_public_ip(config: dict[str, Any]) -> tuple[str, str]:
@@ -173,21 +180,34 @@ def fetch_public_ip(config: dict[str, Any]) -> tuple[str, str]:
     if not urls:
         return "", "disabled"
     timeout = int(os.getenv("PARSER_WB_PUBLIC_IP_TIMEOUT_SECONDS", "5"))
-    proxies = keeper.requests_proxies(keeper.resolve_proxy_url(config))
+    route = require_marketplace_proxy(config)
     errors: list[str] = []
-    for url in urls:
-        try:
-            response = keeper.requests.get(url, timeout=timeout, proxies=proxies)
-            if response.status_code != 200:
-                errors.append(_public_ip_error_label(url, f"http_{response.status_code}"))
-                continue
-            public_ip = _extract_public_ip(response.text)
-            if not public_ip:
-                errors.append(_public_ip_error_label(url, "parse_failed"))
-                continue
-            return public_ip, ""
-        except Exception as exc:
-            errors.append(_public_ip_error_label(url, exc.__class__.__name__))
+    with build_requests_session(route) as session:
+        for endpoint_index, url in enumerate(urls, start=1):
+            try:
+                response = session.get(url, timeout=timeout)
+                if response.status_code != 200:
+                    errors.append(
+                        _public_ip_error_label(
+                            endpoint_index,
+                            f"http_{response.status_code}",
+                        )
+                    )
+                    continue
+                public_ip = _extract_public_ip(response.text)
+                if not public_ip:
+                    errors.append(
+                        _public_ip_error_label(endpoint_index, "parse_failed")
+                    )
+                    continue
+                return public_ip, ""
+            except Exception as exc:
+                errors.append(
+                    _public_ip_error_label(
+                        endpoint_index,
+                        exc.__class__.__name__,
+                    )
+                )
     return "", ";".join(errors)[:240]
 
 
@@ -291,7 +311,10 @@ def main(argv: list[str] | None = None) -> int:
     state_json = keeper.resolve_path(args.state_json)
     query = args.query or keeper.load_queries(config, "", 1)[0]
     url = DEFAULT_URL.format(query=quote(query))
-    proxy = keeper.playwright_proxy_config(keeper.resolve_proxy_url(config))
+    proxy = require_marketplace_proxy(
+        config,
+        browser=True,
+    ).playwright_proxy()
     suggest = config.get("suggest") if isinstance(config.get("suggest"), dict) else {}
     browser_channel = args.browser_channel or str(suggest.get("browser_channel") or "chrome")
     stop = False
@@ -320,8 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if browser_channel:
             launch_kwargs["channel"] = browser_channel
-        if proxy:
-            launch_kwargs["proxy"] = proxy
+        launch_kwargs["proxy"] = proxy
         if args.mobile_android:
             launch_kwargs.update(android_context_options())
         extra_headers = keeper.request_headers_from_config(config)
@@ -363,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
                     title = page.title()[:120]
                     html = page.content()[:5000]
                 except Exception as exc:
-                    error = f"{exc.__class__.__name__}: {exc}"
+                    error = exc.__class__.__name__
 
                 antibot = detect_antibot(title, html)
                 html_ok = response_status == 200 and not antibot and not error

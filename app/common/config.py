@@ -32,6 +32,9 @@ class AppConfig:
     project_root: Path
     paths: ProjectPaths
     runtime: RuntimeConfig
+    runtime_request_headers_file: Path | None = None
+    runtime_request_headers_sha256: str | None = None
+    runtime_request_headers_count: int = 0
 
 
 def _as_path(project_root: Path, value: str) -> Path:
@@ -77,7 +80,11 @@ def load_config(path: str) -> AppConfig:
     )
 
     paths.ensure_base_dirs()
-    _inject_env(raw, project_root=project_root)
+    (
+        runtime_request_headers_file,
+        runtime_request_headers_sha256,
+        runtime_request_headers_count,
+    ) = _inject_env(raw, project_root=project_root)
 
     return AppConfig(
         raw=raw,
@@ -86,6 +93,9 @@ def load_config(path: str) -> AppConfig:
         project_root=project_root,
         paths=paths,
         runtime=cfg_runtime,
+        runtime_request_headers_file=runtime_request_headers_file,
+        runtime_request_headers_sha256=runtime_request_headers_sha256,
+        runtime_request_headers_count=runtime_request_headers_count,
     )
 
 
@@ -103,22 +113,34 @@ def _coerce_headers(raw_value: Any) -> dict[str, str]:
     return headers
 
 
-def _load_headers_file(project_root: Path, value: str) -> dict[str, str]:
+def _load_headers_file(
+    project_root: Path,
+    value: str,
+) -> tuple[dict[str, str], Path, str]:
     if not value:
-        return {}
+        raise ValueError("request headers file path is empty")
     path = _as_path(project_root, value)
     if not path.exists():
         raise FileNotFoundError(f"request headers file not found: {path}")
-    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    payload_bytes = path.read_bytes()
+    payload = yaml.safe_load(payload_bytes.decode("utf-8")) or {}
     if isinstance(payload, dict) and isinstance(payload.get("headers"), dict):
         payload = payload["headers"]
-    return _coerce_headers(payload)
+    return (
+        _coerce_headers(payload),
+        path,
+        hashlib.sha256(payload_bytes).hexdigest(),
+    )
 
 
-def _inject_env(raw: dict[str, Any], *, project_root: Path) -> None:
+def _inject_env(
+    raw: dict[str, Any],
+    *,
+    project_root: Path,
+) -> tuple[Path | None, str | None, int]:
     serp = raw.get("serp", {})
     if not isinstance(serp, dict):
-        return
+        return None, None, 0
     env_name = serp.get("wb_cookie_file_env", "")
     if env_name and os.getenv(env_name):
         serp["wb_cookie_file"] = os.getenv(env_name)
@@ -126,10 +148,17 @@ def _inject_env(raw: dict[str, Any], *, project_root: Path) -> None:
     headers_env_name = str(serp.get("request_headers_file_env") or "PARSER_WB_REQUEST_HEADERS_FILE").strip()
     headers_file = os.getenv(headers_env_name, "").strip() if headers_env_name else ""
     headers_file = headers_file or str(serp.get("request_headers_file") or "").strip()
+    runtime_headers_path: Path | None = None
+    runtime_headers_sha256: str | None = None
+    runtime_headers_count = 0
     if headers_file:
+        loaded_headers, runtime_headers_path, runtime_headers_sha256 = (
+            _load_headers_file(project_root, headers_file)
+        )
         merged = _coerce_headers(serp.get("request_headers"))
-        merged.update(_load_headers_file(project_root, headers_file))
+        merged.update(loaded_headers)
         serp["request_headers"] = merged
+        runtime_headers_count = len(loaded_headers)
 
     webui = raw.get("webui", {})
     pwd_env = webui.get("admin_password_env", "")
@@ -139,3 +168,8 @@ def _inject_env(raw: dict[str, Any], *, project_root: Path) -> None:
     secret_env = webui.get("secret_key_env", "")
     if secret_env and os.getenv(secret_env):
         webui["secret_key"] = os.getenv(secret_env)
+    return (
+        runtime_headers_path,
+        runtime_headers_sha256,
+        runtime_headers_count,
+    )

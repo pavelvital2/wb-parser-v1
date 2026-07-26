@@ -1,6 +1,7 @@
 # WB query packs and regions
 
-Status: Stage 3 guarded pilot contract implemented; live pilot not executed
+Status: Stage 3.2 guarded pilot implementation; live execution requires a new
+owner approval
 
 ## Scope
 
@@ -147,9 +148,9 @@ The runner:
   non-blockingly in that order and retains them through final manifest fsync;
 - resolves all configured `xinfo.dest` values under the held locks, writes the
   immutable effective-plan snapshot, then collects the region scopes serially;
-- checks one unchanged egress identity through the same proxy route/channel
-  using a separate secret-free session and stores only a masked value plus an
-  experiment-local salted hash;
+- checks one unchanged egress identity through the same explicitly configured
+  proxy route and requests session, using secret-free per-request headers, and
+  stores only a masked value plus an experiment-local salted hash;
 - sends the exact resolved value as the search `dest`;
 - performs one request per task against one pinned endpoint, without retry,
   fallback switching or proxy rotation;
@@ -188,25 +189,24 @@ Loaders reject:
 
 ## Stop gate
 
-The Stage 3 implementation is stopped before live execution. The tracked plan
-and regions remain disabled; no resolver/search smoke or pilot has run.
-Scoped publication, warehouse migration, Parser Data API changes and scheduling
-remain unapproved.
+The tracked plan and regions remain disabled. Stage 3.2 code/test work does not
+authorize another resolver/search smoke or pilot. Scoped publication, warehouse
+migration, Parser Data API changes and scheduling remain unapproved.
 
 ## Stage 3 guarded pilot
 
-The A-B-A contract is available only with the additional explicit flag:
+The A-B-A contract is available only through the audited launcher:
 
 ```text
-python main.py --config config/config.yaml collection-plan \
-  --plan-file config/wb/collection_plans/{collection_plan_id}.json \
-  --no-publish --guarded-pilot
+scripts/run_wb_guarded_regional_pilot.sh
 ```
 
-The dedicated launcher accepts the same `--guarded-pilot` flag. The flag does
-not bypass plan or region validation. The tracked plan and both tracked regions
-remain `enabled=false`; a future live pilot requires a separate reviewed
-enable commit followed by a disable commit.
+The launcher accepts no arguments, loads and hashes ignored
+`config/runtime.env` before Python/config loading, and executes the fixed
+`--no-publish --guarded-pilot` plan. It does not bypass plan or region
+validation. The tracked plan and both tracked regions remain `enabled=false`;
+a future live pilot requires a separate reviewed enable commit followed by a
+disable commit and explicit owner approval.
 
 While holding the existing daily, pipeline, warehouse-refresh and plan locks,
 the guarded runner performs this fixed sequence:
@@ -232,6 +232,12 @@ the guarded runner performs this fixed sequence:
    manifest fsync. A successful manifest takes its three source SHA-256 values
    from this confirmed after-snapshot rather than only from initial loading.
 
+Before the first resolver/search/egress request, Stage 3.2 also fails closed
+unless runtime provenance, an explicit structurally valid proxy, loaded request
+headers, explicit cookie-required mode, disabled rotation and one concrete
+proxied requests session are all confirmed. Evidence contains only
+schema/status/boolean/count/hash provenance.
+
 The WB request budget is fail-closed and counts attempts before transport I/O:
 `geo<=2`, `endpoint_probe<=2`, `regional_search=5`, `repeat_search=1`,
 `total_wb<=10`. The primary route uses `9` WB requests and the fallback route
@@ -239,6 +245,16 @@ uses `10`; the reused probe is one of the six main regional pages, while the
 repeat remains separate. Neutral egress checks are recorded separately. There
 are no retries, second pages, endpoint switches after pinning, proxy rotations,
 sellers, warehouse refreshes, publication or notification.
+
+Every endpoint probe, ordinary regional search and repeat is paced by a
+monotonic clock. The first attempt has no delay; each later attempt starts no
+earlier than `17` seconds plus jitter from `0` through `2` seconds after the
+previous attempt. The reusable probe counts as the previous attempt. HTTP
+`429`/`498` blocks all subsequent WB calls with zero retry. A strict numeric
+`Retry-After` of `1..120` seconds controls cooldown when valid; otherwise
+cooldown is `45` seconds. After cooldown, at most one neutral egress check
+through the same proxy session is allowed. The hard runtime cap is 18 minutes
+and the start gate requires at least 20 minutes before 23:45 MSK.
 
 The Moscow repeat is stored under the Moscow scoped raw run and in a separate
 control artifact; it is not appended to the 600 primary product rows. Regional
@@ -251,7 +267,10 @@ Stage 3 state artifacts are immutable files under the scoped run:
 
 ```text
 state/wb_collection_plans/{plan}/{run_id}/endpoint_preflight.json
+state/wb_collection_plans/{plan}/{run_id}/contour_preflight.json
 state/wb_collection_plans/{plan}/{run_id}/request_budget.json
+state/wb_collection_plans/{plan}/{run_id}/search_pacing.json
+state/wb_collection_plans/{plan}/{run_id}/rate_limit.json
 state/wb_collection_plans/{plan}/{run_id}/control/moscow_repeat.json
 state/wb_collection_plans/{plan}/{run_id}/comparison.json
 state/wb_collection_plans/{plan}/{run_id}/protected_evidence.json

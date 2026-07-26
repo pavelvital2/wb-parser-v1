@@ -35,6 +35,7 @@ from app.serp.collection_plan_runner import (
     ScopedSearchResult,
     ScopedTransportError,
     acquire_collection_plan_locks,
+    parse_retry_after_delta,
     run_collection_plan,
 )
 from scripts import run_wb_collection_plan as dedicated_launcher
@@ -50,6 +51,33 @@ PACK_RELATIVE = Path(
 REGIONS_RELATIVE = Path("config/wb/regions.json")
 RUN_ID = "20260726_120000Z"
 FIXED_NOW = datetime(2026, 7, 26, 9, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, ("missing", None)),
+        ("1", ("valid", 1)),
+        ("120", ("valid", 120)),
+        ("0", ("out_of_range", None)),
+        ("121", ("out_of_range", None)),
+        ("000", ("out_of_range", None)),
+        ("001", ("valid", 1)),
+        ("1.0", ("invalid", None)),
+        (" 17", ("invalid", None)),
+        ("17 ", ("invalid", None)),
+        ("+17", ("invalid", None)),
+        ("-1", ("invalid", None)),
+        ("1234", ("invalid", None)),
+        (17, ("invalid", None)),
+        (True, ("invalid", None)),
+    ],
+)
+def test_retry_after_accepts_only_strict_bounded_delta_seconds(
+    value: Any,
+    expected: tuple[str, int | None],
+) -> None:
+    assert parse_retry_after_delta(value) == expected
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -1042,11 +1070,14 @@ def test_from_config_keeps_wb_secrets_out_of_neutral_egress_session(
         "authorization": "Bearer fake-test-token"
     }
     monkeypatch.setenv("PARSER_WB_PROXY_URL", "http://proxy.example.test:8080")
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_LOADED", "1")
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_SHA256", "a" * 64)
 
     class CaptureSession:
         def __init__(self) -> None:
             self.headers: dict[str, str] = {}
             self.proxies: dict[str, str] = {}
+            self.trust_env = True
 
         def close(self) -> None:
             pass
@@ -1061,12 +1092,13 @@ def test_from_config_keeps_wb_secrets_out_of_neutral_egress_session(
     monkeypatch.setattr(requests, "Session", session_factory)
     transport = RequestsScopedTransport.from_config(config)
 
-    assert len(sessions) == 2
-    assert "cookie" in transport.session.headers
-    assert "authorization" in transport.session.headers
-    assert "cookie" not in transport.egress_session.headers
-    assert "authorization" not in transport.egress_session.headers
-    assert transport.session.proxies == transport.egress_session.proxies
+    assert len(sessions) == 1
+    assert transport.egress_session is transport.session
+    assert "cookie" not in transport.session.headers
+    assert "authorization" not in transport.session.headers
+    assert "cookie" in transport.request_headers
+    assert "authorization" in transport.request_headers
+    assert transport.session.trust_env is False
 
 
 def test_cli_adds_explicit_collection_plan_without_changing_legacy_aliases() -> None:

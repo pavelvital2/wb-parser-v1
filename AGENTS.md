@@ -329,9 +329,16 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   If renewal fails but `PARSER_WB_COOKIELESS_FALLBACK_OK=1`, the wrapper checks
   `wb_cookie_keeper.py smoke --without-cookie`; if that smoke passes, the
   collection channel is considered alive and the cookie file is left unchanged.
-- The Linux wrapper scripts load optional ignored `config/runtime.env` if it
-  exists. Use this file or scheduler environment for runtime secrets such as
-  `PARSER_WB_PROXY_URL`; keep it mode `600` and never commit or print values.
+- All WB marketplace collection/access traffic is proxy-only. SERP, sellers,
+  suggest/browser, cookie/access smoke and refresh, persistent browser, regional
+  resolver/search and neutral egress checks must load ignored
+  `config/runtime.env` through `scripts/wb_runtime_env.sh`, require an explicit
+  structurally valid proxy and apply it to the concrete requests session or
+  browser context before network I/O. Direct fallback is forbidden. Telegram,
+  GitHub and local/internal control APIs are outside this data-plane boundary;
+  keep the existing direct route for the local rotation control endpoint, then
+  recreate an explicitly proxied session for later WB traffic. See
+  `docs/WB_PROXY_ONLY_RUNBOOK.md`. Never print proxy values or credentials.
 - Keep `validation.max_error_ratio.serp` at `0.05` for production-like runs.
   Partial SERP above this threshold must not publish `latest` outputs or
   downstream seller exports.

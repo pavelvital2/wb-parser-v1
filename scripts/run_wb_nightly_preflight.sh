@@ -6,6 +6,7 @@ PYTHON_BIN="/home/Codex/agent-tools/parser_wb-python/bin/python"
 CONFIG_FILE="$PROJECT_DIR/config/config.yaml"
 COOKIE_FILE="$PROJECT_DIR/config/wb_cookie.txt"
 RUNTIME_ENV_FILE="$PROJECT_DIR/config/runtime.env"
+RUNTIME_LOADER="$PROJECT_DIR/scripts/wb_runtime_env.sh"
 PREFLIGHT_SCRIPT="$PROJECT_DIR/scripts/wb_nightly_preflight.py"
 NOTIFY_SCRIPT="$PROJECT_DIR/scripts/notify_products_sellers_daily.py"
 LOCK_FILE="$PROJECT_DIR/state/locks/wb_nightly_preflight.flock"
@@ -31,12 +32,13 @@ flock -u 8
 
 cd "$PROJECT_DIR"
 
-if [[ -r "$RUNTIME_ENV_FILE" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$RUNTIME_ENV_FILE"
-  set +a
+if [[ ! -r "$RUNTIME_LOADER" ]]; then
+  echo "$(date --iso-8601=seconds) WB runtime loader is unavailable"
+  exit 2
 fi
+# shellcheck disable=SC1090
+source "$RUNTIME_LOADER"
+wb_load_required_runtime_env "$RUNTIME_ENV_FILE"
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "$(date --iso-8601=seconds) python runtime is not executable: $PYTHON_BIN"

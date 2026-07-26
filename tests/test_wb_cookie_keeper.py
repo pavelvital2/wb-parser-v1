@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+import pytest
+
+
+def _enable_proxy(monkeypatch, url: str = "http://proxy.local:3128") -> None:
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_LOADED", "1")
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_SHA256", "a" * 64)
+    monkeypatch.setenv("PARSER_WB_PROXY_URL", url)
 
 
 def _load_keeper():
@@ -22,6 +32,7 @@ def test_nested_promo_products_is_preflight_ok() -> None:
 
 def test_proxy_helpers_use_env_and_prepare_requests_and_playwright(monkeypatch) -> None:
     keeper = _load_keeper()
+    _enable_proxy(monkeypatch)
     monkeypatch.setenv("TEST_WB_PROXY_URL", "http://user:pa%24%24@proxy.local:3128")
     config = {"serp": {"proxy_url_env": "TEST_WB_PROXY_URL", "proxy_url": "http://ignored.local:8080"}}
 
@@ -149,6 +160,7 @@ def test_renew_keeps_existing_cookie_when_html_smoke_fails(tmp_path: Path, monke
 
 def test_smoke_uses_fallback_urls_and_min_successes(tmp_path: Path, monkeypatch) -> None:
     keeper = _load_keeper()
+    _enable_proxy(monkeypatch)
     cookie_path = tmp_path / "wb_cookie.txt"
     cookie_path.write_text("cookie=1\n", encoding="utf-8")
     queries_path = tmp_path / "exports" / "queries.txt"
@@ -194,13 +206,13 @@ def test_smoke_uses_fallback_urls_and_min_successes(tmp_path: Path, monkeypatch)
 
     calls: list[tuple[str, str, dict[str, str] | None, dict[str, str]]] = []
 
-    def fake_get(url, *, params, headers, timeout, proxies=None):
-        calls.append((url, params["query"], proxies, headers))
+    def fake_get(session, url, *, params, headers, timeout):
+        calls.append((url, params["query"], dict(session.proxies), headers))
         if url == "https://fallback.example/search" and params["query"] == "q1":
             return Response(200, {"products": [{"name": "ok"}]})
         return Response(498, text="blocked")
 
-    monkeypatch.setattr(keeper.requests, "get", fake_get)
+    monkeypatch.setattr(keeper.requests.Session, "get", fake_get)
 
     assert keeper.smoke(config, args, emit=False) is True
     expected_proxy = {"http": "http://proxy.local:3128", "https": "http://proxy.local:3128"}
@@ -217,6 +229,7 @@ def test_smoke_uses_fallback_urls_and_min_successes(tmp_path: Path, monkeypatch)
 
 def test_smoke_can_check_fallback_without_cookie(tmp_path: Path, monkeypatch) -> None:
     keeper = _load_keeper()
+    _enable_proxy(monkeypatch)
     cookie_path = tmp_path / "wb_cookie.txt"
     cookie_path.write_text("cookie=1\n", encoding="utf-8")
 
@@ -249,13 +262,142 @@ def test_smoke_can_check_fallback_without_cookie(tmp_path: Path, monkeypatch) ->
 
     seen_headers: list[dict[str, str]] = []
 
-    def fake_get(url, *, params, headers, timeout, proxies=None):
+    def fake_get(_session, url, *, params, headers, timeout):
         seen_headers.append(headers)
         return Response()
 
-    monkeypatch.setattr(keeper.requests, "get", fake_get)
+    monkeypatch.setattr(keeper.requests.Session, "get", fake_get)
 
     assert keeper.smoke(config, args, emit=False) is True
     assert seen_headers
     assert "cookie" not in seen_headers[0]
     assert seen_headers[0]["authorization"] == "Bearer token"
+
+
+def test_smoke_without_proxy_fails_before_requests_call(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    keeper = _load_keeper()
+    cookie_path = tmp_path / "wb_cookie.txt"
+    cookie_path.write_text("cookie=1\n", encoding="utf-8")
+    config = {
+        "runtime": {"http_timeout_seconds": 5},
+        "serp": {
+            "wb_cookie_file": str(cookie_path),
+            "base_url": "https://search.example.test",
+            "request_params": {},
+        },
+    }
+    args = argparse.Namespace(
+        cookie_file=str(cookie_path),
+        state_json="",
+        query="q1",
+        sample_count=1,
+        min_successes=1,
+        page=1,
+    )
+    calls = 0
+
+    def forbidden_get(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("network must not be called")
+
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_LOADED", "1")
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_SHA256", "a" * 64)
+    monkeypatch.delenv("PARSER_WB_PROXY_URL", raising=False)
+    monkeypatch.setattr(keeper.requests.Session, "get", forbidden_get)
+
+    with pytest.raises(Exception, match="marketplace_proxy_env_missing"):
+        keeper.smoke(config, args, emit=False)
+    assert calls == 0
+
+
+def _refresh_args(tmp_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        cookie_file=str(tmp_path / "wb_cookie.txt"),
+        storage_state=str(tmp_path / "missing-storage-state.json"),
+        storage_state_out=str(tmp_path / "storage-state-out.json"),
+        state_json="",
+        browser_channel="chrome",
+        no_headless=False,
+        headed=False,
+        require_storage_state=False,
+        refresh_url="https://www.wildberries.ru/",
+        timeout_ms=1000,
+        wait_ms=0,
+    )
+
+
+def test_refresh_without_proxy_fails_before_playwright_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keeper = _load_keeper()
+    calls = 0
+    sync_api = ModuleType("playwright.sync_api")
+
+    def forbidden_playwright():
+        nonlocal calls
+        calls += 1
+        raise AssertionError("browser must not start")
+
+    sync_api.sync_playwright = forbidden_playwright  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_LOADED", "1")
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_SHA256", "a" * 64)
+    monkeypatch.delenv("PARSER_WB_PROXY_URL", raising=False)
+
+    with pytest.raises(Exception, match="marketplace_proxy_env_missing"):
+        keeper.refresh(
+            {"serp": {"proxy_url_env": "PARSER_WB_PROXY_URL"}},
+            _refresh_args(tmp_path),
+        )
+
+    assert calls == 0
+
+
+def test_refresh_passes_explicit_proxy_to_browser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keeper = _load_keeper()
+    _enable_proxy(
+        monkeypatch,
+        "http://user:test-only@proxy.example.test:8080",
+    )
+    captured: dict[str, object] = {}
+    sync_api = ModuleType("playwright.sync_api")
+
+    class Chromium:
+        @staticmethod
+        def launch(**kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("stop after launch contract check")
+
+    class Playwright:
+        chromium = Chromium()
+
+    class ContextManager:
+        def __enter__(self):
+            return Playwright()
+
+        def __exit__(self, *_args):
+            return False
+
+    sync_api.sync_playwright = lambda: ContextManager()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+    assert (
+        keeper.refresh(
+            {"serp": {"proxy_url_env": "PARSER_WB_PROXY_URL"}},
+            _refresh_args(tmp_path),
+        )
+        is False
+    )
+    assert captured["proxy"] == {
+        "server": "http://proxy.example.test:8080",
+        "username": "user",
+        "password": "test-only",
+    }

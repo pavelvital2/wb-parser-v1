@@ -148,6 +148,7 @@ Current WB access/cookie operating rules are documented in:
 
 ```text
 docs/WB_ACCESS_COOKIE_RUNBOOK.md
+docs/WB_PROXY_ONLY_RUNBOOK.md
 ```
 
 Use it before changing WB proxy/cookie/header runtime, interpreting `429`/`498`,

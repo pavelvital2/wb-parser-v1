@@ -9,6 +9,7 @@ from app.common.constants import COMPONENT_SUGGEST
 from app.common.csv_io import append_csv_rows
 from app.common.exceptions import CriticalPipelineError
 from app.common.logging_setup import get_logger
+from app.common.proxy_required import require_marketplace_proxy
 from app.common.retry import with_retry
 from app.common.run_context import RunContext, utc_now_iso
 from app.common.state_db import StateDB
@@ -195,6 +196,7 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
     logger = get_logger("suggest")
     if sync_playwright is None:
         raise CriticalPipelineError("playwright is required for suggest component")
+    proxy_route = require_marketplace_proxy(config.raw, browser=True)
 
     settings = config.raw.get("suggest", {})
     prefixes_path = _resolve_path(config, str(settings.get("prefixes_file", "config/prefixes.txt")))
@@ -271,6 +273,7 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
         launch_kwargs: dict[str, Any] = {
             "user_data_dir": str(browser_profile_dir),
             "headless": headless,
+            "proxy": proxy_route.playwright_proxy(),
         }
         if browser_channel:
             launch_kwargs["channel"] = browser_channel
@@ -345,7 +348,7 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
                         )
                     except Exception as exc:
                         status = CHECKPOINT_VALUE_ERROR
-                        error_message = str(exc)
+                        error_message = f"browser_failed:{exc.__class__.__name__}"
                         suggestions = []
 
                     list_size = len(suggestions)
@@ -464,5 +467,3 @@ def run_suggest_collection(config: AppConfig, db: StateDB, ctx: RunContext) -> d
         "raw_path": str(raw_path),
         "staging_path": str(staging_path),
     }
-
-

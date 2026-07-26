@@ -20,6 +20,10 @@ from app.common.constants import COMPONENT_FILTER, COMPONENT_SERP, ERROR_CODE_NE
 from app.common.csv_io import append_csv_rows, read_csv_rows, write_csv_rows
 from app.common.exceptions import CriticalPipelineError
 from app.common.logging_setup import get_logger
+from app.common.proxy_required import (
+    build_requests_session,
+    require_marketplace_proxy,
+)
 from app.common.retry import with_retry
 from app.common.run_context import RunContext, utc_now_iso
 from app.common.state_db import StateDB
@@ -119,7 +123,7 @@ class SerpEngine:
         self.base_url = str(self.serp_cfg.get("base_url", "https://www.wildberries.ru/__internal/u-search/exactmatch/ru/common/v18/search"))
         self.base_urls = self._resolve_base_urls()
         self._active_base_url_index = 0
-        self.proxy_url = self._resolve_proxy_url()
+        self.proxy_url = ""
         self.request_params = dict(self.serp_cfg.get("request_params", {}))
         self.user_agent = str(self.serp_cfg.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"))
         self.referer_base = str(self.serp_cfg.get("referer_base", "https://www.wildberries.ru/catalog/0/search.aspx?search="))
@@ -224,7 +228,9 @@ class SerpEngine:
         self._last_ip_rotation_reason = ""
         self._last_ip_rotation_scope = ""
 
-        session = self._build_session(cookie_value)
+        session: requests.Session | None = (
+            None if dry_run else self._build_session(cookie_value)
+        )
         try:
             for task in tasks:
                 query_done = False
@@ -275,6 +281,10 @@ class SerpEngine:
                         query_done = True
                         break
 
+                    if session is None:
+                        raise CriticalPipelineError(
+                            "SERP live session is unavailable"
+                        )
                     (
                         session,
                         cookie_value,
@@ -408,6 +418,10 @@ class SerpEngine:
                     time.sleep(self.sleep_between_queries_ms / 1000.0)
 
             if failed_pages and self.deferred_retry_enabled and not dry_run:
+                if session is None:
+                    raise CriticalPipelineError(
+                        "SERP live session is unavailable"
+                    )
                 retry_result = self._retry_failed_pages(
                     session=session,
                     cookie_value=cookie_value,
@@ -430,7 +444,8 @@ class SerpEngine:
                 pages_done += retry_result["pages_done"]
                 items_error = max(0, items_error - retry_result["errors_recovered"])
         finally:
-            session.close()
+            if session is not None:
+                session.close()
 
         pages_done, items_error = self._sync_final_page_error_state(
             pages_index_path=pages_index_path,
@@ -509,7 +524,9 @@ class SerpEngine:
         }
 
     def _build_session(self, cookie_value: str) -> requests.Session:
-        session = requests.Session()
+        route = require_marketplace_proxy(self.config.raw)
+        session = build_requests_session(route)
+        self.proxy_url = route.url
         headers = {
             "user-agent": self.user_agent,
             "x-requested-with": self.x_requested_with,
@@ -519,8 +536,6 @@ class SerpEngine:
         if cookie_value:
             headers["cookie"] = cookie_value
         session.headers.update(headers)
-        if self.proxy_url:
-            session.proxies.update({"http": self.proxy_url, "https": self.proxy_url})
         return session
 
     def _http_status_set(self, key: str, default: set[int]) -> set[int]:
@@ -552,14 +567,6 @@ class SerpEngine:
                 add_url(url)
 
         return urls or [self.base_url]
-
-    def _resolve_proxy_url(self) -> str:
-        env_name = str(self.serp_cfg.get("proxy_url_env") or "PARSER_WB_PROXY_URL").strip()
-        if env_name:
-            env_value = os.getenv(env_name, "").strip()
-            if env_value:
-                return env_value
-        return str(self.serp_cfg.get("proxy_url") or "").strip()
 
     def _resolve_cookie_required(self) -> bool:
         env_name = str(self.serp_cfg.get("cookie_required_env") or "PARSER_WB_COOKIE_REQUIRED").strip()
@@ -1297,7 +1304,11 @@ class SerpEngine:
                 try:
                     payload = resp.json()
                 except Exception as exc:
-                    return resp, None, f"json_decode_failed: {exc}"
+                    return (
+                        resp,
+                        None,
+                        f"json_decode_failed:{exc.__class__.__name__}",
+                    )
 
                 if not isinstance(payload, dict):
                     return resp, None, "json_payload_not_object"
@@ -1329,17 +1340,32 @@ class SerpEngine:
         except RetryableHttpStatusError as exc:
             response = exc.response
             if response is None:
-                return None, None, f"request_failed: {exc}", ""
+                return (
+                    None,
+                    None,
+                    f"request_failed:{exc.__class__.__name__}",
+                    "",
+                )
             raw_file = self._write_raw_response(query=query, page=page, content=response.content)
             return response, None, f"http_{response.status_code}: {self._short_http_error_text(response.text)}", raw_file
         except RetryablePayloadAnomalyError as exc:
             response = exc.response
             if response is None:
-                return None, None, f"request_failed: {exc}", ""
+                return (
+                    None,
+                    None,
+                    f"request_failed:{exc.__class__.__name__}",
+                    "",
+                )
             raw_file = self._write_raw_response(query=query, page=page, content=response.content)
             return response, None, exc.error_message, raw_file
         except Exception as exc:
-            return None, None, f"request_failed: {exc}", ""
+            return (
+                None,
+                None,
+                f"request_failed:{exc.__class__.__name__}",
+                "",
+            )
 
         raw_file = self._write_raw_response(query=query, page=page, content=response.content)
         return response, payload, error_message, raw_file

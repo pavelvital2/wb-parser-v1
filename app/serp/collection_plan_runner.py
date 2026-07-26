@@ -20,6 +20,11 @@ import requests
 
 from app.common.config import AppConfig
 from app.common.exceptions import CriticalPipelineError
+from app.common.proxy_required import (
+    assert_requests_session_proxy,
+    build_requests_session,
+    require_marketplace_proxy,
+)
 from app.common.run_lock import acquire_advisory_lock, acquire_run_lock
 from app.serp.collection_plan import (
     CollectionPlanBundle,
@@ -71,12 +76,16 @@ class ScopedTransportError(CollectionPlanRunError):
         request_sent: bool = False,
         dest_id_sent: str = "",
         http_status: int | None = None,
+        retry_after_status: str | None = None,
+        retry_after_seconds: int | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.request_sent = request_sent
         self.dest_id_sent = dest_id_sent
         self.http_status = http_status
+        self.retry_after_status = retry_after_status
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +140,19 @@ class EndpointProbeResult:
     error_code: str | None
     reusable_request: ScopedSearchRequest | None = None
     reusable_result: ScopedSearchResult | None = None
+    retry_after_status: str | None = None
+    retry_after_seconds: int | None = None
+
+
+def parse_retry_after_delta(value: Any) -> tuple[str, int | None]:
+    if value is None:
+        return "missing", None
+    if type(value) is not str or not re.fullmatch(r"[0-9]{1,3}", value):
+        return "invalid", None
+    seconds = int(value)
+    if not 1 <= seconds <= 120:
+        return "out_of_range", None
+    return "valid", seconds
 
 
 class ScopedTransport(Protocol):
@@ -480,6 +502,7 @@ class RequestsScopedTransport:
         endpoint_urls: tuple[str, ...],
         timeout_seconds: float,
         referer_base: str,
+        request_headers: Mapping[str, str] | None = None,
         resolver_url: str = GEO_RESOLVER_URL,
         egress_check_url: str = EGRESS_CHECK_URL,
         egress_session: requests.Session | None = None,
@@ -491,9 +514,15 @@ class RequestsScopedTransport:
         self.endpoint_urls = endpoint_urls
         self.timeout_seconds = float(timeout_seconds)
         self.referer_base = referer_base
+        self.request_headers = dict(request_headers or {})
         self.resolver_url = resolver_url
         self.egress_check_url = egress_check_url
-        self.egress_session = egress_session or requests.Session()
+        self.egress_session = egress_session or session
+        self.proxy_route_sha256 = getattr(
+            session,
+            "_wb_marketplace_proxy_sha256",
+            None,
+        )
         endpoint_ids = tuple(
             "primary" if index == 0 else f"fallback-{index}"
             for index in range(len(endpoint_urls))
@@ -508,7 +537,8 @@ class RequestsScopedTransport:
     @classmethod
     def from_config(cls, config: AppConfig) -> "RequestsScopedTransport":
         serp = config.raw.get("serp", {})
-        session = requests.Session()
+        route = require_marketplace_proxy(config.raw)
+        session = build_requests_session(route)
         headers = {
             "user-agent": str(
                 serp.get(
@@ -552,19 +582,7 @@ class RequestsScopedTransport:
             raise CollectionPlanRunError("configured WB cookie is missing")
         if cookie_value:
             headers["cookie"] = cookie_value
-        session.headers.update(headers)
-
-        proxy_env = str(serp.get("proxy_url_env") or "PARSER_WB_PROXY_URL")
-        proxy_url = os.getenv(proxy_env, "").strip() or str(
-            serp.get("proxy_url") or ""
-        ).strip()
-        if proxy_url:
-            session.proxies.update({"http": proxy_url, "https": proxy_url})
-        egress_session = requests.Session()
-        if proxy_url:
-            egress_session.proxies.update(
-                {"http": proxy_url, "https": proxy_url}
-            )
+        assert_requests_session_proxy(session, route)
 
         urls: list[str] = []
         candidates: list[Any] = [serp.get("base_url")]
@@ -586,7 +604,8 @@ class RequestsScopedTransport:
                     "https://www.wildberries.ru/catalog/0/search.aspx?search=",
                 )
             ),
-            egress_session=egress_session,
+            request_headers=headers,
+            egress_session=session,
         )
 
     @staticmethod
@@ -637,6 +656,10 @@ class RequestsScopedTransport:
         try:
             response = self.egress_session.get(
                 self.egress_check_url,
+                headers={
+                    "accept": "text/plain",
+                    "user-agent": "parser-wb-egress-check/1",
+                },
                 timeout=min(self.timeout_seconds, timeout_seconds),
             )
         except requests.RequestException as exc:
@@ -666,14 +689,29 @@ class RequestsScopedTransport:
                     "longitude": region.longitude,
                     "address": region.address_label,
                 },
+                headers=self.request_headers,
                 timeout=min(self.timeout_seconds, timeout_seconds),
             )
         except requests.RequestException as exc:
             raise ScopedTransportError("resolver_network_error") from exc
         if response.status_code != 200:
+            retry_after_status: str | None = None
+            retry_after_seconds: int | None = None
+            if response.status_code in {429, 498}:
+                response_headers = getattr(response, "headers", {})
+                raw_retry_after = (
+                    response_headers.get("Retry-After")
+                    if isinstance(response_headers, Mapping)
+                    else None
+                )
+                retry_after_status, retry_after_seconds = (
+                    parse_retry_after_delta(raw_retry_after)
+                )
             raise ScopedTransportError(
                 f"resolver_http_{response.status_code}",
                 http_status=response.status_code,
+                retry_after_status=retry_after_status,
+                retry_after_seconds=retry_after_seconds,
             )
         return self._extract_dest(self._response_json(response, code="resolver"))
 
@@ -697,10 +735,14 @@ class RequestsScopedTransport:
             raise ScopedTransportError("endpoint_probe_identity_mismatch")
         endpoint_url = self._endpoint_url(endpoint_id)
         try:
+            headers = dict(self.request_headers)
+            headers["referer"] = (
+                f"{self.referer_base}{quote(request.task.query)}"
+            )
             response = self.session.get(
                 endpoint_url,
                 params=dict(request.params),
-                headers={"referer": f"{self.referer_base}{quote(request.task.query)}"},
+                headers=headers,
                 timeout=min(self.timeout_seconds, timeout_seconds),
             )
         except requests.RequestException:
@@ -711,11 +753,25 @@ class RequestsScopedTransport:
                 error_code="endpoint_probe_network_error",
             )
         if response.status_code != 200:
+            retry_after_status: str | None = None
+            retry_after_seconds: int | None = None
+            if response.status_code in {429, 498}:
+                response_headers = getattr(response, "headers", {})
+                raw_retry_after = (
+                    response_headers.get("Retry-After")
+                    if isinstance(response_headers, Mapping)
+                    else None
+                )
+                retry_after_status, retry_after_seconds = (
+                    parse_retry_after_delta(raw_retry_after)
+                )
             return EndpointProbeResult(
                 endpoint_id=endpoint_id,
                 suitable=False,
                 http_status=response.status_code,
                 error_code=f"endpoint_probe_http_{response.status_code}",
+                retry_after_status=retry_after_status,
+                retry_after_seconds=retry_after_seconds,
             )
         try:
             payload = self._response_json(response, code="endpoint_probe")
@@ -775,10 +831,14 @@ class RequestsScopedTransport:
             raise ScopedTransportError("search_endpoint_not_pinned")
         endpoint_url = self._endpoint_url(request.endpoint_id)
         try:
+            headers = dict(self.request_headers)
+            headers["referer"] = (
+                f"{self.referer_base}{quote(request.task.query)}"
+            )
             response = self.session.get(
                 endpoint_url,
                 params=dict(request.params),
-                headers={"referer": f"{self.referer_base}{quote(request.task.query)}"},
+                headers=headers,
                 timeout=min(self.timeout_seconds, timeout_seconds),
             )
         except requests.RequestException as exc:
@@ -788,11 +848,25 @@ class RequestsScopedTransport:
                 dest_id_sent=request.dest_id_observed,
             ) from exc
         if response.status_code != 200:
+            retry_after_status: str | None = None
+            retry_after_seconds: int | None = None
+            if response.status_code in {429, 498}:
+                response_headers = getattr(response, "headers", {})
+                raw_retry_after = (
+                    response_headers.get("Retry-After")
+                    if isinstance(response_headers, Mapping)
+                    else None
+                )
+                retry_after_status, retry_after_seconds = (
+                    parse_retry_after_delta(raw_retry_after)
+                )
             raise ScopedTransportError(
                 f"search_http_{response.status_code}",
                 request_sent=True,
                 dest_id_sent=request.dest_id_observed,
                 http_status=response.status_code,
+                retry_after_status=retry_after_status,
+                retry_after_seconds=retry_after_seconds,
             )
         payload = self._response_json(
             response,

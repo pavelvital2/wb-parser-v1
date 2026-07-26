@@ -215,16 +215,28 @@ class WebUIServices:
         if action not in ALLOWED_ACTIONS:
             return False, f"Unsupported action: {target}"
 
-        cmd = [
-            sys.executable,
-            str(self.config.project_root / "main.py"),
-            "--config",
-            str(self.config.config_file),
-            "run",
-            action,
-            "--job-id",
-            f"webui_{user}",
-        ]
+        if action == "filter":
+            cmd = [
+                sys.executable,
+                str(self.config.project_root / "main.py"),
+                "--config",
+                str(self.config.config_file),
+                "run",
+                action,
+                "--job-id",
+                f"webui_{user}",
+            ]
+        else:
+            cmd = [
+                str(
+                    self.config.project_root
+                    / "scripts"
+                    / "run_wb_live_component.sh"
+                ),
+                action,
+                "--job-id",
+                f"webui_{user}",
+            ]
 
         try:
             proc = subprocess.Popen(
@@ -244,4 +256,3 @@ class WebUIServices:
             return path.resolve().relative_to(self.config.project_root).as_posix()
         except ValueError:
             return str(path)
-

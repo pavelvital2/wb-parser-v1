@@ -150,6 +150,12 @@ def _make_engine(tmp_path: Path, run_id: str = "20260307_120000Z") -> SerpEngine
     return SerpEngine(config=cfg, db=db, ctx=ctx)
 
 
+def _enable_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_LOADED", "1")
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_SHA256", "a" * 64)
+    monkeypatch.setenv("PARSER_WB_PROXY_URL", "http://proxy.local:3128")
+
+
 def test_write_raw_response_uses_run_and_query_slug(tmp_path: Path) -> None:
     engine = _make_engine(tmp_path)
     rel = engine._write_raw_response("шеврон мвд", 3, b'{"products":[]}')
@@ -194,9 +200,12 @@ def test_fetch_page_falls_back_after_retryable_http_status(tmp_path: Path) -> No
     assert engine._active_base_url_index == 1
 
 
-def test_build_session_uses_configured_proxy(tmp_path: Path) -> None:
+def test_build_session_uses_configured_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_proxy(monkeypatch)
     engine = _make_engine(tmp_path)
-    engine.proxy_url = "http://proxy.local:3128"
 
     session = engine._build_session("cookie=1")
 
@@ -209,7 +218,11 @@ def test_build_session_uses_configured_proxy(tmp_path: Path) -> None:
         session.close()
 
 
-def test_build_session_merges_configured_request_headers_without_overriding_cookie(tmp_path: Path) -> None:
+def test_build_session_merges_configured_request_headers_without_overriding_cookie(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_proxy(monkeypatch)
     engine = _make_engine(tmp_path)
     engine.request_headers = {
         "authorization": "Bearer token",
@@ -227,7 +240,11 @@ def test_build_session_merges_configured_request_headers_without_overriding_cook
         session.close()
 
 
-def test_build_session_omits_empty_cookie_header(tmp_path: Path) -> None:
+def test_build_session_omits_empty_cookie_header(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_proxy(monkeypatch)
     engine = _make_engine(tmp_path)
     engine.request_headers = {"authorization": "Bearer token"}
 

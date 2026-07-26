@@ -10,10 +10,20 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote
 
 import requests
 import yaml
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.common.proxy_required import (
+    build_requests_session,
+    proxy_route_from_url,
+    require_marketplace_proxy,
+)
 
 
 EXIT_OK = 0
@@ -21,7 +31,6 @@ EXIT_SMOKE_FAILED = 20
 EXIT_REFRESH_FAILED = 21
 
 OK_KINDS = {"top_products", "nested_products", "nested_promo_products"}
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def utc_now_iso() -> str:
@@ -81,19 +90,11 @@ def resolve_serp_base_urls(config: dict[str, Any]) -> list[str]:
 
 
 def resolve_proxy_url(config: dict[str, Any]) -> str:
-    serp = config.get("serp") if isinstance(config.get("serp"), dict) else {}
-    env_name = str(serp.get("proxy_url_env") or "PARSER_WB_PROXY_URL").strip()
-    if env_name:
-        env_value = os.getenv(env_name, "").strip()
-        if env_value:
-            return env_value
-    return str(serp.get("proxy_url") or "").strip()
+    return require_marketplace_proxy(config).url
 
 
-def requests_proxies(proxy_url: str) -> dict[str, str] | None:
-    if not proxy_url:
-        return None
-    return {"http": proxy_url, "https": proxy_url}
+def requests_proxies(proxy_url: str) -> dict[str, str]:
+    return proxy_route_from_url(proxy_url).requests_proxies
 
 
 def _coerce_request_headers(raw_headers: Any) -> dict[str, str]:
@@ -134,27 +135,17 @@ def request_headers_from_config(config: dict[str, Any]) -> dict[str, str]:
     return _coerce_request_headers(serp.get("request_headers"))
 
 
-def playwright_proxy_config(proxy_url: str) -> dict[str, str] | None:
-    if not proxy_url:
-        return None
+def playwright_proxy_config(proxy_url: str) -> dict[str, str]:
+    return proxy_route_from_url(proxy_url, browser=True).playwright_proxy()
 
-    parsed = urlsplit(proxy_url)
-    if not parsed.scheme or not parsed.hostname:
-        return {"server": proxy_url}
 
-    host = parsed.hostname
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    server = f"{parsed.scheme}://{host}"
-    if parsed.port:
-        server = f"{server}:{parsed.port}"
-
-    proxy: dict[str, str] = {"server": server}
-    if parsed.username:
-        proxy["username"] = unquote(parsed.username)
-    if parsed.password:
-        proxy["password"] = unquote(parsed.password)
-    return proxy
+def marketplace_get(
+    config: dict[str, Any],
+    url: str,
+    **kwargs: Any,
+) -> requests.Response:
+    with build_requests_session(require_marketplace_proxy(config)) as session:
+        return session.get(url, **kwargs)
 
 
 def resolve_smoke_min_successes(config: dict[str, Any], args: argparse.Namespace, total_queries: int) -> int:
@@ -271,6 +262,9 @@ def write_state(path_value: str, data: dict[str, Any]) -> None:
 
 
 def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True) -> bool:
+    # Validate the marketplace route once, outside the per-endpoint error
+    # handling, so a missing proxy cannot be mistaken for a failed smoke.
+    require_marketplace_proxy(config)
     serp = config.get("serp") if isinstance(config.get("serp"), dict) else {}
     cookie_path = resolve_cookie_path(config, args.cookie_file)
     cookie_value = read_cookie_value_for_smoke(config, args, cookie_path)
@@ -290,8 +284,6 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
     referer_base = str(serp.get("referer_base") or "https://www.wildberries.ru/catalog/0/search.aspx?search=")
     request_params = serp.get("request_params") if isinstance(serp.get("request_params"), dict) else {}
     timeout = int(config.get("runtime", {}).get("http_timeout_seconds", 45))
-    proxies = requests_proxies(resolve_proxy_url(config))
-
     results: list[dict[str, Any]] = []
     successes = 0
     for query in queries:
@@ -311,7 +303,13 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
                 "checked_at_utc": utc_now_iso(),
             }
             try:
-                response = requests.get(base_url, params=params, headers=req_headers, timeout=timeout, proxies=proxies)
+                response = marketplace_get(
+                    config,
+                    base_url,
+                    params=params,
+                    headers=req_headers,
+                    timeout=timeout,
+                )
                 result["http_status"] = response.status_code
                 if response.status_code != 200:
                     result["kind"] = "http_error"
@@ -323,7 +321,7 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
                     except Exception as exc:
                         result["kind"] = "json_decode_failed"
                         result["products_count"] = 0
-                        result["sample"] = str(exc)
+                        result["sample"] = exc.__class__.__name__
                     else:
                         kind, count, sample = classify_payload(payload)
                         result["kind"] = kind
@@ -336,7 +334,7 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
                 result["http_status"] = 0
                 result["kind"] = "request_failed"
                 result["products_count"] = 0
-                result["sample"] = f"{exc.__class__.__name__}: {exc}"
+                result["sample"] = exc.__class__.__name__
 
         if query_ok:
             successes += 1
@@ -384,6 +382,7 @@ def html_access_smoke(config: dict[str, Any], args: argparse.Namespace, cookie_p
     serp = config.get("serp") if isinstance(config.get("serp"), dict) else {}
     if serp.get("refresh_html_smoke_enabled") is False:
         return True
+    require_marketplace_proxy(config)
 
     query = load_queries(config, getattr(args, "query", ""), 1)[0]
     url_template = str(
@@ -399,17 +398,20 @@ def html_access_smoke(config: dict[str, Any], args: argparse.Namespace, cookie_p
     headers.update(request_headers_from_config(config))
     headers["cookie"] = cookie_value
     try:
-        response = requests.get(
+        response = marketplace_get(
+            config,
             url,
             headers=headers,
             timeout=timeout,
-            proxies=requests_proxies(resolve_proxy_url(config)),
             allow_redirects=True,
         )
         text = response.text[:5000]
     except Exception as exc:
         if emit:
-            print(f"html_smoke failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+            print(
+                f"html_smoke failed: {exc.__class__.__name__}",
+                file=sys.stderr,
+            )
         return False
 
     antibot = (
@@ -439,7 +441,10 @@ def refresh(config: dict[str, Any], args: argparse.Namespace) -> bool:
     storage_state_out = resolve_path(args.storage_state_out or str(storage_state))
     suggest = config.get("suggest") if isinstance(config.get("suggest"), dict) else {}
     browser_channel = args.browser_channel or str(suggest.get("browser_channel") or "chrome")
-    proxy_config = playwright_proxy_config(resolve_proxy_url(config))
+    proxy_config = require_marketplace_proxy(
+        config,
+        browser=True,
+    ).playwright_proxy()
     headless = not bool(args.no_headless)
     if args.headed:
         headless = False
@@ -459,8 +464,7 @@ def refresh(config: dict[str, Any], args: argparse.Namespace) -> bool:
             launch_kwargs: dict[str, Any] = {"headless": headless}
             if browser_channel:
                 launch_kwargs["channel"] = browser_channel
-            if proxy_config:
-                launch_kwargs["proxy"] = proxy_config
+            launch_kwargs["proxy"] = proxy_config
             browser = p.chromium.launch(**launch_kwargs)
             context = browser.new_context(**context_kwargs)
             page = context.new_page()
@@ -472,7 +476,7 @@ def refresh(config: dict[str, Any], args: argparse.Namespace) -> bool:
             context.close()
             browser.close()
     except Exception as exc:
-        print(f"refresh failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+        print(f"refresh failed: {exc.__class__.__name__}", file=sys.stderr)
         return False
 
     cookie_pairs: OrderedDict[str, str] = OrderedDict()

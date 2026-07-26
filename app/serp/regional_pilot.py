@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import re
 import stat
 import subprocess
+import time as time_module
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from app.common.config import AppConfig
+from app.common.proxy_required import (
+    assert_requests_session_proxy,
+    require_marketplace_proxy,
+    require_runtime_env_loaded,
+)
 from app.serp.collection_plan import (
     CollectionPlanBundle,
     ResolvedDestination,
@@ -21,6 +29,7 @@ from app.serp.collection_plan import (
 )
 from app.serp.collection_plan_runner import (
     COLLECTION_SCOPE,
+    FINALIZATION_RESERVE_SECONDS,
     REGION_STATE_SCHEMA_VERSION,
     CollectionPlanRunError,
     CollectionPlanRunner,
@@ -49,10 +58,18 @@ CONTROL_SCHEMA_VERSION = "wb_regional_pilot_control_v1"
 COMPARISON_SCHEMA_VERSION = "wb_regional_comparison_v1"
 REQUEST_BUDGET_SCHEMA_VERSION = "wb_regional_request_budget_v1"
 PROTECTED_EVIDENCE_SCHEMA_VERSION = "wb_protected_evidence_v1"
+CONTOUR_EVIDENCE_SCHEMA_VERSION = "wb_pilot_contour_v1"
+PACING_EVIDENCE_SCHEMA_VERSION = "wb_pilot_search_pacing_v1"
+RATE_LIMIT_EVIDENCE_SCHEMA_VERSION = "wb_pilot_rate_limit_v1"
 CONTROL_JACCARD_THRESHOLD = 0.95
 PILOT_QUERY_IDS = ("shevron", "shevrony", "shevron-na-lipuchke")
 PILOT_REGION_IDS = ("moscow", "rostov-on-don")
 PILOT_EGRESS_CHECKS = 4
+PILOT_MINIMUM_START_WINDOW_SECONDS = 20 * 60
+PILOT_HARD_RUNTIME_SECONDS = 18 * 60
+PILOT_SEARCH_MIN_INTERVAL_SECONDS = 17.0
+PILOT_SEARCH_MAX_JITTER_SECONDS = 2.0
+PILOT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 45
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z0-9_]{1,100}$")
 
 PROTECTED_RELATIVE_PATHS = (
@@ -150,6 +167,289 @@ class PilotRequestBudget:
             if self.total_used <= self.total_limit
             else "exceeded",
         }
+
+
+@dataclass(slots=True)
+class PilotRuntimeGuard:
+    wall_deadline_utc: datetime
+    wall_now: Callable[[], datetime]
+    monotonic: Callable[[], float]
+    started_monotonic: float
+    hard_runtime_seconds: float = PILOT_HARD_RUNTIME_SECONDS
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        wall_deadline_utc: datetime,
+        wall_now: Callable[[], datetime],
+        monotonic: Callable[[], float],
+    ) -> "PilotRuntimeGuard":
+        guard = cls(
+            wall_deadline_utc=wall_deadline_utc,
+            wall_now=wall_now,
+            monotonic=monotonic,
+            started_monotonic=monotonic(),
+        )
+        if guard.wall_remaining_seconds() < PILOT_MINIMUM_START_WINDOW_SECONDS:
+            raise CollectionPlanRunError(
+                "guarded pilot requires 20 minutes before 23:45 MSK"
+            )
+        return guard
+
+    def wall_remaining_seconds(self) -> float:
+        current = self.wall_now()
+        if current.tzinfo is None:
+            raise CollectionPlanRunError("pilot wall clock must be timezone-aware")
+        return (
+            self.wall_deadline_utc
+            - current.astimezone(timezone.utc)
+        ).total_seconds()
+
+    def runtime_remaining_seconds(self) -> float:
+        elapsed = self.monotonic() - self.started_monotonic
+        if elapsed < 0:
+            raise CollectionPlanRunError("pilot monotonic clock moved backwards")
+        return self.hard_runtime_seconds - elapsed
+
+    def available_seconds(self) -> float:
+        return min(
+            self.wall_remaining_seconds(),
+            self.runtime_remaining_seconds(),
+        )
+
+    def ensure_can_wait(self, seconds: float, *, reserve_seconds: float) -> None:
+        if (
+            not isinstance(seconds, (int, float))
+            or isinstance(seconds, bool)
+            or seconds < 0
+        ):
+            raise CollectionPlanRunError("pilot wait interval is invalid")
+        if self.available_seconds() <= float(seconds) + float(reserve_seconds):
+            raise CollectionPlanRunError("pilot deadline reached before wait")
+
+    def request_timeout(self, configured_timeout: float) -> float:
+        available = self.available_seconds() - FINALIZATION_RESERVE_SECONDS
+        if available <= 0.1:
+            raise CollectionPlanRunError("pilot hard runtime reached before HTTP")
+        return min(float(configured_timeout), available)
+
+
+@dataclass(slots=True)
+class PilotSearchPacer:
+    runtime_guard: PilotRuntimeGuard
+    monotonic: Callable[[], float]
+    sleeper: Callable[[float], None]
+    jitter: Callable[[], float]
+    last_attempt_monotonic: float | None = None
+    blocked: bool = False
+    events: list[dict[str, Any]] = field(default_factory=list)
+
+    def before_attempt(
+        self,
+        *,
+        phase: str,
+        endpoint_id: str,
+        region_id: str,
+        query_id: str,
+        page: int,
+        request_timeout_seconds: float,
+    ) -> None:
+        if self.blocked:
+            raise CollectionPlanRunError(
+                "pilot search attempts are blocked after rate limit"
+            )
+        now_value = self.monotonic()
+        wait_seconds = 0.0
+        jitter_seconds = 0.0
+        required_interval = 0.0
+        if self.last_attempt_monotonic is not None:
+            raw_jitter = self.jitter()
+            if (
+                isinstance(raw_jitter, bool)
+                or not isinstance(raw_jitter, (int, float))
+                or not 0.0 <= float(raw_jitter) <= PILOT_SEARCH_MAX_JITTER_SECONDS
+            ):
+                raise CollectionPlanRunError("pilot search jitter is invalid")
+            jitter_seconds = float(raw_jitter)
+            required_interval = (
+                PILOT_SEARCH_MIN_INTERVAL_SECONDS + jitter_seconds
+            )
+            elapsed = now_value - self.last_attempt_monotonic
+            if elapsed < 0:
+                raise CollectionPlanRunError(
+                    "pilot search monotonic clock moved backwards"
+                )
+            wait_seconds = max(0.0, required_interval - elapsed)
+            self.runtime_guard.ensure_can_wait(
+                wait_seconds,
+                reserve_seconds=(
+                    float(request_timeout_seconds)
+                    + FINALIZATION_RESERVE_SECONDS
+                ),
+            )
+            if wait_seconds > 0:
+                self.sleeper(wait_seconds)
+            actual_interval = (
+                self.monotonic() - self.last_attempt_monotonic
+            )
+            if actual_interval + 1e-6 < required_interval:
+                raise CollectionPlanRunError(
+                    "pilot search pacing interval was not satisfied"
+                )
+        else:
+            actual_interval = None
+
+        self.runtime_guard.request_timeout(request_timeout_seconds)
+        self.last_attempt_monotonic = self.monotonic()
+        self.events.append(
+            {
+                "sequence": len(self.events) + 1,
+                "phase": phase,
+                "endpoint_id": endpoint_id,
+                "region_id": region_id,
+                "query_id": query_id,
+                "page": page,
+                "required_interval_seconds": round(required_interval, 6),
+                "jitter_seconds": round(jitter_seconds, 6),
+                "sleep_seconds": round(wait_seconds, 6),
+                "actual_interval_seconds": (
+                    round(float(actual_interval), 6)
+                    if actual_interval is not None
+                    else None
+                ),
+            }
+        )
+
+    def block(self) -> None:
+        self.blocked = True
+
+    def artifact(self) -> dict[str, Any]:
+        return {
+            "schema_version": PACING_EVIDENCE_SCHEMA_VERSION,
+            "status": "blocked" if self.blocked else "active",
+            "minimum_interval_seconds": PILOT_SEARCH_MIN_INTERVAL_SECONDS,
+            "maximum_jitter_seconds": PILOT_SEARCH_MAX_JITTER_SECONDS,
+            "attempts": self.events,
+        }
+
+
+def _strict_bool_env(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise CollectionPlanRunError("pilot cookie-required env is invalid")
+
+
+def build_pilot_contour_evidence(
+    *,
+    config: AppConfig,
+    bundle: CollectionPlanBundle,
+    transport: ScopedTransport,
+) -> dict[str, Any]:
+    runtime_sha256 = require_runtime_env_loaded()
+    route = require_marketplace_proxy(config.raw)
+    serp = config.raw.get("serp", {})
+    if not isinstance(serp, Mapping):
+        raise CollectionPlanRunError("pilot SERP config is invalid")
+
+    headers_env_name = str(
+        serp.get("request_headers_file_env")
+        or "PARSER_WB_REQUEST_HEADERS_FILE"
+    ).strip()
+    headers_env_value = os.getenv(headers_env_name, "")
+    headers_path = config.runtime_request_headers_file
+    if (
+        not headers_env_value.strip()
+        or headers_path is None
+        or config.runtime_request_headers_sha256 is None
+        or config.runtime_request_headers_count <= 0
+    ):
+        raise CollectionPlanRunError("pilot request headers contour is unavailable")
+    expected_headers_path = Path(headers_env_value)
+    if not expected_headers_path.is_absolute():
+        expected_headers_path = config.project_root / expected_headers_path
+    try:
+        expected_relative = expected_headers_path.relative_to(config.project_root)
+        configured_relative = headers_path.relative_to(config.project_root)
+    except ValueError as exc:
+        raise CollectionPlanRunError(
+            "pilot request headers source is outside project"
+        ) from exc
+    if expected_relative != configured_relative:
+        raise CollectionPlanRunError("pilot request headers source mismatch")
+    if headers_path.is_symlink() or not headers_path.is_file():
+        raise CollectionPlanRunError("pilot request headers source is unsafe")
+    current_headers_sha256 = hashlib.sha256(headers_path.read_bytes()).hexdigest()
+    if current_headers_sha256 != config.runtime_request_headers_sha256:
+        raise CollectionPlanRunError(
+            "pilot request headers changed after config load"
+        )
+
+    cookie_required_env_name = str(
+        serp.get("cookie_required_env") or "PARSER_WB_COOKIE_REQUIRED"
+    ).strip()
+    if cookie_required_env_name not in os.environ:
+        raise CollectionPlanRunError("pilot cookie-required env is missing")
+    cookie_required = _strict_bool_env(os.environ[cookie_required_env_name])
+    if bundle.collection_plan.proxy_rotation_mode != "disabled":
+        raise CollectionPlanRunError("pilot proxy rotation is not disabled")
+
+    if isinstance(transport, RequestsScopedTransport):
+        assert_requests_session_proxy(transport.session, route)
+        if transport.egress_session is not transport.session:
+            raise CollectionPlanRunError(
+                "pilot transport must use one requests session"
+            )
+        proxy_applied = True
+        session_count = 1
+        transport_route_sha256 = transport.proxy_route_sha256
+    else:
+        proxy_applied = getattr(transport, "proxy_applied", None) is True
+        session_count = getattr(transport, "proxy_session_count", None)
+        transport_route_sha256 = getattr(
+            transport,
+            "proxy_route_sha256",
+            None,
+        )
+    if (
+        not proxy_applied
+        or session_count != 1
+        or transport_route_sha256 != route.sha256
+    ):
+        raise CollectionPlanRunError("pilot transport proxy contour mismatch")
+
+    return {
+        "schema_version": CONTOUR_EVIDENCE_SCHEMA_VERSION,
+        "status": "ready",
+        "runtime_env": {
+            "loaded": True,
+            "sha256": runtime_sha256,
+        },
+        "proxy": {
+            "configured": True,
+            "valid": True,
+            "applied": True,
+            "single_session": True,
+            "route_sha256": route.sha256,
+        },
+        "request_headers": {
+            "configured": True,
+            "readable": True,
+            "loaded": True,
+            "count": config.runtime_request_headers_count,
+            "source_sha256": current_headers_sha256,
+        },
+        "cookie_required": {
+            "explicit": True,
+            "value_is_required": cookie_required,
+        },
+        "rotation": {
+            "enabled": False,
+        },
+    }
 
 
 def _default_crontab_reader() -> bytes | None:
@@ -454,6 +754,25 @@ class ReusableProbePage:
     result: ScopedSearchResult
 
 
+class PilotRateLimitError(CollectionPlanRunError):
+    def __init__(
+        self,
+        *,
+        phase: str,
+        http_status: int,
+        retry_after_status: str | None,
+        retry_after_seconds: int | None,
+        endpoint_evidence: dict[str, Any] | None = None,
+    ) -> None:
+        self.code = f"pilot_rate_limit_http_{http_status}"
+        super().__init__(self.code)
+        self.phase = phase
+        self.http_status = http_status
+        self.retry_after_status = retry_after_status or "missing"
+        self.retry_after_seconds = retry_after_seconds
+        self.endpoint_evidence = endpoint_evidence
+
+
 class GuardedRegionalPilotRunner(CollectionPlanRunner):
     def __init__(
         self,
@@ -465,6 +784,12 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
         guarded_pilot: bool,
         request_budget: PilotRequestBudget | None = None,
         protected_auditor: ProtectedStateAuditor | None = None,
+        monotonic: Callable[[], float] = time_module.monotonic,
+        sleeper: Callable[[float], None] = time_module.sleep,
+        jitter: Callable[[], float] = lambda: random.uniform(
+            0.0,
+            PILOT_SEARCH_MAX_JITTER_SECONDS,
+        ),
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -479,6 +804,51 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
         self.request_budget = request_budget or PilotRequestBudget()
         self.protected_auditor = protected_auditor or ProtectedStateAuditor(
             project_root=config.project_root
+        )
+        self.runtime_guard = PilotRuntimeGuard.build(
+            wall_deadline_utc=self.deadline.deadline_utc,
+            wall_now=self.now,
+            monotonic=monotonic,
+        )
+        self.sleeper = sleeper
+        self.search_pacer = PilotSearchPacer(
+            runtime_guard=self.runtime_guard,
+            monotonic=monotonic,
+            sleeper=sleeper,
+            jitter=jitter,
+        )
+
+    def _network_timeout(self) -> float:
+        return min(
+            self.deadline.request_timeout(
+                self.config.runtime.http_timeout_seconds
+            ),
+            self.runtime_guard.request_timeout(
+                self.config.runtime.http_timeout_seconds
+            ),
+        )
+
+    def _check_egress(self, expected: str | None = None) -> str:
+        self.runtime_guard.request_timeout(
+            self.config.runtime.http_timeout_seconds
+        )
+        return super()._check_egress(expected)
+
+    def _write(
+        self,
+        path: Path,
+        payload: bytes,
+        *,
+        final_manifest: bool = False,
+    ) -> None:
+        self.runtime_guard.ensure_can_wait(
+            0.0,
+            reserve_seconds=FINALIZATION_RESERVE_SECONDS,
+        )
+        super()._write(
+            path,
+            payload,
+            final_manifest=final_manifest,
         )
 
     def _validate_pilot_contract(self, bundle: CollectionPlanBundle) -> None:
@@ -498,14 +868,40 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
     ) -> dict[str, ResolvedDestination]:
         resolved: dict[str, ResolvedDestination] = {}
         for region in bundle.enabled_regions:
-            timeout_seconds = self.deadline.request_timeout(
-                self.config.runtime.http_timeout_seconds
-            )
+            timeout_seconds = self._network_timeout()
             self.request_budget.reserve("geo")
-            dest_id = self.transport.resolve_destination(
-                region,
-                timeout_seconds=timeout_seconds,
-            )
+            try:
+                dest_id = self.transport.resolve_destination(
+                    region,
+                    timeout_seconds=timeout_seconds,
+                )
+            except ScopedTransportError as exc:
+                if type(exc.http_status) is int and exc.http_status in {
+                    429,
+                    498,
+                }:
+                    retry_after_status = (
+                        exc.retry_after_status
+                        if exc.retry_after_status
+                        in {"missing", "valid", "invalid", "out_of_range"}
+                        else "missing"
+                    )
+                    retry_after_seconds = (
+                        exc.retry_after_seconds
+                        if (
+                            retry_after_status == "valid"
+                            and type(exc.retry_after_seconds) is int
+                            and 1 <= exc.retry_after_seconds <= 120
+                        )
+                        else None
+                    )
+                    raise PilotRateLimitError(
+                        phase="geo_resolver",
+                        http_status=exc.http_status,
+                        retry_after_status=retry_after_status,
+                        retry_after_seconds=retry_after_seconds,
+                    ) from exc
+                raise
             if not isinstance(dest_id, str):
                 raise CollectionPlanRunError(
                     f"resolver returned invalid dest for {region.region_id}"
@@ -545,15 +941,21 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
         pinned_endpoint_id: str | None = None
         reusable_page: ReusableProbePage | None = None
         for endpoint_id in self.transport.endpoint_policy.endpoint_ids[:2]:
-            timeout_seconds = self.deadline.request_timeout(
-                self.config.runtime.http_timeout_seconds
-            )
+            timeout_seconds = self._network_timeout()
             self.request_budget.reserve("endpoint_probe")
             request = ScopedSearchRequest(
                 task=base_request.task,
                 dest_id_observed=base_request.dest_id_observed,
                 endpoint_id=endpoint_id,
                 params=base_request.params,
+            )
+            self.search_pacer.before_attempt(
+                phase="endpoint_probe",
+                endpoint_id=endpoint_id,
+                region_id=first_task.region_id,
+                query_id=first_task.query_id,
+                page=first_task.page,
+                request_timeout_seconds=timeout_seconds,
             )
             result = self.transport.probe_endpoint(
                 request,
@@ -622,6 +1024,44 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                     ),
                 }
             )
+            if type(result.http_status) is int and result.http_status in {
+                429,
+                498,
+            }:
+                retry_after_status = (
+                    result.retry_after_status
+                    if result.retry_after_status
+                    in {"missing", "valid", "invalid", "out_of_range"}
+                    else "invalid"
+                )
+                retry_after_seconds = (
+                    result.retry_after_seconds
+                    if (
+                        retry_after_status == "valid"
+                        and type(result.retry_after_seconds) is int
+                        and 1 <= result.retry_after_seconds <= 120
+                    )
+                    else None
+                )
+                evidence = {
+                    "schema_version": ENDPOINT_EVIDENCE_SCHEMA_VERSION,
+                    "status": "failed",
+                    "attempts": attempts,
+                    "pinned_endpoint_id": None,
+                    "reuse": {
+                        "reused_as_first_page": False,
+                        "region_id": None,
+                        "query_id": None,
+                        "page": None,
+                    },
+                }
+                raise PilotRateLimitError(
+                    phase="endpoint_probe",
+                    http_status=result.http_status,
+                    retry_after_status=retry_after_status,
+                    retry_after_seconds=retry_after_seconds,
+                    endpoint_evidence=evidence,
+                )
             if suitable:
                 self.transport.pin_endpoint(endpoint_id)
                 pinned_endpoint_id = endpoint_id
@@ -776,9 +1216,7 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 task=task,
                 dest_id=resolution.dest_id_observed,
             )
-            timeout_seconds = self.deadline.request_timeout(
-                self.config.runtime.http_timeout_seconds
-            )
+            timeout_seconds = self._network_timeout()
             try:
                 if reusable_first_page is not None and not reusable_consumed:
                     if not self._same_search_request(
@@ -792,6 +1230,14 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                     reusable_consumed = True
                 else:
                     self.request_budget.reserve("regional_search")
+                    self.search_pacer.before_attempt(
+                        phase="regional_search",
+                        endpoint_id=request.endpoint_id,
+                        region_id=task.region_id,
+                        query_id=task.query_id,
+                        page=task.page,
+                        request_timeout_seconds=timeout_seconds,
+                    )
                     result = self.transport.search(
                         request,
                         timeout_seconds=timeout_seconds,
@@ -891,10 +1337,16 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
             task=task,
             dest_id=resolution.dest_id_observed,
         )
-        timeout_seconds = self.deadline.request_timeout(
-            self.config.runtime.http_timeout_seconds
-        )
+        timeout_seconds = self._network_timeout()
         self.request_budget.reserve("repeat_search")
+        self.search_pacer.before_attempt(
+            phase="repeat_search",
+            endpoint_id=request.endpoint_id,
+            region_id=task.region_id,
+            query_id=task.query_id,
+            page=task.page,
+            request_timeout_seconds=timeout_seconds,
+        )
         result = self.transport.search(
             request,
             timeout_seconds=timeout_seconds,
@@ -934,6 +1386,99 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
             "status": "eligible" if eligible else "not_eligible",
             **membership,
         }
+
+    @staticmethod
+    def _rate_limit_signal(exc: Exception) -> dict[str, Any] | None:
+        if isinstance(exc, PilotRateLimitError):
+            return {
+                "phase": exc.phase,
+                "http_status": exc.http_status,
+                "retry_after_status": exc.retry_after_status,
+                "retry_after_seconds": exc.retry_after_seconds,
+            }
+        if (
+            isinstance(exc, ScopedTransportError)
+            and type(exc.http_status) is int
+            and exc.http_status in {429, 498}
+        ):
+            retry_after_status = (
+                exc.retry_after_status
+                if exc.retry_after_status
+                in {"missing", "valid", "invalid", "out_of_range"}
+                else "missing"
+            )
+            retry_after_seconds = (
+                exc.retry_after_seconds
+                if (
+                    retry_after_status == "valid"
+                    and type(exc.retry_after_seconds) is int
+                    and 1 <= exc.retry_after_seconds <= 120
+                )
+                else None
+            )
+            return {
+                "phase": "regional_or_repeat_search",
+                "http_status": exc.http_status,
+                "retry_after_status": retry_after_status,
+                "retry_after_seconds": retry_after_seconds,
+            }
+        return None
+
+    def _finalize_rate_limit(
+        self,
+        *,
+        signal: Mapping[str, Any],
+        egress: PilotEgressEvidence,
+    ) -> dict[str, Any]:
+        self.search_pacer.block()
+        retry_after_seconds = signal.get("retry_after_seconds")
+        cooldown_seconds = (
+            int(retry_after_seconds)
+            if type(retry_after_seconds) is int
+            else PILOT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+        )
+        evidence = {
+            "schema_version": RATE_LIMIT_EVIDENCE_SCHEMA_VERSION,
+            "status": "triggered",
+            "http_status": signal["http_status"],
+            "phase": signal["phase"],
+            "retry_after": {
+                "status": signal["retry_after_status"],
+                "seconds": retry_after_seconds,
+            },
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_status": "pending",
+            "failure_final_egress": {
+                "attempted": False,
+                "status": "not_attempted",
+            },
+            "subsequent_wb_calls_allowed": False,
+            "retry_count": 0,
+        }
+        try:
+            self.runtime_guard.ensure_can_wait(
+                cooldown_seconds,
+                reserve_seconds=(
+                    self.config.runtime.http_timeout_seconds
+                    + FINALIZATION_RESERVE_SECONDS
+                ),
+            )
+        except CollectionPlanRunError:
+            evidence["cooldown_status"] = "skipped_deadline"
+            return evidence
+
+        self.sleeper(float(cooldown_seconds))
+        evidence["cooldown_status"] = "completed"
+        evidence["failure_final_egress"]["attempted"] = True
+        try:
+            egress.verify(self)
+        except EgressIdentityChangedError:
+            evidence["failure_final_egress"]["status"] = "changed"
+        except CollectionPlanRunError:
+            evidence["failure_final_egress"]["status"] = "unverified"
+        else:
+            evidence["failure_final_egress"]["status"] = "matched_initial"
+        return evidence
 
     @staticmethod
     def _comparison_artifact(
@@ -1040,6 +1585,10 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
             )
 
             egress = PilotEgressEvidence()
+            contour_evidence: dict[str, Any] = {
+                "schema_version": CONTOUR_EVIDENCE_SCHEMA_VERSION,
+                "status": "not_checked",
+            }
             endpoint_evidence: dict[str, Any] = {
                 "schema_version": ENDPOINT_EVIDENCE_SCHEMA_VERSION,
                 "status": "not_attempted",
@@ -1064,9 +1613,20 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
             totals = {"regions_ok": 0, "pages_ok": 0, "products_ok": 0}
             snapshot_sha256: str | None = None
             control: dict[str, Any] | None = None
+            rate_limit_evidence: dict[str, Any] = {
+                "schema_version": RATE_LIMIT_EVIDENCE_SCHEMA_VERSION,
+                "status": "not_triggered",
+                "subsequent_wb_calls_allowed": True,
+                "retry_count": 0,
+            }
             caught: Exception | None = None
 
             try:
+                contour_evidence = build_pilot_contour_evidence(
+                    config=self.config,
+                    bundle=bundle,
+                    transport=self.transport,
+                )
                 initial_egress = self._check_egress()
                 egress.record_initial(initial_egress)
                 resolved = self._resolve_destinations(bundle)
@@ -1125,15 +1685,47 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 )
                 egress.verify(self)
                 egress.finalize()
+            except PilotRateLimitError as exc:
+                if exc.endpoint_evidence is not None:
+                    endpoint_evidence = exc.endpoint_evidence
+                caught = exc
             except EndpointPreflightFailed as exc:
                 endpoint_evidence = exc.evidence
                 caught = exc
             except Exception as exc:
                 caught = exc
 
+            if contour_evidence["status"] == "not_checked":
+                contour_evidence = {
+                    "schema_version": CONTOUR_EVIDENCE_SCHEMA_VERSION,
+                    "status": "failed",
+                }
+            rate_limit_signal = (
+                self._rate_limit_signal(caught)
+                if caught is not None
+                else None
+            )
+            if rate_limit_signal is not None:
+                rate_limit_evidence = self._finalize_rate_limit(
+                    signal=rate_limit_signal,
+                    egress=egress,
+                )
+
+            self._write(
+                paths.state_run_dir / "contour_preflight.json",
+                _json_bytes(contour_evidence),
+            )
             self._write(
                 paths.state_run_dir / "endpoint_preflight.json",
                 _json_bytes(endpoint_evidence),
+            )
+            self._write(
+                paths.state_run_dir / "search_pacing.json",
+                _json_bytes(self.search_pacer.artifact()),
+            )
+            self._write(
+                paths.state_run_dir / "rate_limit.json",
+                _json_bytes(rate_limit_evidence),
             )
             self._write(
                 paths.state_run_dir / "request_budget.json",
@@ -1216,6 +1808,8 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 and egress.verification_status == "verified_constant"
                 and egress.completed == egress.expected
                 and endpoint_evidence["status"] == "success"
+                and contour_evidence["status"] == "ready"
+                and rate_limit_evidence["status"] == "not_triggered"
                 and snapshot_sha256 is not None
                 and confirmed_source_hashes is not None
             )
@@ -1266,6 +1860,10 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 "finished_at_utc": _utc_iso(self.now()),
                 "deadline_utc": _utc_iso(self.deadline.deadline_utc),
                 "egress": egress.artifact(salt=self.egress_hash_salt),
+                "contour_preflight_path": _relative(
+                    paths.state_run_dir / "contour_preflight.json",
+                    paths.project_root,
+                ),
                 "endpoint_preflight": {
                     "status": endpoint_evidence["status"],
                     "pinned_endpoint_id": endpoint_evidence[
@@ -1278,6 +1876,14 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 },
                 "request_budget_path": _relative(
                     paths.state_run_dir / "request_budget.json",
+                    paths.project_root,
+                ),
+                "search_pacing_path": _relative(
+                    paths.state_run_dir / "search_pacing.json",
+                    paths.project_root,
+                ),
+                "rate_limit_path": _relative(
+                    paths.state_run_dir / "rate_limit.json",
                     paths.project_root,
                 ),
                 "control_path": (

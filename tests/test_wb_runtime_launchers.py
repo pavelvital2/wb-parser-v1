@@ -1,0 +1,326 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PYTHON_BIN = Path("/home/Codex/agent-tools/parser_wb-python/bin/python")
+
+
+def _copy_launcher(tmp_path: Path, launcher_name: str) -> Path:
+    project = tmp_path / "project"
+    scripts = project / "scripts"
+    config = project / "config"
+    scripts.mkdir(parents=True)
+    config.mkdir(parents=True)
+    shutil.copy2(
+        PROJECT_ROOT / "scripts/wb_runtime_env.sh",
+        scripts / "wb_runtime_env.sh",
+    )
+    shutil.copy2(
+        PROJECT_ROOT / f"scripts/{launcher_name}",
+        scripts / launcher_name,
+    )
+    (scripts / launcher_name).chmod(0o755)
+    return project
+
+
+def _write_fake_main(project: Path, capture_path: Path) -> None:
+    (project / "main.py").write_text(
+        "import json, os, sys\n"
+        "payload = {\n"
+        "  'runtime_loaded': os.getenv('PARSER_WB_RUNTIME_ENV_LOADED'),\n"
+        "  'runtime_sha256_present': len(os.getenv('PARSER_WB_RUNTIME_ENV_SHA256', '')) == 64,\n"
+        "  'proxy_present': bool(os.getenv('PARSER_WB_PROXY_URL')),\n"
+        "  'headers_present': bool(os.getenv('PARSER_WB_REQUEST_HEADERS_FILE')),\n"
+        "  'cookie_required_present': 'PARSER_WB_COOKIE_REQUIRED' in os.environ,\n"
+        "  'argv': sys.argv[1:],\n"
+        "}\n"
+        f"open({str(capture_path)!r}, 'w', encoding='utf-8').write(json.dumps(payload))\n",
+        encoding="utf-8",
+    )
+
+
+def _write_fake_keeper(project: Path, capture_path: Path) -> None:
+    (project / "scripts/wb_cookie_keeper.py").write_text(
+        "import json, os, sys\n"
+        "payload = {\n"
+        "  'runtime_loaded': os.getenv('PARSER_WB_RUNTIME_ENV_LOADED'),\n"
+        "  'runtime_sha256_present': len(os.getenv('PARSER_WB_RUNTIME_ENV_SHA256', '')) == 64,\n"
+        "  'argv': sys.argv[1:],\n"
+        "}\n"
+        f"open({str(capture_path)!r}, 'w', encoding='utf-8').write(json.dumps(payload))\n",
+        encoding="utf-8",
+    )
+
+
+def _write_runtime_env(project: Path) -> Path:
+    runtime_env = project / "config/runtime.env"
+    runtime_env.write_text(
+        "PARSER_WB_PROXY_URL=http://proxy.example.test:8080\n"
+        "PARSER_WB_REQUEST_HEADERS_FILE=config/wb_request_headers.json\n"
+        "PARSER_WB_COOKIE_REQUIRED=0\n",
+        encoding="utf-8",
+    )
+    return runtime_env
+
+
+def test_guarded_launcher_sources_runtime_before_python(
+    tmp_path: Path,
+) -> None:
+    project = _copy_launcher(
+        tmp_path,
+        "run_wb_guarded_regional_pilot.sh",
+    )
+    capture = tmp_path / "capture.json"
+    _write_fake_main(project, capture)
+    _write_runtime_env(project)
+
+    result = subprocess.run(
+        [str(project / "scripts/run_wb_guarded_regional_pilot.sh")],
+        cwd=project,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(capture.read_text(encoding="utf-8"))
+    assert payload["runtime_loaded"] == "1"
+    assert payload["runtime_sha256_present"] is True
+    assert payload["proxy_present"] is True
+    assert payload["headers_present"] is True
+    assert payload["cookie_required_present"] is True
+    assert payload["argv"][-2:] == ["--no-publish", "--guarded-pilot"]
+
+
+@pytest.mark.parametrize("runtime_state", ["missing", "symlink", "unreadable"])
+def test_guarded_launcher_rejects_unsafe_runtime_before_python(
+    tmp_path: Path,
+    runtime_state: str,
+) -> None:
+    project = _copy_launcher(
+        tmp_path,
+        "run_wb_guarded_regional_pilot.sh",
+    )
+    capture = tmp_path / "capture.json"
+    _write_fake_main(project, capture)
+    runtime_env = project / "config/runtime.env"
+    if runtime_state == "symlink":
+        target = tmp_path / "external-runtime.env"
+        target.write_text(
+            "PARSER_WB_PROXY_URL=http://proxy.example.test:8080\n",
+            encoding="utf-8",
+        )
+        runtime_env.symlink_to(target)
+    elif runtime_state == "unreadable":
+        runtime_env.write_text(
+            "PARSER_WB_PROXY_URL=http://proxy.example.test:8080\n",
+            encoding="utf-8",
+        )
+        runtime_env.chmod(0)
+
+    result = subprocess.run(
+        [str(project / "scripts/run_wb_guarded_regional_pilot.sh")],
+        cwd=project,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    if runtime_state == "unreadable" and result.returncode == 0:
+        pytest.skip("current user can read mode-000 test files")
+    assert result.returncode != 0
+    assert not capture.exists()
+    assert "proxy.example.test" not in result.stdout + result.stderr
+
+
+def test_live_component_launcher_sources_runtime_and_forwards_target(
+    tmp_path: Path,
+) -> None:
+    project = _copy_launcher(tmp_path, "run_wb_live_component.sh")
+    capture = tmp_path / "capture.json"
+    _write_fake_main(project, capture)
+    _write_runtime_env(project)
+
+    result = subprocess.run(
+        [
+            str(project / "scripts/run_wb_live_component.sh"),
+            "sellers",
+            "--job-id",
+            "test",
+        ],
+        cwd=project,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(capture.read_text(encoding="utf-8"))
+    assert payload["runtime_loaded"] == "1"
+    assert payload["argv"][-4:] == [
+        "run",
+        "sellers",
+        "--job-id",
+        "test",
+    ]
+
+
+def test_access_launcher_sources_runtime_and_forwards_keeper_target(
+    tmp_path: Path,
+) -> None:
+    project = _copy_launcher(tmp_path, "run_wb_access_tool.sh")
+    capture = tmp_path / "capture.json"
+    _write_fake_keeper(project, capture)
+    _write_runtime_env(project)
+
+    result = subprocess.run(
+        [
+            str(project / "scripts/run_wb_access_tool.sh"),
+            "smoke",
+            "--sample-count",
+            "1",
+        ],
+        cwd=project,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(capture.read_text(encoding="utf-8"))
+    assert payload["runtime_loaded"] == "1"
+    assert payload["runtime_sha256_present"] is True
+    assert payload["argv"] == ["smoke", "--sample-count", "1"]
+
+
+def test_all_marketplace_wrappers_use_required_runtime_loader() -> None:
+    wrapper_names = (
+        "run_products_sellers_daily.sh",
+        "run_wb_cookie_renewal.sh",
+        "run_wb_nightly_preflight.sh",
+        "run_wb_persistent_session.sh",
+        "run_wb_persistent_watchdog.sh",
+        "run_wb_guarded_regional_pilot.sh",
+        "run_wb_live_component.sh",
+        "run_wb_access_tool.sh",
+    )
+    for name in wrapper_names:
+        source = (PROJECT_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert 'source "$RUNTIME_LOADER"' in source
+        assert "wb_load_required_runtime_env" in source
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["wb_cookie_keeper.py", "wb_persistent_session.py"],
+)
+def test_real_script_path_bootstraps_project_imports_from_external_cwd(
+    tmp_path: Path,
+    script_name: str,
+) -> None:
+    result = subprocess.run(
+        [
+            str(PYTHON_BIN),
+            str(PROJECT_ROOT / "scripts" / script_name),
+            "--help",
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "ModuleNotFoundError" not in result.stderr
+    assert "No module named 'app'" not in result.stderr
+
+
+def test_real_keeper_launcher_imports_then_fails_closed_before_network(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    scripts = project / "scripts"
+    common = project / "app/common"
+    config = project / "config"
+    scripts.mkdir(parents=True)
+    common.mkdir(parents=True)
+    config.mkdir(parents=True)
+    for relative in (
+        "scripts/wb_runtime_env.sh",
+        "scripts/run_wb_access_tool.sh",
+        "scripts/wb_cookie_keeper.py",
+        "app/__init__.py",
+        "app/common/__init__.py",
+        "app/common/exceptions.py",
+        "app/common/proxy_required.py",
+    ):
+        source = PROJECT_ROOT / relative
+        target = project / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    (scripts / "run_wb_access_tool.sh").chmod(0o755)
+    (config / "runtime.env").write_text(
+        "PARSER_WB_COOKIE_REQUIRED=0\n",
+        encoding="utf-8",
+    )
+    (config / "config.yaml").write_text(
+        "runtime:\n"
+        "  http_timeout_seconds: 1\n"
+        "serp:\n"
+        "  proxy_url_env: PARSER_WB_PROXY_URL\n"
+        "  wb_cookie_file: config/wb_cookie.txt\n"
+        "  base_url: http://127.0.0.1:9/forbidden\n"
+        "  request_params: {}\n",
+        encoding="utf-8",
+    )
+    (config / "wb_cookie.txt").write_text("test_cookie=1\n", encoding="utf-8")
+    network_sentinel = tmp_path / "network-called"
+    hook_dir = tmp_path / "hook"
+    hook_dir.mkdir()
+    (hook_dir / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        "import requests.sessions\n"
+        f"_sentinel = Path({str(network_sentinel)!r})\n"
+        "def _forbidden(*args, **kwargs):\n"
+        "    _sentinel.write_text('called', encoding='utf-8')\n"
+        "    raise AssertionError('network forbidden')\n"
+        "requests.sessions.Session.request = _forbidden\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(hook_dir)
+    env.pop("PARSER_WB_PROXY_URL", None)
+
+    result = subprocess.run(
+        [
+            str(scripts / "run_wb_access_tool.sh"),
+            "smoke",
+            "--config",
+            str(config / "config.yaml"),
+            "--cookie-file",
+            str(config / "wb_cookie.txt"),
+            "--query",
+            "offline-test",
+            "--sample-count",
+            "1",
+        ],
+        cwd=project,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 20
+    assert "MarketplaceProxyError" in result.stderr
+    assert "marketplace_proxy_env_missing" in result.stderr
+    assert "ModuleNotFoundError" not in result.stderr
+    assert not network_sentinel.exists()

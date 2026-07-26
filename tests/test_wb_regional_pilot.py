@@ -16,6 +16,7 @@ import requests
 
 from app.common.cli import build_parser
 from app.common.config import load_config
+from app.common.proxy_required import MarketplaceProxyError
 from app.serp.collection_plan import EffectiveEndpointPolicy
 from app.serp.collection_plan_runner import (
     CollectionPlanRunError,
@@ -28,7 +29,9 @@ from app.serp.collection_plan_runner import (
 from app.serp.regional_pilot import (
     EndpointPreflightFailed,
     GuardedRegionalPilotRunner,
+    PilotRateLimitError,
     PilotRequestBudget,
+    PilotRuntimeGuard,
     ProtectedStateAuditor,
     run_guarded_regional_pilot,
 )
@@ -58,12 +61,20 @@ def _project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (root / "config").mkdir(parents=True)
     shutil.copy2(PROJECT_ROOT / "config/config.yaml", root / "config/config.yaml")
     shutil.copytree(PROJECT_ROOT / "config/wb", root / "config/wb")
-    for name in (
-        "PARSER_WB_REQUEST_HEADERS_FILE",
-        "PARSER_WB_PROXY_URL",
-        "WB_COOKIE_FILE",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    runtime_env = root / "config/runtime.env"
+    runtime_env.write_text("# test runtime\n", encoding="utf-8")
+    headers_path = root / "config/wb_request_headers.json"
+    headers_path.write_text('{"authorization":"test-only"}\n', encoding="utf-8")
+    proxy_url = "http://proxy.example.test:8080"
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_LOADED", "1")
+    monkeypatch.setenv(
+        "PARSER_WB_RUNTIME_ENV_SHA256",
+        hashlib.sha256(runtime_env.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setenv("PARSER_WB_REQUEST_HEADERS_FILE", str(headers_path))
+    monkeypatch.setenv("PARSER_WB_PROXY_URL", proxy_url)
+    monkeypatch.setenv("PARSER_WB_COOKIE_REQUIRED", "0")
+    monkeypatch.delenv("WB_COOKIE_FILE", raising=False)
 
     plan_path = root / PLAN_RELATIVE
     plan = _read_json(plan_path)
@@ -120,6 +131,11 @@ def _usable_probe_result(
 
 class PilotFakeTransport:
     request_params = {"appType": "1", "dest": "-legacy", "curr": "rub"}
+    proxy_applied = True
+    proxy_session_count = 1
+    proxy_route_sha256 = hashlib.sha256(
+        b"http://proxy.example.test:8080"
+    ).hexdigest()
 
     def __init__(
         self,
@@ -137,6 +153,12 @@ class PilotFakeTransport:
         egress_values: list[str] | None = None,
         egress_failure_calls: set[int] | None = None,
         on_search: Callable[[int], None] | None = None,
+        search_failure_call: int | None = None,
+        search_failure_status: int = 429,
+        retry_after_status: str | None = None,
+        retry_after_seconds: int | None = None,
+        resolver_failure_region: str | None = None,
+        resolver_failure_status: int = 429,
     ) -> None:
         self.endpoint_policy = EffectiveEndpointPolicy(
             selection_mode="ordered_fallbacks",
@@ -152,6 +174,12 @@ class PilotFakeTransport:
         self.egress_values = list(egress_values or ["203.0.113.10"] * 4)
         self.egress_failure_calls = set(egress_failure_calls or ())
         self.on_search = on_search
+        self.search_failure_call = search_failure_call
+        self.search_failure_status = search_failure_status
+        self.retry_after_status = retry_after_status
+        self.retry_after_seconds = retry_after_seconds
+        self.resolver_failure_region = resolver_failure_region
+        self.resolver_failure_status = resolver_failure_status
         self.events: list[str] = []
         self.resolve_calls: list[str] = []
         self.probe_calls: list[str] = []
@@ -172,6 +200,13 @@ class PilotFakeTransport:
     def resolve_destination(self, region, *, timeout_seconds: float) -> str:
         self.events.append(f"resolve:{region.region_id}")
         self.resolve_calls.append(region.region_id)
+        if region.region_id == self.resolver_failure_region:
+            raise ScopedTransportError(
+                f"resolver_http_{self.resolver_failure_status}",
+                http_status=self.resolver_failure_status,
+                retry_after_status=self.retry_after_status,
+                retry_after_seconds=self.retry_after_seconds,
+            )
         return {
             "moscow": "-535680",
             "rostov-on-don": "-2228364",
@@ -250,6 +285,15 @@ class PilotFakeTransport:
         )
         if self.on_search is not None:
             self.on_search(call_number)
+        if call_number == self.search_failure_call:
+            raise ScopedTransportError(
+                f"search_http_{self.search_failure_status}",
+                request_sent=True,
+                dest_id_sent=request.dest_id_observed,
+                http_status=self.search_failure_status,
+                retry_after_status=self.retry_after_status,
+                retry_after_seconds=self.retry_after_seconds,
+            )
         if request.endpoint_id != self.endpoint_policy.pinned_endpoint_id:
             raise ScopedTransportError("search_endpoint_not_pinned")
         if (
@@ -274,6 +318,19 @@ class PilotFakeTransport:
         self.closed = True
 
 
+class FakeMonotonicClock:
+    def __init__(self) -> None:
+        self.value = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.value += seconds
+
+
 def _run(
     config,
     plan_path: Path,
@@ -289,6 +346,9 @@ def _run(
             crontab_reader=lambda: b"test-crontab\n",
         ),
     )
+    clock = kwargs.pop("pilot_clock", FakeMonotonicClock())
+    wall_now = kwargs.pop("wall_now", lambda: FIXED_NOW)
+    jitter = kwargs.pop("jitter", lambda: 0.0)
     return run_guarded_regional_pilot(
         config=config,
         plan_path=plan_path,
@@ -296,9 +356,12 @@ def _run(
         guarded_pilot=True,
         transport=transport,
         run_id=RUN_ID,
-        now=lambda: FIXED_NOW,
+        now=wall_now,
         egress_hash_salt=b"test-only-salt",
         protected_auditor=auditor,
+        monotonic=clock.monotonic,
+        sleeper=clock.sleep,
+        jitter=jitter,
         **kwargs,
     )
 
@@ -334,7 +397,14 @@ def test_primary_probe_success_runs_exact_a_b_a_contract(
 
     monkeypatch.setattr(socket, "create_connection", forbidden_network)
     monkeypatch.setattr(requests.sessions.Session, "request", forbidden_network)
-    manifest = _run(config, plan_path, transport, root=root)
+    clock = FakeMonotonicClock()
+    manifest = _run(
+        config,
+        plan_path,
+        transport,
+        root=root,
+        pilot_clock=clock,
+    )
 
     state_dir = _state_dir(root)
     budget = _read_json(state_dir / "request_budget.json")
@@ -343,6 +413,7 @@ def test_primary_probe_success_runs_exact_a_b_a_contract(
     comparison = _read_json(state_dir / "comparison.json")
     snapshot = _read_json(state_dir / "effective_plan.json")
     protected = _read_json(state_dir / "protected_evidence.json")
+    pacing = _read_json(state_dir / "search_pacing.json")
 
     assert manifest["complete"] is True
     assert manifest["totals"] == {
@@ -380,6 +451,16 @@ def test_primary_probe_success_runs_exact_a_b_a_contract(
         "repeat_search": 1,
         "total_wb": 9,
     }
+    assert len(pacing["attempts"]) == 7
+    assert pacing["attempts"][0]["phase"] == "endpoint_probe"
+    assert pacing["attempts"][0]["sleep_seconds"] == 0.0
+    assert pacing["attempts"][1]["phase"] == "regional_search"
+    assert pacing["attempts"][1]["query_id"] == "shevrony"
+    assert all(
+        event["required_interval_seconds"] == 17.0
+        for event in pacing["attempts"][1:]
+    )
+    assert clock.sleeps == [17.0] * 6
     assert manifest["egress"]["verification_status"] == "verified_constant"
     assert manifest["egress"]["constant"] is True
     assert manifest["egress"]["checks_completed"] == 4
@@ -471,6 +552,234 @@ def test_primary_probe_success_runs_exact_a_b_a_contract(
     assert not (root / "data/warehouse").exists()
 
 
+def test_search_pacer_applies_positive_bounded_jitter_to_every_later_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    clock = FakeMonotonicClock()
+
+    _run(
+        config,
+        plan_path,
+        PilotFakeTransport(),
+        root=root,
+        pilot_clock=clock,
+        jitter=lambda: 2.0,
+    )
+
+    pacing = _read_json(_state_dir(root) / "search_pacing.json")
+    assert pacing["attempts"][0]["required_interval_seconds"] == 0.0
+    assert pacing["attempts"][0]["sleep_seconds"] == 0.0
+    assert all(
+        event["required_interval_seconds"] == 19.0
+        and event["jitter_seconds"] == 2.0
+        and event["actual_interval_seconds"] >= 19.0
+        for event in pacing["attempts"][1:]
+    )
+    assert clock.sleeps == [19.0] * 6
+
+
+@pytest.mark.parametrize(
+    ("http_status", "retry_status", "retry_seconds", "expected_cooldown"),
+    [
+        (429, "valid", 17, 17),
+        (498, "invalid", None, 45),
+    ],
+)
+def test_rate_limit_blocks_all_later_wb_calls_and_allows_one_neutral_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    http_status: int,
+    retry_status: str,
+    retry_seconds: int | None,
+    expected_cooldown: int,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    clock = FakeMonotonicClock()
+    transport = PilotFakeTransport(
+        search_failure_call=1,
+        search_failure_status=http_status,
+        retry_after_status=retry_status,
+        retry_after_seconds=retry_seconds,
+    )
+
+    with pytest.raises(ScopedTransportError, match=f"search_http_{http_status}"):
+        _run(
+            config,
+            plan_path,
+            transport,
+            root=root,
+            pilot_clock=clock,
+        )
+
+    state_dir = _state_dir(root)
+    rate_limit = _read_json(state_dir / "rate_limit.json")
+    budget = _read_json(state_dir / "request_budget.json")
+    manifest = _read_json(state_dir / "manifest.json")
+    assert len(transport.probe_calls) == 1
+    assert len(transport.search_calls) == 1
+    assert transport.egress_calls == 2
+    assert rate_limit["status"] == "triggered"
+    assert rate_limit["http_status"] == http_status
+    assert rate_limit["retry_after"] == {
+        "status": retry_status,
+        "seconds": retry_seconds,
+    }
+    assert rate_limit["cooldown_seconds"] == expected_cooldown
+    assert rate_limit["cooldown_status"] == "completed"
+    assert rate_limit["failure_final_egress"] == {
+        "attempted": True,
+        "status": "matched_initial",
+    }
+    assert rate_limit["subsequent_wb_calls_allowed"] is False
+    assert rate_limit["retry_count"] == 0
+    assert budget["used"] == {
+        "geo": 2,
+        "endpoint_probe": 1,
+        "regional_search": 1,
+        "repeat_search": 0,
+        "total_wb": 4,
+    }
+    assert clock.sleeps == [17.0, float(expected_cooldown)]
+    assert manifest["complete"] is False
+
+
+def test_resolver_rate_limit_blocks_second_geo_probe_and_search_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    clock = FakeMonotonicClock()
+    transport = PilotFakeTransport(
+        resolver_failure_region="moscow",
+        resolver_failure_status=429,
+        retry_after_status="valid",
+        retry_after_seconds=5,
+    )
+
+    with pytest.raises(PilotRateLimitError, match="pilot_rate_limit_http_429"):
+        _run(
+            config,
+            plan_path,
+            transport,
+            root=root,
+            pilot_clock=clock,
+        )
+
+    rate_limit = _read_json(_state_dir(root) / "rate_limit.json")
+    assert transport.resolve_calls == ["moscow"]
+    assert transport.probe_calls == []
+    assert transport.search_calls == []
+    assert transport.egress_calls == 2
+    assert rate_limit["phase"] == "geo_resolver"
+    assert rate_limit["retry_after"] == {
+        "status": "valid",
+        "seconds": 5,
+    }
+    assert rate_limit["subsequent_wb_calls_allowed"] is False
+    assert clock.sleeps == [5.0]
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    [
+        "PARSER_WB_RUNTIME_ENV_LOADED",
+        "PARSER_WB_RUNTIME_ENV_SHA256",
+        "PARSER_WB_PROXY_URL",
+        "PARSER_WB_REQUEST_HEADERS_FILE",
+        "PARSER_WB_COOKIE_REQUIRED",
+    ],
+)
+def test_contour_preflight_failure_makes_zero_transport_calls_and_leaks_no_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_name: str,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    transport = PilotFakeTransport()
+    monkeypatch.delenv(missing_name, raising=False)
+
+    with pytest.raises((CollectionPlanRunError, MarketplaceProxyError)):
+        _run(config, plan_path, transport, root=root)
+
+    assert transport.events == []
+    assert transport.egress_calls == 0
+    assert transport.resolve_calls == []
+    assert transport.probe_calls == []
+    assert transport.search_calls == []
+    serialized = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in _state_dir(root).rglob("*.json")
+    )
+    assert "proxy.example.test" not in serialized
+    assert "authorization" not in serialized.lower()
+    assert "test-only" not in serialized
+
+
+def test_request_headers_change_after_config_load_fails_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    headers_path = root / "config/wb_request_headers.json"
+    headers_path.write_text('{"authorization":"changed"}\n', encoding="utf-8")
+    transport = PilotFakeTransport()
+
+    with pytest.raises(
+        CollectionPlanRunError,
+        match="request headers changed after config load",
+    ):
+        _run(config, plan_path, transport, root=root)
+
+    assert transport.events == []
+    assert transport.egress_calls == 0
+    assert transport.resolve_calls == []
+    assert transport.probe_calls == []
+    assert transport.search_calls == []
+
+
+def test_start_gate_requires_twenty_minutes_before_cutoff_without_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    transport = PilotFakeTransport()
+    too_late = datetime(2026, 7, 26, 20, 26, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(CollectionPlanRunError, match="requires 20 minutes"):
+        _run(
+            config,
+            plan_path,
+            transport,
+            root=root,
+            wall_now=lambda: too_late,
+        )
+
+    assert transport.events == []
+    assert not _state_dir(root).exists()
+
+
+def test_hard_runtime_guard_fails_before_late_http_timeout() -> None:
+    clock = FakeMonotonicClock()
+    guard = PilotRuntimeGuard.build(
+        wall_deadline_utc=datetime(
+            2026,
+            7,
+            26,
+            20,
+            45,
+            tzinfo=timezone.utc,
+        ),
+        wall_now=lambda: FIXED_NOW,
+        monotonic=clock.monotonic,
+    )
+    clock.value += 18 * 60
+
+    with pytest.raises(CollectionPlanRunError, match="hard runtime"):
+        guard.request_timeout(45)
+
+
 def test_primary_failure_pins_one_fallback_for_all_searches(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -492,11 +801,19 @@ def test_primary_failure_pins_one_fallback_for_all_searches(
             ),
         }
     )
-    manifest = _run(config, plan_path, transport, root=root)
+    clock = FakeMonotonicClock()
+    manifest = _run(
+        config,
+        plan_path,
+        transport,
+        root=root,
+        pilot_clock=clock,
+    )
 
     endpoint = _read_json(_state_dir(root) / "endpoint_preflight.json")
     budget = _read_json(_state_dir(root) / "request_budget.json")
     snapshot = _read_json(_state_dir(root) / "effective_plan.json")
+    pacing = _read_json(_state_dir(root) / "search_pacing.json")
     assert manifest["complete"] is True
     assert transport.probe_calls == ["primary", "fallback-1"]
     assert transport.pin_calls == ["fallback-1"]
@@ -513,6 +830,17 @@ def test_primary_failure_pins_one_fallback_for_all_searches(
     assert budget["used"]["regional_search"] == 5
     assert budget["used"]["total_wb"] == 10
     assert len(transport.search_calls) == 6
+    assert [event["phase"] for event in pacing["attempts"][:3]] == [
+        "endpoint_probe",
+        "endpoint_probe",
+        "regional_search",
+    ]
+    assert pacing["attempts"][0]["sleep_seconds"] == 0.0
+    assert all(
+        event["actual_interval_seconds"] >= 17.0
+        for event in pacing["attempts"][1:]
+    )
+    assert clock.sleeps == [17.0] * 7
     assert all(
         not (
             call.task.region_id == "moscow"
@@ -538,15 +866,19 @@ def test_both_endpoint_probes_fail_without_regional_search(
         for endpoint_id in ("primary", "fallback-1")
     }
 
-    with pytest.raises(EndpointPreflightFailed):
+    with pytest.raises(PilotRateLimitError):
         _run(config, plan_path, transport, root=root)
 
     endpoint = _read_json(_state_dir(root) / "endpoint_preflight.json")
+    rate_limit = _read_json(_state_dir(root) / "rate_limit.json")
     manifest = _read_json(_state_dir(root) / "manifest.json")
-    assert transport.probe_calls == ["primary", "fallback-1"]
+    assert transport.probe_calls == ["primary"]
     assert transport.search_calls == []
     assert endpoint["status"] == "failed"
     assert endpoint["pinned_endpoint_id"] is None
+    assert rate_limit["status"] == "triggered"
+    assert rate_limit["http_status"] == 498
+    assert rate_limit["retry_count"] == 0
     assert manifest["complete"] is False
 
 
@@ -766,7 +1098,9 @@ def test_repeat_failure_cannot_complete(
     assert manifest["complete"] is False
     assert manifest["egress"]["verification_status"] == "unverified"
     assert manifest["egress"]["constant"] is None
-    assert manifest["egress"]["checks_completed"] == 3
+    assert manifest["egress"]["checks_completed"] == (
+        4 if transport_kwargs.get("repeat_failure") else 3
+    )
     assert not (_state_dir(root) / "control/moscow_repeat.json").exists()
 
 

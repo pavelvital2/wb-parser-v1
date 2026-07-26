@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+import requests
+
 
 def _load_session():
     path = Path(__file__).resolve().parents[1] / "scripts" / "wb_persistent_session.py"
@@ -44,12 +47,23 @@ def test_fetch_public_ip_uses_proxy_without_returning_proxy_secret(monkeypatch) 
         status_code = 200
         text = '{"ip":"203.0.113.20"}'
 
-    def fake_get(url, *, timeout, proxies):
-        calls.append({"url": url, "timeout": timeout, "proxies": proxies})
+    def fake_get(requests_session, url, *, timeout):
+        calls.append(
+            {
+                "url": url,
+                "timeout": timeout,
+                "proxies": dict(requests_session.proxies),
+            }
+        )
         return Response()
 
-    monkeypatch.setattr(session.keeper.requests, "get", fake_get)
-    monkeypatch.setattr(session.keeper, "resolve_proxy_url", lambda _config: "http://user:secret@example.test:8080")
+    monkeypatch.setattr(requests.Session, "get", fake_get)
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_LOADED", "1")
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_SHA256", "a" * 64)
+    monkeypatch.setenv(
+        "PARSER_WB_PROXY_URL",
+        "http://user:test-only@example.test:8080",
+    )
     monkeypatch.setenv("PARSER_WB_PUBLIC_IP_URLS", "https://ip.example.test")
 
     public_ip, error = session.fetch_public_ip({})
@@ -57,12 +71,12 @@ def test_fetch_public_ip_uses_proxy_without_returning_proxy_secret(monkeypatch) 
     assert public_ip == "203.0.113.20"
     assert error == ""
     assert calls[0]["proxies"] == {
-        "http": "http://user:secret@example.test:8080",
-        "https": "http://user:secret@example.test:8080",
+        "http": "http://user:test-only@example.test:8080",
+        "https": "http://user:test-only@example.test:8080",
     }
 
 
-def test_fetch_public_ip_falls_back_to_next_endpoint(monkeypatch) -> None:
+def test_fetch_public_ip_without_proxy_fails_before_endpoint_call(monkeypatch) -> None:
     session = _load_session()
     calls = []
 
@@ -70,18 +84,52 @@ def test_fetch_public_ip_falls_back_to_next_endpoint(monkeypatch) -> None:
         status_code = 200
         text = "203.0.113.30\n"
 
-    def fake_get(url, *, timeout, proxies):
+    def fake_get(_requests_session, url, *, timeout):
         calls.append(url)
-        if len(calls) == 1:
-            raise TimeoutError("first endpoint timed out")
         return Response()
 
     monkeypatch.setenv("PARSER_WB_PUBLIC_IP_URLS", "https://first.example.test,https://second.example.test")
-    monkeypatch.setattr(session.keeper.requests, "get", fake_get)
-    monkeypatch.setattr(session.keeper, "resolve_proxy_url", lambda _config: "")
+    monkeypatch.setattr(requests.Session, "get", fake_get)
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_LOADED", "1")
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_SHA256", "a" * 64)
+    monkeypatch.delenv("PARSER_WB_PROXY_URL", raising=False)
 
-    public_ip, error = session.fetch_public_ip({})
+    with pytest.raises(Exception, match="marketplace_proxy_env_missing"):
+        session.fetch_public_ip({})
 
-    assert public_ip == "203.0.113.30"
-    assert error == ""
-    assert calls == ["https://first.example.test", "https://second.example.test"]
+    assert calls == []
+
+
+def test_persistent_browser_entrypoint_fails_before_playwright_without_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _load_session()
+    monkeypatch.setattr(session.keeper, "load_config", lambda _path: {})
+    monkeypatch.setattr(
+        session.keeper,
+        "load_queries",
+        lambda _config, _query, _count: ["offline-test"],
+    )
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_LOADED", "1")
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_SHA256", "a" * 64)
+    monkeypatch.delenv("PARSER_WB_PROXY_URL", raising=False)
+
+    with pytest.raises(Exception, match="marketplace_proxy_env_missing"):
+        session.main(
+            [
+                "--config",
+                str(tmp_path / "config.yaml"),
+                "--cookie-file",
+                str(tmp_path / "cookie.txt"),
+                "--storage-state",
+                str(tmp_path / "storage.json"),
+                "--profile-dir",
+                str(tmp_path / "profile"),
+                "--state-json",
+                str(tmp_path / "state.json"),
+                "--oneshot",
+            ]
+        )
+
+    assert not (tmp_path / "profile").exists()

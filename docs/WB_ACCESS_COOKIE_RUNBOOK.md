@@ -23,6 +23,9 @@ Windows 3proxy и секретные Opera-derived request headers. Persistent b
 - Не считать browser renewal доказанным автономным способом обновления cookies.
 - Не продвигать новый cookie/header candidate без smoke-проверок.
 - Не трогать Ozon в рамках WB access repair.
+- Не запускать marketplace access через обычный `source runtime.env`: используй
+  tracked launcher, который проверяет exact-byte runtime provenance и применяет
+  proxy к конкретной session/browser context.
 
 ## Рабочий Контур
 
@@ -92,11 +95,7 @@ tail -n 80 data/logs/wb_nightly_preflight.log
 Проверить текущий API/SERP доступ:
 
 ```bash
-set -a
-source config/runtime.env
-set +a
-
-/home/Codex/agent-tools/parser_wb-python/bin/python scripts/wb_cookie_keeper.py smoke \
+scripts/run_wb_access_tool.sh smoke \
   --config config/config.yaml \
   --cookie-file config/wb_cookie.txt \
   --sample-count 3
@@ -105,11 +104,7 @@ set +a
 Проверить fallback без cookie, но с secret API headers:
 
 ```bash
-set -a
-source config/runtime.env
-set +a
-
-/home/Codex/agent-tools/parser_wb-python/bin/python scripts/wb_cookie_keeper.py smoke \
+scripts/run_wb_access_tool.sh smoke \
   --config config/config.yaml \
   --cookie-file config/wb_cookie.txt \
   --sample-count 3 \
@@ -153,6 +148,9 @@ Browser `HTTP 498`, API/SERP smoke ok
 
 WB SERP вызывает local Rotate API только как реакцию на ошибку текущей страницы,
 после штатных retry/fallback. Периодической ротации "на всякий случай" нет.
+Это local/internal control-plane вызов, а не marketplace collection traffic.
+Его текущий маршрут не меняется. Все WB-запросы до и после него обязаны идти
+через явно настроенный proxy; direct fallback запрещен.
 
 Контракт успешной ротации:
 
