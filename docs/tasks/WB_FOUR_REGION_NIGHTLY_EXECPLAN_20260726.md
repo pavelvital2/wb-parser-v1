@@ -101,14 +101,19 @@ whose downstream window expires is continued with an explicit
 A complete four-region generation is converted deterministically into:
 
 - one deduplicated product input keyed by `nmId`, choosing the first row by
-  plan region order, query order and absolute position;
+  plan region order, query order and absolute position that has a non-empty
+  `supplier_id`; if every occurrence is missing a supplier, the first row is
+  retained and counted in `missing_supplier_products`;
 - a full region-query-product-position bridge retaining every actual position
   row, up to the 120000-row capacity;
 - one seller request per unique `supplier_id`, regardless of how many regions
   contain its products.
 
 Seller raw/staging/marts and checkpoints are scoped by plan and run. They do
-not publish legacy seller latest.
+not publish legacy seller latest. Seller selection never filters or rewrites
+the full position bridge. Success and failure preview state expose
+`missing_supplier_products`; it is null when complete seller inputs were not
+available to calculate it.
 
 ### Regional Warehouse
 

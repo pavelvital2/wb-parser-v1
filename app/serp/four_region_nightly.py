@@ -45,6 +45,7 @@ class FourRegionInputs:
     positions_count: int
     unique_products_count: int
     unique_suppliers_count: int
+    missing_supplier_products: int
     duplicate_product_positions: int
     region_counts: Mapping[str, Mapping[str, int]]
 
@@ -157,7 +158,12 @@ def deterministic_seller_rows(
         product_id = row.get("nmId", "")
         if not product_id:
             raise CriticalPipelineError("regional seller input product ID is missing")
-        unique_products.setdefault(product_id, row)
+        selected = unique_products.setdefault(product_id, row)
+        if (
+            not str(selected.get("supplier_id", "")).strip()
+            and str(row.get("supplier_id", "")).strip()
+        ):
+            unique_products[product_id] = row
     return list(unique_products.values())
 
 
@@ -325,10 +331,14 @@ def build_four_region_inputs(
         query_ids=bundle.collection_plan.query_ids,
     )
     unique_suppliers = {
-        row.get("supplier_id", "")
+        str(row.get("supplier_id", "")).strip()
         for row in seller_rows
-        if row.get("supplier_id", "")
+        if str(row.get("supplier_id", "")).strip()
     }
+    missing_supplier_products = sum(
+        not str(row.get("supplier_id", "")).strip()
+        for row in seller_rows
+    )
 
     output_root = (
         config.project_root
@@ -349,6 +359,7 @@ def build_four_region_inputs(
         positions_count=len(rows),
         unique_products_count=len(seller_rows),
         unique_suppliers_count=len(unique_suppliers),
+        missing_supplier_products=missing_supplier_products,
         duplicate_product_positions=sum(
             values["duplicate_product_positions"]
             for values in region_counts.values()
@@ -412,6 +423,7 @@ def write_four_region_failure_preview(
             ),
             "unique_products": 0,
             "unique_suppliers": 0,
+            "missing_supplier_products": None,
             "duplicate_product_positions": int(
                 manifest.get("totals", {}).get(
                     "duplicate_product_positions",
@@ -473,6 +485,7 @@ def run_four_region_downstream(
     )
     state_path = state_dir / "state.json"
     latest_path = state_dir.parent / "latest.json"
+    inputs: FourRegionInputs | None = None
     try:
         with acquire_collection_plan_locks(
             paths=paths,
@@ -557,6 +570,9 @@ def run_four_region_downstream(
                     "positions": inputs.positions_count,
                     "unique_products": inputs.unique_products_count,
                     "unique_suppliers": inputs.unique_suppliers_count,
+                    "missing_supplier_products": (
+                        inputs.missing_supplier_products
+                    ),
                     "duplicate_product_positions": (
                         inputs.duplicate_product_positions
                     ),
@@ -616,6 +632,11 @@ def run_four_region_downstream(
                 "positions": 0,
                 "unique_products": 0,
                 "unique_suppliers": 0,
+                "missing_supplier_products": (
+                    inputs.missing_supplier_products
+                    if inputs is not None
+                    else None
+                ),
                 "duplicate_product_positions": 0,
                 "max_position_capacity": MAX_POSITIONS,
             },

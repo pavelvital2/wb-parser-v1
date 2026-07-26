@@ -582,6 +582,58 @@ def test_deterministic_seller_rows_deduplicate_across_regions() -> None:
     assert len(rows) == 4
 
 
+def test_deterministic_seller_rows_prefers_first_nonempty_supplier() -> None:
+    rows = [
+        {
+            "region_id": "rostov-on-don",
+            "query_id": "q1",
+            "absolute_position": "1",
+            "nmId": "10",
+            "supplier_id": "300",
+        },
+        {
+            "region_id": "moscow",
+            "query_id": "q1",
+            "absolute_position": "1",
+            "nmId": "10",
+            "supplier_id": "",
+        },
+        {
+            "region_id": "moscow",
+            "query_id": "q1",
+            "absolute_position": "2",
+            "nmId": "10",
+            "supplier_id": "100",
+        },
+        {
+            "region_id": "moscow",
+            "query_id": "q2",
+            "absolute_position": "1",
+            "nmId": "20",
+            "supplier_id": "",
+        },
+        {
+            "region_id": "rostov-on-don",
+            "query_id": "q1",
+            "absolute_position": "2",
+            "nmId": "20",
+            "supplier_id": " ",
+        },
+    ]
+    selected = deterministic_seller_rows(
+        rows,
+        region_ids=("moscow", "rostov-on-don"),
+        query_ids=("q1", "q2"),
+    )
+    assert [
+        (row["nmId"], row["region_id"], row["absolute_position"], row["supplier_id"])
+        for row in selected
+    ] == [
+        ("10", "moscow", "2", "100"),
+        ("20", "moscow", "1", ""),
+    ]
+
+
 def test_four_region_inputs_preserve_repeated_position_facts_and_dedup_sellers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -631,7 +683,16 @@ def test_four_region_inputs_preserve_repeated_position_facts_and_dedup_sellers(
                             if query_index == 0
                             else f"{2000 + query_index}"
                         ),
-                        "supplier_id": "5001",
+                        "supplier_id": (
+                            ""
+                            if query_index == 1
+                            or (
+                                query_index == 0
+                                and region.region_id == "moscow"
+                                and position == 1
+                            )
+                            else "5001"
+                        ),
                         "endpoint_id": "primary",
                     }
                 )
@@ -729,6 +790,8 @@ def test_four_region_inputs_preserve_repeated_position_facts_and_dedup_sellers(
     assert inputs.positions_count == total_positions == 124
     assert inputs.duplicate_product_positions == 4
     assert inputs.unique_products_count == 30
+    assert inputs.unique_suppliers_count == 1
+    assert inputs.missing_supplier_products == 1
     bridge_rows = list(
         csv.DictReader(
             inputs.bridge_path.open("r", encoding="utf-8-sig", newline=""),
@@ -743,6 +806,20 @@ def test_four_region_inputs_preserve_repeated_position_facts_and_dedup_sellers(
     ]
     assert [row["absolute_position"] for row in first_query_rows] == ["1", "2"]
     assert len({row["nmId"] for row in first_query_rows}) == 1
+    assert [row["supplier_id"] for row in first_query_rows] == ["", "5001"]
+    seller_rows = list(
+        csv.DictReader(
+            inputs.seller_input_path.open(
+                "r",
+                encoding="utf-8-sig",
+                newline="",
+            ),
+            delimiter=";",
+        )
+    )
+    seller_by_product = {row["nmId"]: row for row in seller_rows}
+    assert seller_by_product["1000"]["supplier_id"] == "5001"
+    assert seller_by_product["2001"]["supplier_id"] == ""
 
 
 def test_legacy_nightly_wrapper_is_byte_identical() -> None:
@@ -809,6 +886,7 @@ def test_launcher_blocks_downstream_for_partial_collection(
     )
     assert state["sellers"]["status"] == "not_run"
     assert state["warehouse"]["status"] == "not_run"
+    assert state["totals"]["missing_supplier_products"] is None
 
 
 def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
@@ -833,6 +911,7 @@ def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
         positions_count=120000,
         unique_products_count=40000,
         unique_suppliers_count=800,
+        missing_supplier_products=7,
         duplicate_product_positions=25,
         region_counts={
             region_id: {"pages": 300, "positions": 30000}
@@ -881,6 +960,7 @@ def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
         "positions": 120000,
         "unique_products": 40000,
         "unique_suppliers": 800,
+        "missing_supplier_products": 7,
         "duplicate_product_positions": 25,
         "max_position_capacity": 120000,
     }
@@ -923,6 +1003,7 @@ def test_downstream_failure_leaves_previous_scoped_latest_unchanged(
         positions_count=120000,
         unique_products_count=1,
         unique_suppliers_count=1,
+        missing_supplier_products=1,
         duplicate_product_positions=0,
         region_counts={
             region_id: {"pages": 300, "positions": 30000}
@@ -966,3 +1047,4 @@ def test_downstream_failure_leaves_previous_scoped_latest_unchanged(
     )
     assert failure["complete"] is False
     assert failure["warehouse"]["status"] == "not_run"
+    assert failure["totals"]["missing_supplier_products"] == 1

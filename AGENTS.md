@@ -468,6 +468,10 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   `daily_run_quality.items_ok` remains a separate metric. Scoped regional
   seller resume must canonicalize one final row per expected supplier, require
   successful checkpoint/output agreement and report full verified-mart totals.
+  For duplicate `nmId` occurrences, seller input chooses the first plan-ordered
+  row with a non-empty `supplier_id`; all-missing products retain their first
+  row and increment `missing_supplier_products`. The position bridge remains
+  unchanged.
   Operational contract:
   `docs/tasks/WB_FOUR_REGION_NIGHTLY_EXECPLAN_20260726.md`.
 - A WB top-20 product-only SERP run on 2026-06-12

@@ -451,6 +451,11 @@ Returned `processed_sellers` and `items_ok` describe the complete verified
 mart, while `invocation_processed_sellers` records only work performed by the
 current invocation.
 
+Before seller collection, each `nmId` selects the first plan-ordered occurrence
+with a non-empty `supplier_id`. When all occurrences lack a supplier, the first
+position is retained and counted in `missing_supplier_products`. This selection
+does not alter the region-query-product-position bridge.
+
 Warehouse ingestion uses a bounded DuckDB runtime in production:
 `memory_limit=1GiB`, `threads=2`, with private mode-`700` spill sessions under
 ignored `data/warehouse/wb_regional/tmp`. Each clean close removes its own
