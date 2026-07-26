@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import csv
-import ctypes
-import errno
 import hashlib
 import json
 import os
@@ -30,6 +28,7 @@ from app.serp.collection_plan import (
 from app.serp.collection_plan_runner import (
     DeadlineGuard,
     PRODUCT_FIELDS,
+    RESUMABLE_MANIFEST_SCHEMA_VERSION,
     ScopedPaths,
     acquire_collection_plan_locks,
 )
@@ -38,6 +37,8 @@ from app.warehouse.wb_regional import ingest_regional_run
 
 FOUR_REGION_PLAN_ID = "shevron-four-regions-top1000-v2"
 FOUR_REGION_IDS = ("moscow", "rostov-on-don", "novosibirsk", "kazan")
+FOUR_REGION_QUERY_PACK_ID = "shevron-core"
+FOUR_REGION_QUERY_PACK_VERSION = "2026-07-26.1"
 EXPECTED_QUERIES = 30
 MAX_PAGES = 1200
 MAX_POSITIONS = 120000
@@ -57,6 +58,14 @@ REVIEWED_FOUR_REGION_RUNTIME_WINDOW = CollectionRuntimeWindow(
 )
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 _STATE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_RFC3339_UTC_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)$"
+)
+DOWNSTREAM_LINEAGE_SCHEMA = "wb_four_region_lineage_v1"
+DOWNSTREAM_LATEST_SCHEMA = "wb_four_region_latest_v1"
 _ATTEMPT_STAGES = frozenset(
     {
         "collection",
@@ -70,9 +79,14 @@ _ATTEMPT_STAGES = frozenset(
     }
 )
 _ATTEMPT_LOCK_OWNERSHIP = frozenset({"not_acquired", "acquired"})
-_AT_FDCWD = -100
-_RENAME_NOREPLACE = 1
-_RENAME_EXCHANGE = 2
+_DOWNSTREAM_STAGE_ORDER = {
+    "state_transition": 0,
+    "input_build": 1,
+    "sellers": 2,
+    "warehouse": 3,
+    "state_publication": 4,
+    "complete": 5,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +102,7 @@ class FourRegionInputs:
     missing_supplier_products: int
     duplicate_product_positions: int
     region_counts: Mapping[str, Mapping[str, int]]
+    collection_lineage: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,11 +191,11 @@ class _AuthoritativeStateLease:
     active: bool = True
     state_written: bool = False
     reconcile_only: bool = False
+    already_published: bool = False
     expected_state_bytes: bytes | None = None
     expected_state_sha256: str | None = None
-    latest_write_installed: bool = False
-    latest_written_bytes: bytes | None = None
     latest_published: bool = False
+    candidate_lineage: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,37 +259,6 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-
-
-def _renameat2(source: Path, destination: Path, flags: int) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise CriticalPipelineError(
-            "atomic compare-exchange is unavailable"
-        )
-    renameat2.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    ]
-    renameat2.restype = ctypes.c_int
-    result = renameat2(
-        _AT_FDCWD,
-        os.fsencode(source),
-        _AT_FDCWD,
-        os.fsencode(destination),
-        flags,
-    )
-    if result != 0:
-        error_number = ctypes.get_errno()
-        raise OSError(
-            error_number,
-            os.strerror(error_number),
-            str(destination),
-        )
 
 
 def _trusted_file_snapshot(
@@ -365,15 +349,13 @@ def _trusted_file_snapshot(
     )
 
 
-def _atomic_compare_exchange_bytes(
+def _atomic_replace_bytes(
     path: Path,
     *,
-    expected_prior_bytes: bytes | None,
     new_bytes: bytes,
     on_replaced: Callable[[], None] | None = None,
 ) -> None:
     temp: Path | None = None
-    exchanged = False
     try:
         with tempfile.NamedTemporaryFile(
             dir=path.parent,
@@ -386,115 +368,15 @@ def _atomic_compare_exchange_bytes(
             handle.write(new_bytes)
             handle.flush()
             os.fsync(handle.fileno())
-        if expected_prior_bytes is None:
-            try:
-                _renameat2(temp, path, _RENAME_NOREPLACE)
-            except OSError as exc:
-                if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
-                    raise CriticalPipelineError(
-                        "authoritative publication compare-exchange conflict"
-                    ) from exc
-                raise
-            temp = None
-            if on_replaced is not None:
-                on_replaced()
-            _fsync_directory(path.parent)
-            return
-
-        _renameat2(temp, path, _RENAME_EXCHANGE)
-        exchanged = True
-        try:
-            _trusted_file_snapshot(
-                temp,
-                expected_bytes=expected_prior_bytes,
-            )
-        except Exception as conflict:
-            displaced = _trusted_file_snapshot(temp)
-            current = _trusted_file_snapshot(
-                path,
-                expected_bytes=new_bytes,
-            )
-            if current is not None:
-                _renameat2(temp, path, _RENAME_EXCHANGE)
-                exchanged = False
-                _trusted_file_snapshot(
-                    path,
-                    expected_bytes=(
-                        displaced.payload
-                        if displaced is not None
-                        else None
-                    ),
-                )
-            raise CriticalPipelineError(
-                "authoritative publication compare-exchange conflict"
-            ) from conflict
+        os.replace(temp, path)
+        temp = None
         if on_replaced is not None:
             on_replaced()
-        temp.unlink()
-        temp = None
-        exchanged = False
         _fsync_directory(path.parent)
     finally:
         if temp is not None:
-            if exchanged:
-                try:
-                    current = _trusted_file_snapshot(
-                        path,
-                        expected_bytes=new_bytes,
-                    )
-                    if current is not None:
-                        _renameat2(temp, path, _RENAME_EXCHANGE)
-                        exchanged = False
-                except Exception:
-                    pass
             try:
                 temp.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-
-def _atomic_remove_exact(path: Path, *, expected_bytes: bytes) -> None:
-    quarantine = path.parent / (
-        f".{path.name}.{uuid.uuid4().hex}.rollback"
-    )
-    moved = False
-    try:
-        _renameat2(path, quarantine, _RENAME_NOREPLACE)
-        moved = True
-        try:
-            _trusted_file_snapshot(
-                quarantine,
-                expected_bytes=expected_bytes,
-            )
-        except Exception as conflict:
-            try:
-                _renameat2(
-                    quarantine,
-                    path,
-                    _RENAME_NOREPLACE,
-                )
-                moved = False
-            except OSError as restore_error:
-                if restore_error.errno not in {
-                    errno.EEXIST,
-                    errno.ENOTEMPTY,
-                }:
-                    raise
-            raise CriticalPipelineError(
-                "authoritative publication rollback conflict"
-            ) from conflict
-        quarantine.unlink()
-        moved = False
-        _fsync_directory(path.parent)
-    finally:
-        if moved and quarantine.exists():
-            try:
-                _renameat2(
-                    quarantine,
-                    path,
-                    _RENAME_NOREPLACE,
-                )
-                moved = False
             except OSError:
                 pass
 
@@ -567,18 +449,662 @@ def _optional_regular_bytes(path: Path) -> bytes | None:
     return snapshot.payload if snapshot is not None else None
 
 
+def _strict_utc(value: Any, *, field: str) -> datetime:
+    if type(value) is not str or not _RFC3339_UTC_RE.fullmatch(value):
+        raise CriticalPipelineError(f"{field} is not strict RFC3339 UTC")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise CriticalPipelineError(
+            f"{field} is not strict RFC3339 UTC"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise CriticalPipelineError(f"{field} is not UTC")
+    return parsed.astimezone(UTC)
+
+
+def _epoch_microseconds(value: datetime) -> int:
+    delta = value - datetime(1970, 1, 1, tzinfo=UTC)
+    return (
+        delta.days * 86_400_000_000
+        + delta.seconds * 1_000_000
+        + delta.microseconds
+    )
+
+
+def _strict_int(
+    value: Any,
+    *,
+    field: str,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
+    if type(value) is not int or value < minimum:
+        raise CriticalPipelineError(f"{field} is invalid")
+    if maximum is not None and value > maximum:
+        raise CriticalPipelineError(f"{field} is invalid")
+    return value
+
+
+def _strict_sha256(value: Any, *, field: str) -> str:
+    if type(value) is not str or not _SHA256_RE.fullmatch(value):
+        raise CriticalPipelineError(f"{field} is invalid")
+    return value
+
+
+def _collection_lineage(
+    *,
+    config: AppConfig,
+    bundle: CollectionPlanBundle,
+    paths: ScopedPaths,
+    run_id: str,
+) -> dict[str, Any]:
+    snapshot = _trusted_file_snapshot(paths.manifest_path)
+    if snapshot is None:
+        raise CriticalPipelineError("four-region collection manifest is missing")
+    try:
+        manifest = json.loads(snapshot.payload)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise CriticalPipelineError(
+            "four-region collection manifest is invalid"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise CriticalPipelineError(
+            "four-region collection manifest is invalid"
+        )
+    required = {
+        "schema_version": RESUMABLE_MANIFEST_SCHEMA_VERSION,
+        "run_id": run_id,
+        "collection_plan_id": FOUR_REGION_PLAN_ID,
+        "query_pack_id": bundle.query_pack.query_pack_id,
+        "query_pack_version": bundle.query_pack.version,
+        "query_pack_sha256": bundle.query_pack_sha256,
+        "collection_plan_sha256": bundle.collection_plan_sha256,
+        "region_registry_sha256": bundle.region_registry_sha256,
+        "publication_mode": "none",
+        "sellers_mode": "disabled",
+        "proxy_rotation_mode": "disabled",
+        "status": "success",
+        "complete": True,
+    }
+    if any(
+        manifest.get(field) != expected
+        or type(manifest.get(field)) is not type(expected)
+        for field, expected in required.items()
+    ):
+        raise CriticalPipelineError(
+            "four-region collection lineage mismatch"
+        )
+    effective_sha256 = _strict_sha256(
+        manifest.get("effective_plan_sha256"),
+        field="effective_plan_sha256",
+    )
+    started_text = manifest.get("started_at_utc")
+    finished_text = manifest.get("finished_at_utc")
+    started = _strict_utc(started_text, field="started_at_utc")
+    finished = _strict_utc(finished_text, field="finished_at_utc")
+    if finished < started:
+        raise CriticalPipelineError(
+            "four-region collection timestamps are inconsistent"
+        )
+    return {
+        "schema_version": DOWNSTREAM_LINEAGE_SCHEMA,
+        "collection_run_id": run_id,
+        "collection_started_at_utc": started_text,
+        "collection_finished_at_utc": finished_text,
+        "collection_order_epoch_us": _epoch_microseconds(started),
+        "collection_manifest_path": paths.manifest_path.relative_to(
+            config.project_root
+        ).as_posix(),
+        "collection_manifest_sha256": snapshot.sha256,
+        "collection_plan_sha256": bundle.collection_plan_sha256,
+        "query_pack_id": bundle.query_pack.query_pack_id,
+        "query_pack_version": bundle.query_pack.version,
+        "query_pack_sha256": bundle.query_pack_sha256,
+        "region_registry_sha256": bundle.region_registry_sha256,
+        "effective_plan_sha256": effective_sha256,
+    }
+
+
+def _validate_collection_lineage(
+    lineage: Any,
+    *,
+    project_root: Path,
+    expected_run_id: str,
+) -> dict[str, Any]:
+    if not isinstance(lineage, dict) or set(lineage) != {
+        "schema_version",
+        "collection_run_id",
+        "collection_started_at_utc",
+        "collection_finished_at_utc",
+        "collection_order_epoch_us",
+        "collection_manifest_path",
+        "collection_manifest_sha256",
+        "collection_plan_sha256",
+        "query_pack_id",
+        "query_pack_version",
+        "query_pack_sha256",
+        "region_registry_sha256",
+        "effective_plan_sha256",
+    }:
+        raise CriticalPipelineError(
+            "downstream collection lineage contract mismatch"
+        )
+    if (
+        lineage.get("schema_version") != DOWNSTREAM_LINEAGE_SCHEMA
+        or lineage.get("collection_run_id") != expected_run_id
+        or not _STATE_ID_RE.fullmatch(expected_run_id)
+        or lineage.get("query_pack_id") != FOUR_REGION_QUERY_PACK_ID
+        or lineage.get("query_pack_version") != FOUR_REGION_QUERY_PACK_VERSION
+    ):
+        raise CriticalPipelineError(
+            "downstream collection lineage identity mismatch"
+        )
+    started = _strict_utc(
+        lineage.get("collection_started_at_utc"),
+        field="collection_started_at_utc",
+    )
+    finished = _strict_utc(
+        lineage.get("collection_finished_at_utc"),
+        field="collection_finished_at_utc",
+    )
+    order = _strict_int(
+        lineage.get("collection_order_epoch_us"),
+        field="collection_order_epoch_us",
+        minimum=1,
+    )
+    if finished < started or order != _epoch_microseconds(started):
+        raise CriticalPipelineError(
+            "downstream collection lineage order mismatch"
+        )
+    for field in (
+        "collection_manifest_sha256",
+        "collection_plan_sha256",
+        "query_pack_sha256",
+        "region_registry_sha256",
+        "effective_plan_sha256",
+    ):
+        _strict_sha256(lineage.get(field), field=field)
+    expected_manifest = (
+        Path("state/wb_collection_plans")
+        / FOUR_REGION_PLAN_ID
+        / expected_run_id
+        / "manifest.json"
+    )
+    if lineage.get("collection_manifest_path") != expected_manifest.as_posix():
+        raise CriticalPipelineError(
+            "downstream collection manifest path mismatch"
+        )
+    manifest_path = _safe_project_file(
+        project_root,
+        expected_manifest.as_posix(),
+        suffix=".json",
+    )
+    snapshot = _trusted_file_snapshot(manifest_path)
+    if (
+        snapshot is None
+        or snapshot.sha256 != lineage["collection_manifest_sha256"]
+    ):
+        raise CriticalPipelineError(
+            "downstream collection manifest hash mismatch"
+        )
+    try:
+        manifest = json.loads(snapshot.payload)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise CriticalPipelineError(
+            "downstream collection manifest is invalid"
+        ) from exc
+    manifest_required = {
+        "schema_version": RESUMABLE_MANIFEST_SCHEMA_VERSION,
+        "run_id": expected_run_id,
+        "collection_plan_id": FOUR_REGION_PLAN_ID,
+        "query_pack_id": lineage["query_pack_id"],
+        "query_pack_version": lineage["query_pack_version"],
+        "query_pack_sha256": lineage["query_pack_sha256"],
+        "collection_plan_sha256": lineage["collection_plan_sha256"],
+        "region_registry_sha256": lineage["region_registry_sha256"],
+        "effective_plan_sha256": lineage["effective_plan_sha256"],
+        "publication_mode": "none",
+        "sellers_mode": "disabled",
+        "proxy_rotation_mode": "disabled",
+        "started_at_utc": lineage["collection_started_at_utc"],
+        "finished_at_utc": lineage["collection_finished_at_utc"],
+        "status": "success",
+        "complete": True,
+    }
+    if not isinstance(manifest, dict) or any(
+        manifest.get(field) != expected
+        or type(manifest.get(field)) is not type(expected)
+        for field, expected in manifest_required.items()
+    ):
+        raise CriticalPipelineError(
+            "downstream collection manifest provenance mismatch"
+        )
+    return dict(lineage)
+
+
+def _validated_artifact(
+    *,
+    project_root: Path,
+    relative_path: Any,
+    expected_sha256: Any,
+    suffix: str,
+) -> Path:
+    if type(relative_path) is not str:
+        raise CriticalPipelineError("downstream artifact path is invalid")
+    expected = _strict_sha256(
+        expected_sha256,
+        field="downstream artifact sha256",
+    )
+    path = _safe_project_file(project_root, relative_path, suffix=suffix)
+    snapshot = _trusted_file_snapshot(path)
+    if snapshot is None or snapshot.sha256 != expected:
+        raise CriticalPipelineError("downstream artifact hash mismatch")
+    return path
+
+
+def _validate_legacy_evidence(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise CriticalPipelineError("legacy warehouse evidence is invalid")
+    status = value.get("status")
+    if status == "source_absent":
+        if (
+            set(value) != {"status", "positions", "sellers"}
+            or _strict_int(value.get("positions"), field="legacy positions")
+            != 0
+            or _strict_int(value.get("sellers"), field="legacy sellers") != 0
+        ):
+            raise CriticalPipelineError(
+                "legacy warehouse source-absent evidence is invalid"
+            )
+        return
+    if status not in {"updated", "no_changes"} or set(value) != {
+        "status",
+        "positions",
+        "sellers",
+        "inserted_positions",
+        "inserted_sellers",
+        "run_quality",
+        "inserted_run_quality",
+        "revision_id",
+    }:
+        raise CriticalPipelineError("legacy warehouse evidence is invalid")
+    for field in (
+        "positions",
+        "sellers",
+        "inserted_positions",
+        "inserted_sellers",
+        "run_quality",
+        "inserted_run_quality",
+    ):
+        _strict_int(value.get(field), field=f"legacy {field}")
+    _strict_sha256(value.get("revision_id"), field="legacy revision_id")
+
+
+def _validate_completed_state_bytes(
+    payload_bytes: bytes,
+    *,
+    project_root: Path,
+    expected_run_id: str | None = None,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(payload_bytes)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise CriticalPipelineError(
+            "completed downstream state is invalid"
+        ) from exc
+    if not isinstance(payload, dict) or _json_bytes(payload) != payload_bytes:
+        raise CriticalPipelineError(
+            "completed downstream state is not canonical"
+        )
+    if set(payload) != {
+        "schema_version",
+        "run_id",
+        "collection_plan_id",
+        "status",
+        "complete",
+        "stage",
+        "execution_contract",
+        "finished_at_utc",
+        "lineage",
+        "regions",
+        "totals",
+        "sellers",
+        "warehouse",
+        "failure_reason",
+        "artifacts",
+    }:
+        raise CriticalPipelineError(
+            "completed downstream state contract mismatch"
+        )
+    run_id = payload.get("run_id")
+    if (
+        type(run_id) is not str
+        or not _STATE_ID_RE.fullmatch(run_id)
+        or (expected_run_id is not None and run_id != expected_run_id)
+        or payload.get("schema_version") != DOWNSTREAM_SCHEMA
+        or payload.get("collection_plan_id") != FOUR_REGION_PLAN_ID
+        or payload.get("status") != "success"
+        or payload.get("complete") is not True
+        or payload.get("stage") != "complete"
+        or payload.get("failure_reason") is not None
+        or payload.get("execution_contract")
+        != DownstreamExecutionContract.pre_cutover().evidence()
+    ):
+        raise CriticalPipelineError(
+            "completed downstream state semantic mismatch"
+        )
+    lineage = _validate_collection_lineage(
+        payload.get("lineage"),
+        project_root=project_root,
+        expected_run_id=run_id,
+    )
+    finished = _strict_utc(
+        payload.get("finished_at_utc"),
+        field="downstream finished_at_utc",
+    )
+    collection_finished = _strict_utc(
+        lineage["collection_finished_at_utc"],
+        field="collection_finished_at_utc",
+    )
+    if finished < collection_finished:
+        raise CriticalPipelineError(
+            "downstream completion predates collection completion"
+        )
+
+    regions = payload.get("regions")
+    if not isinstance(regions, list) or len(regions) != len(FOUR_REGION_IDS):
+        raise CriticalPipelineError("completed downstream regions are invalid")
+    pages = positions = duplicates = 0
+    for expected_region, region in zip(FOUR_REGION_IDS, regions, strict=True):
+        if not isinstance(region, dict) or set(region) != {
+            "region_id",
+            "pages",
+            "positions",
+            "duplicate_product_positions",
+            "max_position_capacity",
+        }:
+            raise CriticalPipelineError(
+                "completed downstream region evidence is invalid"
+            )
+        if region.get("region_id") != expected_region:
+            raise CriticalPipelineError(
+                "completed downstream region order mismatch"
+            )
+        pages += _strict_int(
+            region.get("pages"),
+            field="region pages",
+            minimum=1,
+            maximum=EXPECTED_QUERIES * 10,
+        )
+        region_positions = _strict_int(
+            region.get("positions"),
+            field="region positions",
+            minimum=1,
+            maximum=EXPECTED_QUERIES * 1000,
+        )
+        positions += region_positions
+        region_duplicates = _strict_int(
+            region.get("duplicate_product_positions"),
+            field="region duplicate positions",
+            maximum=region_positions,
+        )
+        duplicates += region_duplicates
+        if region.get("max_position_capacity") != EXPECTED_QUERIES * 1000:
+            raise CriticalPipelineError(
+                "completed downstream region capacity mismatch"
+            )
+
+    totals = payload.get("totals")
+    if not isinstance(totals, dict) or set(totals) != {
+        "pages",
+        "positions",
+        "unique_products",
+        "unique_suppliers",
+        "missing_supplier_products",
+        "duplicate_product_positions",
+        "max_position_capacity",
+    }:
+        raise CriticalPipelineError("completed downstream totals are invalid")
+    unique_products = _strict_int(
+        totals.get("unique_products"),
+        field="unique products",
+        minimum=1,
+        maximum=positions,
+    )
+    unique_suppliers = _strict_int(
+        totals.get("unique_suppliers"),
+        field="unique suppliers",
+        maximum=unique_products,
+    )
+    missing_suppliers = _strict_int(
+        totals.get("missing_supplier_products"),
+        field="missing supplier products",
+        maximum=unique_products,
+    )
+    if (
+        totals.get("pages") != pages
+        or totals.get("positions") != positions
+        or totals.get("duplicate_product_positions") != duplicates
+        or totals.get("max_position_capacity") != MAX_POSITIONS
+        or unique_suppliers + missing_suppliers > unique_products
+    ):
+        raise CriticalPipelineError(
+            "completed downstream totals are inconsistent"
+        )
+
+    sellers = payload.get("sellers")
+    if not isinstance(sellers, dict) or set(sellers) != {
+        "status",
+        "items_ok",
+        "items_error",
+        "source_sha256",
+        "output_path",
+        "output_sha256",
+    }:
+        raise CriticalPipelineError("completed seller evidence is invalid")
+    if (
+        sellers.get("status") != "success"
+        or _strict_int(sellers.get("items_ok"), field="seller items_ok")
+        != unique_suppliers
+        or _strict_int(sellers.get("items_error"), field="seller items_error")
+        != 0
+    ):
+        raise CriticalPipelineError("completed seller result is invalid")
+
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "bridge_path",
+        "bridge_sha256",
+        "seller_input_path",
+        "seller_input_sha256",
+        "seller_output_path",
+        "seller_output_sha256",
+    }:
+        raise CriticalPipelineError("completed artifact evidence is invalid")
+    expected_artifact_paths = {
+        "bridge_path": (
+            Path("data/marts/wb_four_region")
+            / FOUR_REGION_PLAN_ID
+            / run_id
+            / "regional_query_product_position_bridge.csv"
+        ).as_posix(),
+        "seller_input_path": (
+            Path("data/marts/wb_four_region")
+            / FOUR_REGION_PLAN_ID
+            / run_id
+            / "products_for_sellers.csv"
+        ).as_posix(),
+        "seller_output_path": (
+            Path("data/marts/sellers_scoped")
+            / FOUR_REGION_PLAN_ID
+            / run_id
+            / "sellers_daily.csv"
+        ).as_posix(),
+    }
+    if any(
+        artifacts.get(field) != expected
+        for field, expected in expected_artifact_paths.items()
+    ):
+        raise CriticalPipelineError(
+            "completed artifact path contract mismatch"
+        )
+    _validated_artifact(
+        project_root=project_root,
+        relative_path=artifacts.get("bridge_path"),
+        expected_sha256=artifacts.get("bridge_sha256"),
+        suffix=".csv",
+    )
+    _validated_artifact(
+        project_root=project_root,
+        relative_path=artifacts.get("seller_input_path"),
+        expected_sha256=artifacts.get("seller_input_sha256"),
+        suffix=".csv",
+    )
+    _validated_artifact(
+        project_root=project_root,
+        relative_path=artifacts.get("seller_output_path"),
+        expected_sha256=artifacts.get("seller_output_sha256"),
+        suffix=".csv",
+    )
+    if (
+        sellers.get("source_sha256") != artifacts.get("seller_input_sha256")
+        or sellers.get("output_path") != artifacts.get("seller_output_path")
+        or sellers.get("output_sha256") != artifacts.get("seller_output_sha256")
+    ):
+        raise CriticalPipelineError(
+            "completed seller artifact provenance mismatch"
+        )
+
+    warehouse = payload.get("warehouse")
+    if not isinstance(warehouse, dict) or set(warehouse) != {
+        "status",
+        "positions_count",
+        "sellers_count",
+        "legacy_yaroslavl",
+        "ingestion_evidence",
+    }:
+        raise CriticalPipelineError("completed warehouse evidence is invalid")
+    if (
+        warehouse.get("status") not in {"success", "already_ingested"}
+        or _strict_int(
+            warehouse.get("positions_count"),
+            field="warehouse positions",
+        )
+        != positions
+    ):
+        raise CriticalPipelineError("completed warehouse result is invalid")
+    _strict_int(
+        warehouse.get("sellers_count"),
+        field="warehouse sellers",
+    )
+    _validate_legacy_evidence(warehouse.get("legacy_yaroslavl"))
+    ingestion = warehouse.get("ingestion_evidence")
+    if not isinstance(ingestion, dict) or set(ingestion) != {
+        "collection_manifest_sha256",
+        "bridge_sha256",
+        "sellers_sha256",
+    }:
+        raise CriticalPipelineError(
+            "completed warehouse ingestion evidence is invalid"
+        )
+    if (
+        ingestion.get("collection_manifest_sha256")
+        != lineage["collection_manifest_sha256"]
+        or ingestion.get("bridge_sha256") != artifacts["bridge_sha256"]
+        or ingestion.get("sellers_sha256") != artifacts["seller_output_sha256"]
+    ):
+        raise CriticalPipelineError(
+            "completed warehouse ingestion provenance mismatch"
+        )
+    return payload
+
+
+def _validate_latest_bytes(
+    payload_bytes: bytes,
+    *,
+    project_root: Path,
+) -> tuple[dict[str, Any], dict[str, Any], bytes]:
+    try:
+        pointer = json.loads(payload_bytes)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise CriticalPipelineError("downstream latest pointer is invalid") from exc
+    if (
+        not isinstance(pointer, dict)
+        or _json_bytes(pointer) != payload_bytes
+        or set(pointer)
+        != {
+            "schema_version",
+            "run_id",
+            "state_path",
+            "state_sha256",
+            "lineage",
+        }
+        or pointer.get("schema_version") != DOWNSTREAM_LATEST_SCHEMA
+    ):
+        raise CriticalPipelineError("downstream latest pointer is invalid")
+    run_id = pointer.get("run_id")
+    if type(run_id) is not str or not _STATE_ID_RE.fullmatch(run_id):
+        raise CriticalPipelineError("downstream latest run identity is invalid")
+    expected_path = (
+        Path("state/wb_four_region_nightly")
+        / FOUR_REGION_PLAN_ID
+        / run_id
+        / "state.json"
+    )
+    if pointer.get("state_path") != expected_path.as_posix():
+        raise CriticalPipelineError("downstream latest state path mismatch")
+    state_path = _safe_project_file(
+        project_root,
+        expected_path.as_posix(),
+        suffix=".json",
+    )
+    state_snapshot = _trusted_file_snapshot(state_path)
+    expected_sha = _strict_sha256(
+        pointer.get("state_sha256"),
+        field="latest state_sha256",
+    )
+    if state_snapshot is None or state_snapshot.sha256 != expected_sha:
+        raise CriticalPipelineError(
+            "published downstream state integrity mismatch"
+        )
+    state = _validate_completed_state_bytes(
+        state_snapshot.payload,
+        project_root=project_root,
+        expected_run_id=run_id,
+    )
+    if pointer.get("lineage") != state.get("lineage"):
+        raise CriticalPipelineError("downstream latest lineage mismatch")
+    return pointer, state, state_snapshot.payload
+
+
+def _lineage_order(lineage: Mapping[str, Any]) -> int:
+    return _strict_int(
+        lineage.get("collection_order_epoch_us"),
+        field="collection_order_epoch_us",
+        minimum=1,
+    )
+
+
 def _begin_authoritative_state_transition(
     *,
     state_path: Path,
     latest_path: Path,
     run_id: str,
     project_root: Path,
+    candidate_lineage: Mapping[str, Any],
 ) -> _AuthoritativeStateLease:
     _safe_state_parent(state_path, project_root=project_root)
     _safe_state_parent(latest_path, project_root=project_root)
     state_bytes = _optional_regular_bytes(state_path)
     latest_bytes = _optional_regular_bytes(latest_path)
+    validated_candidate_lineage = _validate_collection_lineage(
+        candidate_lineage,
+        project_root=project_root,
+        expected_run_id=run_id,
+    )
     state_payload: dict[str, Any] | None = None
+    completed_state = False
     if state_bytes is not None:
         try:
             loaded = json.loads(state_bytes)
@@ -610,43 +1136,41 @@ def _begin_authoritative_state_transition(
             raise CriticalPipelineError(
                 "downstream authoritative state contract mismatch"
             )
-
-    if latest_bytes is not None:
-        try:
-            loaded_latest = json.loads(latest_bytes)
-        except (UnicodeError, json.JSONDecodeError) as exc:
-            raise CriticalPipelineError(
-                "downstream latest pointer is invalid"
-            ) from exc
-        if not isinstance(loaded_latest, dict):
-            raise CriticalPipelineError(
-                "downstream latest pointer is invalid"
+        completed_state = (
+            state_payload["status"] == "success"
+            and state_payload["complete"] is True
+        )
+        if completed_state:
+            state_payload = _validate_completed_state_bytes(
+                state_bytes,
+                project_root=project_root,
+                expected_run_id=run_id,
             )
-        if loaded_latest.get("run_id") == run_id:
-            if state_bytes is None:
+            if state_payload["lineage"] != validated_candidate_lineage:
                 raise CriticalPipelineError(
-                    "published downstream state is missing"
+                    "completed downstream state lineage mismatch"
                 )
-            expected_state_path = state_path.relative_to(
-                project_root
-            ).as_posix()
-            if (
-                loaded_latest.get("schema_version") != DOWNSTREAM_SCHEMA
-                or loaded_latest.get("state_path") != expected_state_path
-                or loaded_latest.get("state_sha256")
-                != _sha256_bytes(state_bytes)
-            ):
+
+    latest_payload: dict[str, Any] | None = None
+    latest_state_bytes: bytes | None = None
+    if latest_bytes is not None:
+        latest_payload, latest_state, latest_state_bytes = _validate_latest_bytes(
+            latest_bytes,
+            project_root=project_root,
+        )
+        if latest_payload["run_id"] == run_id:
+            if not completed_state or latest_state_bytes != state_bytes:
                 raise CriticalPipelineError(
                     "published downstream state integrity mismatch"
                 )
+        elif (
+            _lineage_order(validated_candidate_lineage)
+            <= _lineage_order(latest_state["lineage"])
+        ):
             raise CriticalPipelineError(
-                "published downstream state is immutable"
+                "downstream latest is newer than reconcile candidate"
             )
 
-    completed_unpublished = state_payload is not None and (
-        state_payload["status"] == "success"
-        or state_payload["complete"] is True
-    )
     return _AuthoritativeStateLease(
         project_root=project_root,
         state_path=state_path,
@@ -654,14 +1178,20 @@ def _begin_authoritative_state_transition(
         run_id=run_id,
         prior_state_bytes=state_bytes,
         prior_latest_bytes=latest_bytes,
-        state_written=completed_unpublished,
-        reconcile_only=completed_unpublished,
-        expected_state_bytes=state_bytes if completed_unpublished else None,
+        state_written=completed_state,
+        reconcile_only=completed_state,
+        already_published=(
+            completed_state
+            and latest_payload is not None
+            and latest_payload["run_id"] == run_id
+        ),
+        expected_state_bytes=state_bytes if completed_state else None,
         expected_state_sha256=(
             _sha256_bytes(state_bytes)
-            if completed_unpublished and state_bytes is not None
+            if completed_state and state_bytes is not None
             else None
         ),
+        candidate_lineage=validated_candidate_lineage,
     )
 
 
@@ -692,6 +1222,42 @@ def _write_authoritative_state(
             "downstream authoritative state transition is invalid"
         )
     encoded = _json_bytes(payload)
+    if lease.prior_state_bytes is not None:
+        try:
+            prior_payload = json.loads(lease.prior_state_bytes)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise CriticalPipelineError(
+                "prior downstream state is invalid"
+            ) from exc
+        if not isinstance(prior_payload, dict):
+            raise CriticalPipelineError("prior downstream state is invalid")
+        if prior_payload.get("status") == "success":
+            raise CriticalPipelineError(
+                "completed downstream state is immutable"
+            )
+        if payload.get("status") == "failed":
+            prior_stage = _DOWNSTREAM_STAGE_ORDER.get(
+                str(prior_payload.get("stage"))
+            )
+            next_stage = _DOWNSTREAM_STAGE_ORDER.get(str(payload.get("stage")))
+            if (
+                prior_stage is None
+                or next_stage is None
+                or next_stage < prior_stage
+            ):
+                raise CriticalPipelineError(
+                    "downstream failure state transition is not monotonic"
+                )
+    if payload.get("status") == "success":
+        _validate_completed_state_bytes(
+            encoded,
+            project_root=lease.project_root,
+            expected_run_id=lease.run_id,
+        )
+        if payload.get("lineage") != lease.candidate_lineage:
+            raise CriticalPipelineError(
+                "downstream authoritative state lineage mismatch"
+            )
     expected_sha256 = _sha256_bytes(encoded)
     current = _optional_regular_bytes(lease.state_path)
     if current != lease.prior_state_bytes:
@@ -704,9 +1270,8 @@ def _write_authoritative_state(
         lease.expected_state_sha256 = expected_sha256
         lease.state_written = True
 
-    _atomic_compare_exchange_bytes(
+    _atomic_replace_bytes(
         lease.state_path,
-        expected_prior_bytes=lease.prior_state_bytes,
         new_bytes=encoded,
         on_replaced=mark_state_replaced,
     )
@@ -718,45 +1283,6 @@ def _write_authoritative_state(
         raise CriticalPipelineError(
             "downstream authoritative state verification failed"
         )
-
-
-def _rollback_latest(lease: _AuthoritativeStateLease) -> None:
-    if lease.latest_written_bytes is None:
-        return
-    current = _trusted_file_snapshot(
-        lease.latest_path,
-        allow_missing=True,
-    )
-    if current is None or current.payload != lease.latest_written_bytes:
-        raise CriticalPipelineError(
-            "downstream latest rollback ownership lost"
-        )
-    if lease.prior_latest_bytes is None:
-        _atomic_remove_exact(
-            lease.latest_path,
-            expected_bytes=lease.latest_written_bytes,
-        )
-        if _trusted_file_snapshot(
-            lease.latest_path,
-            allow_missing=True,
-        ) is not None:
-            raise CriticalPipelineError(
-                "downstream latest rollback verification failed"
-            )
-    else:
-        _atomic_compare_exchange_bytes(
-            lease.latest_path,
-            expected_prior_bytes=lease.latest_written_bytes,
-            new_bytes=lease.prior_latest_bytes,
-        )
-        _trusted_file_snapshot(
-            lease.latest_path,
-            expected_bytes=lease.prior_latest_bytes,
-        )
-    lease.latest_write_installed = False
-    lease.latest_written_bytes = None
-
-
 def _write_authoritative_latest(
     lease: _AuthoritativeStateLease,
     payload: Mapping[str, Any],
@@ -767,16 +1293,31 @@ def _write_authoritative_latest(
         or lease.latest_published
         or lease.expected_state_bytes is None
         or lease.expected_state_sha256 is None
-        or payload.get("schema_version") != DOWNSTREAM_SCHEMA
+        or payload.get("schema_version") != DOWNSTREAM_LATEST_SCHEMA
         or payload.get("run_id") != lease.run_id
         or payload.get("state_path")
         != lease.state_path.relative_to(lease.project_root).as_posix()
         or payload.get("state_sha256") != lease.expected_state_sha256
+        or payload.get("lineage") != lease.candidate_lineage
     ):
         raise CriticalPipelineError(
             "downstream latest transition is invalid"
         )
+    if lease.already_published:
+        current = _optional_regular_bytes(lease.latest_path)
+        if current != lease.prior_latest_bytes:
+            raise CriticalPipelineError(
+                "downstream latest changed during same-run reconcile"
+            )
+        _validate_latest_bytes(current or b"", project_root=lease.project_root)
+        lease.latest_published = True
+        return
     encoded = _json_bytes(payload)
+    _validate_completed_state_bytes(
+        lease.expected_state_bytes,
+        project_root=lease.project_root,
+        expected_run_id=lease.run_id,
+    )
     _trusted_file_snapshot(
         lease.state_path,
         expected_bytes=lease.expected_state_bytes,
@@ -786,53 +1327,47 @@ def _write_authoritative_latest(
         raise CriticalPipelineError(
             "downstream latest changed during transition"
         )
-
-    def mark_latest_replaced() -> None:
-        lease.latest_write_installed = True
-        lease.latest_written_bytes = encoded
-
-    try:
-        _atomic_compare_exchange_bytes(
-            lease.latest_path,
-            expected_prior_bytes=lease.prior_latest_bytes,
-            new_bytes=encoded,
-            on_replaced=mark_latest_replaced,
+    if current is not None:
+        current_pointer, current_state, _current_state_bytes = (
+            _validate_latest_bytes(
+                current,
+                project_root=lease.project_root,
+            )
         )
-        state_snapshot = _trusted_file_snapshot(
-            lease.state_path,
-            expected_bytes=lease.expected_state_bytes,
-        )
-        latest_snapshot = _trusted_file_snapshot(
-            lease.latest_path,
-            expected_bytes=encoded,
-        )
-        final_state_snapshot = _trusted_file_snapshot(
-            lease.state_path,
-            expected_bytes=lease.expected_state_bytes,
-        )
-        if (
-            state_snapshot is None
-            or latest_snapshot is None
-            or final_state_snapshot is None
-            or state_snapshot.sha256 != lease.expected_state_sha256
-            or final_state_snapshot.sha256
-            != lease.expected_state_sha256
-            or latest_snapshot.sha256 != _sha256_bytes(encoded)
+        candidate_order = _lineage_order(lease.candidate_lineage or {})
+        current_order = _lineage_order(current_state["lineage"])
+        if current_pointer["run_id"] != lease.run_id and (
+            candidate_order <= current_order
         ):
             raise CriticalPipelineError(
-                "downstream publication transaction verification failed"
+                "downstream latest is newer than publication candidate"
             )
-        lease.latest_published = True
-    except Exception:
-        if lease.latest_write_installed and not lease.latest_published:
-            try:
-                _rollback_latest(lease)
-            except Exception as rollback_error:
-                raise CriticalPipelineError(
-                    "downstream publication failed and latest rollback "
-                    "could not be verified"
-                ) from rollback_error
-        raise
+    _atomic_replace_bytes(lease.latest_path, new_bytes=encoded)
+    state_snapshot = _trusted_file_snapshot(
+        lease.state_path,
+        expected_bytes=lease.expected_state_bytes,
+    )
+    latest_snapshot = _trusted_file_snapshot(
+        lease.latest_path,
+        expected_bytes=encoded,
+    )
+    final_state_snapshot = _trusted_file_snapshot(
+        lease.state_path,
+        expected_bytes=lease.expected_state_bytes,
+    )
+    if (
+        state_snapshot is None
+        or latest_snapshot is None
+        or final_state_snapshot is None
+        or state_snapshot.sha256 != lease.expected_state_sha256
+        or final_state_snapshot.sha256 != lease.expected_state_sha256
+        or latest_snapshot.sha256 != _sha256_bytes(encoded)
+    ):
+        raise CriticalPipelineError(
+            "downstream publication transaction verification failed"
+        )
+    _validate_latest_bytes(encoded, project_root=lease.project_root)
+    lease.latest_published = True
 
 
 def _load_scoped_products(path: Path) -> list[dict[str, str]]:
@@ -844,6 +1379,11 @@ def validate_four_region_bundle(bundle: CollectionPlanBundle) -> None:
     plan = bundle.collection_plan
     if plan.collection_plan_id != FOUR_REGION_PLAN_ID:
         raise CriticalPipelineError("unexpected four-region collection plan")
+    if (
+        bundle.query_pack.query_pack_id != FOUR_REGION_QUERY_PACK_ID
+        or bundle.query_pack.version != FOUR_REGION_QUERY_PACK_VERSION
+    ):
+        raise CriticalPipelineError("four-region query-pack contract mismatch")
     if plan.region_set != FOUR_REGION_IDS:
         raise CriticalPipelineError("four-region order mismatch")
     if len(plan.query_ids) != EXPECTED_QUERIES or plan.depth != 1000:
@@ -913,6 +1453,12 @@ def build_four_region_inputs(
         or manifest.get("region_registry_sha256") != bundle.region_registry_sha256
     ):
         raise CriticalPipelineError("four-region collection is not complete")
+    collection_lineage = _collection_lineage(
+        config=config,
+        bundle=bundle,
+        paths=paths,
+        run_id=run_id,
+    )
     totals = manifest.get("totals")
     if (
         not isinstance(totals, dict)
@@ -1089,6 +1635,7 @@ def build_four_region_inputs(
             for values in region_counts.values()
         ),
         region_counts=region_counts,
+        collection_lineage=collection_lineage,
     )
 
 
@@ -1335,11 +1882,18 @@ def _run_locked_four_region_downstream(
 ) -> dict[str, Any]:
     stage = "state_transition"
     try:
+        candidate_lineage = _collection_lineage(
+            config=config,
+            bundle=bundle,
+            paths=paths,
+            run_id=run_id,
+        )
         lease = _begin_authoritative_state_transition(
             state_path=state_path,
             latest_path=latest_path,
             run_id=run_id,
             project_root=config.project_root,
+            candidate_lineage=candidate_lineage,
         )
     except Exception as exc:
         write_four_region_failure_attempt(
@@ -1364,12 +1918,13 @@ def _run_locked_four_region_downstream(
                     "completed downstream state is invalid"
                 )
             pointer = {
-                "schema_version": DOWNSTREAM_SCHEMA,
+                "schema_version": DOWNSTREAM_LATEST_SCHEMA,
                 "run_id": run_id,
                 "state_path": state_path.relative_to(
                     config.project_root
                 ).as_posix(),
                 "state_sha256": lease.expected_state_sha256,
+                "lineage": completed_state["lineage"],
             }
             deadline.ensure_active()
             _write_authoritative_latest(lease, pointer)
@@ -1438,6 +1993,23 @@ def _run_locked_four_region_downstream(
             raise CriticalPipelineError(
                 "regional sellers stage is partial"
             )
+        seller_output_path = Path(
+            str(sellers_result["mart_sellers_path"])
+        )
+        try:
+            seller_output_relative = seller_output_path.relative_to(
+                config.project_root
+            ).as_posix()
+        except ValueError as exc:
+            raise CriticalPipelineError(
+                "regional seller output escapes project root"
+            ) from exc
+        seller_output_path = _safe_project_file(
+            config.project_root,
+            seller_output_relative,
+            suffix=".csv",
+        )
+        seller_output_sha256 = _sha256(seller_output_path)
         deadline.ensure_active()
         stage = "warehouse"
         warehouse_result = warehouse_ingest(
@@ -1470,6 +2042,7 @@ def _run_locked_four_region_downstream(
             "finished_at_utc": datetime.now(UTC)
             .replace(microsecond=0)
             .isoformat(),
+            "lineage": dict(inputs.collection_lineage),
             "regions": [
                 {
                     "region_id": region_id,
@@ -1498,6 +2071,8 @@ def _run_locked_four_region_downstream(
                 "items_ok": int(sellers_result["items_ok"]),
                 "items_error": int(sellers_result["items_error"]),
                 "source_sha256": inputs.seller_input_sha256,
+                "output_path": seller_output_relative,
+                "output_sha256": seller_output_sha256,
             },
             "warehouse": {
                 "status": warehouse_result["status"],
@@ -1508,6 +2083,15 @@ def _run_locked_four_region_downstream(
                     warehouse_result["sellers_count"]
                 ),
                 "legacy_yaroslavl": warehouse_result["legacy"],
+                "ingestion_evidence": {
+                    "collection_manifest_sha256": (
+                        inputs.collection_lineage[
+                            "collection_manifest_sha256"
+                        ]
+                    ),
+                    "bridge_sha256": inputs.bridge_sha256,
+                    "sellers_sha256": seller_output_sha256,
+                },
             },
             "failure_reason": None,
             "artifacts": {
@@ -1521,16 +2105,19 @@ def _run_locked_four_region_downstream(
                     ).as_posix()
                 ),
                 "seller_input_sha256": inputs.seller_input_sha256,
+                "seller_output_path": seller_output_relative,
+                "seller_output_sha256": seller_output_sha256,
             },
         }
         _write_authoritative_state(lease, state)
         pointer = {
-            "schema_version": DOWNSTREAM_SCHEMA,
+            "schema_version": DOWNSTREAM_LATEST_SCHEMA,
             "run_id": run_id,
             "state_path": state_path.relative_to(
                 config.project_root
             ).as_posix(),
             "state_sha256": lease.expected_state_sha256,
+            "lineage": state["lineage"],
         }
         _write_authoritative_latest(lease, pointer)
         return state

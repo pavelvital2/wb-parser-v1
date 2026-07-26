@@ -490,12 +490,18 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   `state/wb_four_region_nightly/<plan>/attempts/<run_id>/`. Diagnostic write
   failure must not mask the original pipeline error.
   State-to-latest publication uses exact canonical writer bytes and atomic
-  compare/exchange. It verifies state via a no-follow FD before and after latest
-  publication. On post-check failure it may restore previous latest only if
-  latest still contains this attempt's exact bytes; never overwrite a
-  concurrent latest. A completed state left unpublished by crash/fsync failure
-  is reconciled under all locks and the deadline without rerunning sellers or
-  warehouse.
+  replace while the complete shared lock set is held. A strict completed-state
+  validator covers the execution contract, four regions, totals, sellers,
+  warehouse evidence, artifact hashes, timestamps and collection lineage.
+  The monotonic lineage order is the verified collection
+  `started_at_utc` from the immutable scoped manifest; an older or
+  equal-time different run must never replace a newer latest. State and latest
+  are verified through no-follow file descriptors after publication. There is
+  no compensating rename rollback: a crash before latest leaves an immutable
+  completed-but-unpublished state for same-run reconciliation, while a durable
+  exact latest remains authoritative. Non-cooperating writers are outside this
+  lock-based authority model and must not be "repaired" with an unsafe
+  pseudo-CAS.
   Scoped `regional_run_quality.source_row_sha256` must cover every retained
   row field except the hash itself.
   Operational contract:

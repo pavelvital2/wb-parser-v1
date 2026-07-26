@@ -124,24 +124,30 @@ immutable files under
 Failure to persist this best-effort diagnostic must not mask the original
 pipeline error.
 
-State-to-latest publication is a verified compare-and-exchange transaction.
-The state SHA-256 is calculated from the canonical bytes encoded by the current
-writer, never from a later path read as the source of truth. The writer
-atomically replaces state only if the displaced bytes equal the lease
-precondition, then verifies the exact file through a no-follow file descriptor,
-stable inode metadata and the expected bytes. It repeats that verification
-immediately before latest exchange and after latest is durable. Latest itself
-is exchanged only if its displaced bytes match the lease precondition.
+State-to-latest publication uses one lock-based authority model. Every
+cooperating authoritative writer holds the complete collection-plan exclusion
+lock set. The completed state is strict canonical JSON and includes the exact
+execution contract, four ordered regions, internally consistent totals,
+successful sellers and warehouse evidence, artifact paths/hashes, timestamps
+and collection lineage. The lineage order is the collection
+`started_at_utc`, parsed from and pinned to the immutable scoped collection
+manifest; its epoch-microsecond value is stored explicitly. Filename ordering
+is never used. An older run, or a different run with an equal lineage time,
+cannot replace a newer latest.
 
-If post-publication verification detects state mutation, latest is restored to
-the previous exact bytes only when the current latest still equals the bytes
-installed by this transaction. A first publication is removed through an
-atomic quarantine move under the same condition. A concurrent latest is never
-overwritten during rollback. A crash or fsync failure after durable completed
-state but before verified latest leaves a completed-but-unpublished state.
-The next approved downstream invocation may publish that same immutable state
-without rerunning sellers or warehouse; it must still reacquire all locks and
-pass deadline and state-byte verification.
+The writer calculates state SHA-256 from the exact canonical bytes it encodes,
+atomically replaces state and then latest while all locks remain held, and
+verifies both files through no-follow descriptors. There is deliberately no
+exchange-plus-compensating-exchange rollback. Such a pseudo-CAS has a
+second-writer race and unsafe crash point. A crash before latest replacement
+leaves an immutable completed-but-unpublished state; a later approved
+same-run invocation can validate and publish it without rerunning sellers or
+warehouse. A crash after a durable exact latest replacement leaves that
+state/latest pair available for idempotent same-run reconciliation. A
+non-cooperating writer is outside this authority model; post-write verification
+fails closed but never attempts a compensating rename that could overwrite a
+newer pointer. The cutover preflight must continue to prove that no stale
+collector is active before this authority is enabled.
 
 ### Scoped Sellers
 

@@ -67,12 +67,21 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.chmod(0o600)
 
 
-def _downstream_state_paths(root: Path) -> tuple[Path, Path]:
+def _write_canonical_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.write_bytes(four_region._json_bytes(payload))
+    path.chmod(0o600)
+
+
+def _downstream_state_paths(
+    root: Path,
+    *,
+    run_id: str = RUN_ID,
+) -> tuple[Path, Path]:
     state_path = (
         root
         / "state/wb_four_region_nightly"
         / FOUR_REGION_PLAN_ID
-        / RUN_ID
+        / run_id
         / "state.json"
     )
     return state_path, state_path.parent.parent / "latest.json"
@@ -80,32 +89,168 @@ def _downstream_state_paths(root: Path) -> tuple[Path, Path]:
 
 def _write_published_downstream_state(
     root: Path,
+    *,
+    run_id: str = RUN_ID,
+    started_at_utc: str = "2026-07-26T00:16:00+00:00",
+    finished_at_utc: str = "2026-07-26T00:30:00+00:00",
 ) -> tuple[Path, Path]:
-    state_path, latest_path = _downstream_state_paths(root)
+    state_path, latest_path = _downstream_state_paths(root, run_id=run_id)
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_json(
-        state_path,
-        {
+    manifest_path = _ensure_collection_manifest(
+        root,
+        run_id=run_id,
+        started_at_utc=started_at_utc,
+        finished_at_utc=finished_at_utc,
+    )
+    if manifest_path.is_file():
+        config = load_config(str(root / "config/config.yaml"))
+        bundle = load_collection_plan_bundle(
+            project_root=root,
+            plan_path=root / PLAN_RELATIVE,
+            region_registry_path=root / REGISTRY_RELATIVE,
+        )
+        paths = ScopedPaths.build(
+            project_root=root,
+            collection_plan_id=FOUR_REGION_PLAN_ID,
+            run_id=run_id,
+        )
+        lineage = four_region._collection_lineage(
+            config=config,
+            bundle=bundle,
+            paths=paths,
+            run_id=run_id,
+        )
+        artifacts_root = (
+            root
+            / "data/marts/wb_four_region"
+            / FOUR_REGION_PLAN_ID
+            / run_id
+        )
+        artifacts_root.mkdir(parents=True, exist_ok=True)
+        bridge = (
+            artifacts_root
+            / "regional_query_product_position_bridge.csv"
+        )
+        seller_input = artifacts_root / "products_for_sellers.csv"
+        seller_output = (
+            root
+            / "data/marts/sellers_scoped"
+            / FOUR_REGION_PLAN_ID
+            / run_id
+            / "sellers_daily.csv"
+        )
+        seller_output.parent.mkdir(parents=True, exist_ok=True)
+        for path, content in (
+            (bridge, "bridge\n"),
+            (seller_input, "seller-input\n"),
+            (seller_output, "seller-output\n"),
+        ):
+            path.write_text(content, encoding="utf-8")
+            path.chmod(0o600)
+        state = {
             "schema_version": "wb_four_region_downstream_v1",
-            "run_id": RUN_ID,
+            "run_id": run_id,
             "collection_plan_id": FOUR_REGION_PLAN_ID,
             "status": "success",
             "complete": True,
             "stage": "complete",
-        },
-    )
-    latest_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_json(
-        latest_path,
-        {
+            "execution_contract": (
+                DownstreamExecutionContract.pre_cutover().evidence()
+            ),
+            "finished_at_utc": finished_at_utc,
+            "lineage": lineage,
+            "regions": [
+                {
+                    "region_id": region_id,
+                    "pages": 1,
+                    "positions": 1,
+                    "duplicate_product_positions": 0,
+                    "max_position_capacity": 30000,
+                }
+                for region_id in FOUR_REGION_IDS
+            ],
+            "totals": {
+                "pages": 4,
+                "positions": 4,
+                "unique_products": 4,
+                "unique_suppliers": 4,
+                "missing_supplier_products": 0,
+                "duplicate_product_positions": 0,
+                "max_position_capacity": 120000,
+            },
+            "sellers": {
+                "status": "success",
+                "items_ok": 4,
+                "items_error": 0,
+                "source_sha256": hashlib.sha256(
+                    seller_input.read_bytes()
+                ).hexdigest(),
+                "output_path": seller_output.relative_to(root).as_posix(),
+                "output_sha256": hashlib.sha256(
+                    seller_output.read_bytes()
+                ).hexdigest(),
+            },
+            "warehouse": {
+                "status": "success",
+                "positions_count": 4,
+                "sellers_count": 4,
+                "legacy_yaroslavl": {
+                    "status": "source_absent",
+                    "positions": 0,
+                    "sellers": 0,
+                },
+                "ingestion_evidence": {
+                    "collection_manifest_sha256": lineage[
+                        "collection_manifest_sha256"
+                    ],
+                    "bridge_sha256": hashlib.sha256(
+                        bridge.read_bytes()
+                    ).hexdigest(),
+                    "sellers_sha256": hashlib.sha256(
+                        seller_output.read_bytes()
+                    ).hexdigest(),
+                },
+            },
+            "failure_reason": None,
+            "artifacts": {
+                "bridge_path": bridge.relative_to(root).as_posix(),
+                "bridge_sha256": hashlib.sha256(
+                    bridge.read_bytes()
+                ).hexdigest(),
+                "seller_input_path": seller_input.relative_to(root).as_posix(),
+                "seller_input_sha256": hashlib.sha256(
+                    seller_input.read_bytes()
+                ).hexdigest(),
+                "seller_output_path": seller_output.relative_to(root).as_posix(),
+                "seller_output_sha256": hashlib.sha256(
+                    seller_output.read_bytes()
+                ).hexdigest(),
+            },
+        }
+    else:
+        state = {
             "schema_version": "wb_four_region_downstream_v1",
-            "run_id": RUN_ID,
-            "state_path": state_path.relative_to(root).as_posix(),
-            "state_sha256": hashlib.sha256(
-                state_path.read_bytes()
-            ).hexdigest(),
-        },
-    )
+            "run_id": run_id,
+            "collection_plan_id": FOUR_REGION_PLAN_ID,
+            "status": "success",
+            "complete": True,
+            "stage": "complete",
+        }
+    _write_canonical_json(state_path, state)
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    pointer = {
+        "schema_version": (
+            "wb_four_region_latest_v1"
+            if manifest_path.is_file()
+            else "wb_four_region_downstream_v1"
+        ),
+        "run_id": run_id,
+        "state_path": state_path.relative_to(root).as_posix(),
+        "state_sha256": hashlib.sha256(state_path.read_bytes()).hexdigest(),
+    }
+    if manifest_path.is_file():
+        pointer["lineage"] = state["lineage"]
+    _write_canonical_json(latest_path, pointer)
     return state_path, latest_path
 
 
@@ -142,7 +287,86 @@ def _project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         if region["region_id"] in FOUR_REGION_IDS:
             region["enabled"] = True
     _write_json(registry_path, registry)
-    return root, load_config(str(root / "config/config.yaml")), plan_path
+    config = load_config(str(root / "config/config.yaml"))
+    return root, config, plan_path
+
+
+def _ensure_collection_manifest(
+    root: Path,
+    *,
+    run_id: str = RUN_ID,
+    started_at_utc: str = "2026-07-26T00:16:00+00:00",
+    finished_at_utc: str = "2026-07-26T00:30:00+00:00",
+) -> Path:
+    paths = ScopedPaths.build(
+        project_root=root,
+        collection_plan_id=FOUR_REGION_PLAN_ID,
+        run_id=run_id,
+    )
+    if paths.manifest_path.exists():
+        return paths.manifest_path
+    config_path = root / "config/config.yaml"
+    plan_path = root / PLAN_RELATIVE
+    registry_path = root / REGISTRY_RELATIVE
+    if not (
+        config_path.is_file()
+        and plan_path.is_file()
+        and registry_path.is_file()
+    ):
+        return paths.manifest_path
+    bundle = load_collection_plan_bundle(
+        project_root=root,
+        plan_path=plan_path,
+        region_registry_path=registry_path,
+    )
+    paths.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        paths.manifest_path,
+        {
+            "schema_version": "wb_collection_plan_manifest_v2",
+            "run_id": run_id,
+            "collection_plan_id": FOUR_REGION_PLAN_ID,
+            "query_pack_id": bundle.query_pack.query_pack_id,
+            "query_pack_version": bundle.query_pack.version,
+            "query_pack_sha256": bundle.query_pack_sha256,
+            "collection_plan_sha256": bundle.collection_plan_sha256,
+            "region_registry_sha256": bundle.region_registry_sha256,
+            "effective_plan_sha256": "a" * 64,
+            "publication_mode": "none",
+            "sellers_mode": "disabled",
+            "proxy_rotation_mode": "disabled",
+            "started_at_utc": started_at_utc,
+            "finished_at_utc": finished_at_utc,
+            "status": "success",
+            "complete": True,
+        },
+    )
+    return paths.manifest_path
+
+
+def _test_collection_lineage(
+    root: Path,
+    config: Any,
+    plan_path: Path,
+    *,
+    run_id: str = RUN_ID,
+) -> dict[str, Any]:
+    _ensure_collection_manifest(root, run_id=run_id)
+    bundle = load_collection_plan_bundle(
+        project_root=root,
+        plan_path=plan_path,
+        region_registry_path=root / REGISTRY_RELATIVE,
+    )
+    return four_region._collection_lineage(
+        config=config,
+        bundle=bundle,
+        paths=ScopedPaths.build(
+            project_root=root,
+            collection_plan_id=FOUR_REGION_PLAN_ID,
+            run_id=run_id,
+        ),
+        run_id=run_id,
+    )
 
 
 class FourRegionFakeTransport:
@@ -821,13 +1045,22 @@ def test_four_region_inputs_preserve_repeated_position_facts_and_dedup_sellers(
     _write_json(
         paths.manifest_path,
         {
+            "schema_version": "wb_collection_plan_manifest_v2",
             "run_id": RUN_ID,
+            "collection_plan_id": FOUR_REGION_PLAN_ID,
+            "query_pack_id": bundle.query_pack.query_pack_id,
+            "query_pack_version": bundle.query_pack.version,
             "status": "success",
             "complete": True,
             "collection_plan_sha256": bundle.collection_plan_sha256,
             "query_pack_sha256": bundle.query_pack_sha256,
             "region_registry_sha256": bundle.region_registry_sha256,
             "effective_plan_sha256": "a" * 64,
+            "publication_mode": "none",
+            "sellers_mode": "disabled",
+            "proxy_rotation_mode": "disabled",
+            "started_at_utc": "2026-07-26T00:16:00+00:00",
+            "finished_at_utc": "2026-07-26T00:30:00+00:00",
             "totals": {
                 "regions_ok": 4,
                 "queries_ok": 120,
@@ -958,14 +1191,28 @@ def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, config, plan_path = _project(tmp_path, monkeypatch)
-    artifact_root = root / "data/marts/wb_four_region/test"
+    artifact_root = (
+        root
+        / "data/marts/wb_four_region"
+        / FOUR_REGION_PLAN_ID
+        / RUN_ID
+    )
     artifact_root.mkdir(parents=True)
     seller_input = artifact_root / "products_for_sellers.csv"
-    bridge = artifact_root / "bridge.csv"
-    seller_output = artifact_root / "sellers.csv"
+    bridge = artifact_root / "regional_query_product_position_bridge.csv"
+    seller_output = (
+        root
+        / "data/marts/sellers_scoped"
+        / FOUR_REGION_PLAN_ID
+        / RUN_ID
+        / "sellers_daily.csv"
+    )
+    seller_output.parent.mkdir(parents=True, exist_ok=True)
     seller_input.write_text("input\n", encoding="utf-8")
     bridge.write_text("bridge\n", encoding="utf-8")
     seller_output.write_text("sellers\n", encoding="utf-8")
+    for path in (seller_input, bridge, seller_output):
+        path.chmod(0o600)
     inputs = FourRegionInputs(
         root=artifact_root,
         seller_input_path=seller_input,
@@ -978,9 +1225,21 @@ def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
         missing_supplier_products=7,
         duplicate_product_positions=25,
         region_counts={
-            region_id: {"pages": 300, "positions": 30000}
+            region_id: {
+                "pages": 300,
+                "positions": 30000,
+                "duplicate_product_positions": (
+                    25 if region_id == FOUR_REGION_IDS[0] else 0
+                ),
+                "max_position_capacity": 30000,
+            }
             for region_id in FOUR_REGION_IDS
         },
+        collection_lineage=_test_collection_lineage(
+            root,
+            config,
+            plan_path,
+        ),
     )
     monkeypatch.setattr(
         "app.serp.four_region_nightly.build_four_region_inputs",
@@ -1009,9 +1268,9 @@ def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
             "positions_count": 120000,
             "sellers_count": 3200,
             "legacy": {
-                "status": "migrated",
-                "positions": 100,
-                "sellers": 10,
+                "status": "source_absent",
+                "positions": 0,
+                "sellers": 0,
             },
         },
         now=lambda: datetime(
@@ -1050,15 +1309,14 @@ def test_downstream_failure_leaves_previous_scoped_latest_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, config, plan_path = _project(tmp_path, monkeypatch)
-    latest_path = (
-        root
-        / "state/wb_four_region_nightly"
-        / FOUR_REGION_PLAN_ID
-        / "latest.json"
+    _old_state_path, latest_path = _write_published_downstream_state(
+        root,
+        run_id="20260725_001600Z",
+        started_at_utc="2026-07-25T00:16:00+00:00",
+        finished_at_utc="2026-07-25T00:30:00+00:00",
     )
-    latest_path.parent.mkdir(parents=True)
-    previous = {"schema_version": "previous", "run_id": "old-run"}
-    _write_json(latest_path, previous)
+    previous_bytes = latest_path.read_bytes()
+    previous = _read_json(latest_path)
     artifact_root = root / "data/marts/wb_four_region/test"
     artifact_root.mkdir(parents=True)
     seller_input = artifact_root / "products_for_sellers.csv"
@@ -1066,6 +1324,7 @@ def test_downstream_failure_leaves_previous_scoped_latest_unchanged(
     seller_output = artifact_root / "sellers.csv"
     for path in (seller_input, bridge, seller_output):
         path.write_text("x\n", encoding="utf-8")
+        path.chmod(0o600)
     inputs = FourRegionInputs(
         root=artifact_root,
         seller_input_path=seller_input,
@@ -1078,9 +1337,19 @@ def test_downstream_failure_leaves_previous_scoped_latest_unchanged(
         missing_supplier_products=1,
         duplicate_product_positions=0,
         region_counts={
-            region_id: {"pages": 300, "positions": 30000}
+            region_id: {
+                "pages": 300,
+                "positions": 30000,
+                "duplicate_product_positions": 0,
+                "max_position_capacity": 30000,
+            }
             for region_id in FOUR_REGION_IDS
         },
+        collection_lineage=_test_collection_lineage(
+            root,
+            config,
+            plan_path,
+        ),
     )
     monkeypatch.setattr(
         "app.serp.four_region_nightly.build_four_region_inputs",
@@ -1117,6 +1386,7 @@ def test_downstream_failure_leaves_previous_scoped_latest_unchanged(
                 tzinfo=timezone.utc,
             ),
         )
+    assert latest_path.read_bytes() == previous_bytes
     assert _read_json(latest_path) == previous
     failure = _read_json(
         root
@@ -1427,7 +1697,7 @@ def test_same_run_downstream_lock_contention_preserves_published_state(
     assert attempt["lock_ownership"] == "not_acquired"
 
 
-def test_downstream_rejects_published_state_under_locks_without_mutation(
+def test_downstream_same_run_reconcile_is_idempotent_without_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1436,37 +1706,30 @@ def test_downstream_rejects_published_state_under_locks_without_mutation(
     state_before = state_path.read_bytes()
     latest_before = latest_path.read_bytes()
 
-    with pytest.raises(
-        CriticalPipelineError,
-        match="published downstream state is immutable",
-    ):
-        run_four_region_downstream(
-            config=config,
-            plan_path=plan_path,
-            run_id=RUN_ID,
-            sellers_factory=lambda **_kwargs: pytest.fail(
-                "completed state must fail before sellers"
-            ),
-            warehouse_ingest=lambda **_kwargs: pytest.fail(
-                "completed state must fail before warehouse"
-            ),
-            now=lambda: datetime(
-                2026,
-                7,
-                26,
-                4,
-                0,
-                tzinfo=timezone.utc,
-            ),
-        )
+    result = run_four_region_downstream(
+        config=config,
+        plan_path=plan_path,
+        run_id=RUN_ID,
+        sellers_factory=lambda **_kwargs: pytest.fail(
+            "completed state must not run sellers"
+        ),
+        warehouse_ingest=lambda **_kwargs: pytest.fail(
+            "completed state must not run warehouse"
+        ),
+        now=lambda: datetime(
+            2026,
+            7,
+            26,
+            4,
+            0,
+            tzinfo=timezone.utc,
+        ),
+    )
 
+    assert result["run_id"] == RUN_ID
     assert state_path.read_bytes() == state_before
     assert latest_path.read_bytes() == latest_before
-    artifacts = _attempt_artifacts(root)
-    assert len(artifacts) == 1
-    attempt = _read_json(artifacts[0])
-    assert attempt["stage"] == "state_transition"
-    assert attempt["lock_ownership"] == "acquired"
+    assert _attempt_artifacts(root) == []
 
 
 def test_attempt_artifact_failure_does_not_mask_preflight_error(
@@ -1504,58 +1767,57 @@ def test_attempt_artifact_failure_does_not_mask_preflight_error(
 
 
 def _publication_transaction(
-    root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    with_prior_latest: bool = True,
 ) -> tuple[
+    Path,
     four_region._AuthoritativeStateLease,
     Path,
     Path,
     dict[str, Any],
-    bytes,
+    bytes | None,
 ]:
-    state_path, latest_path = _downstream_state_paths(root)
-    latest_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_json(
-        latest_path,
-        {
-            "schema_version": "previous",
-            "run_id": "previous-run",
-        },
-    )
-    previous_latest = latest_path.read_bytes()
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    state_path, latest_path = _write_published_downstream_state(root)
+    state_payload = _read_json(state_path)
+    candidate_lineage = dict(state_payload["lineage"])
+    state_path.unlink()
+    latest_path.unlink()
+    prior_latest: bytes | None = None
+    if with_prior_latest:
+        _prior_state, latest_path = _write_published_downstream_state(
+            root,
+            run_id="20260725_001600Z",
+            started_at_utc="2026-07-25T00:16:00+00:00",
+            finished_at_utc="2026-07-25T00:30:00+00:00",
+        )
+        prior_latest = latest_path.read_bytes()
     lease = four_region._begin_authoritative_state_transition(
         state_path=state_path,
         latest_path=latest_path,
         run_id=RUN_ID,
         project_root=root,
+        candidate_lineage=candidate_lineage,
     )
-    state = {
-        "schema_version": "wb_four_region_downstream_v1",
-        "run_id": RUN_ID,
-        "collection_plan_id": FOUR_REGION_PLAN_ID,
-        "status": "success",
-        "complete": True,
-        "stage": "complete",
-    }
-    four_region._write_authoritative_state(lease, state)
-    encoded_state = four_region._json_bytes(state)
-    assert state_path.read_bytes() == encoded_state
-    assert lease.expected_state_sha256 == hashlib.sha256(
-        encoded_state
-    ).hexdigest()
+    four_region._write_authoritative_state(lease, state_payload)
     pointer = {
-        "schema_version": "wb_four_region_downstream_v1",
+        "schema_version": "wb_four_region_latest_v1",
         "run_id": RUN_ID,
         "state_path": state_path.relative_to(root).as_posix(),
         "state_sha256": lease.expected_state_sha256,
+        "lineage": candidate_lineage,
     }
-    return lease, state_path, latest_path, pointer, previous_latest
+    return root, lease, state_path, latest_path, pointer, prior_latest
 
 
 def test_publication_rejects_state_mutation_before_latest_replace(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lease, state_path, latest_path, pointer, previous_latest = (
-        _publication_transaction(tmp_path)
+    _root, lease, state_path, latest_path, pointer, prior_latest = (
+        _publication_transaction(tmp_path, monkeypatch)
     )
     state_path.write_bytes(b'{"mutated":true}\n')
     state_path.chmod(0o600)
@@ -1566,186 +1828,49 @@ def test_publication_rejects_state_mutation_before_latest_replace(
     ):
         four_region._write_authoritative_latest(lease, pointer)
 
-    assert latest_path.read_bytes() == previous_latest
-    assert lease.latest_write_installed is False
+    assert latest_path.read_bytes() == prior_latest
     assert lease.latest_published is False
 
 
-def test_publication_rolls_back_latest_after_state_postcheck_mutation(
+def test_completed_unpublished_reconcile_publishes_without_stage_rerun(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lease, state_path, latest_path, pointer, previous_latest = (
-        _publication_transaction(tmp_path)
-    )
-    original_exchange = four_region._atomic_compare_exchange_bytes
-    injected = False
-
-    def mutate_after_latest(path: Path, **kwargs) -> None:
-        nonlocal injected
-        original_exchange(path, **kwargs)
-        if path == latest_path and not injected:
-            injected = True
-            state_path.write_bytes(b'{"mutated":"after-latest"}\n')
-            state_path.chmod(0o600)
-
-    monkeypatch.setattr(
-        four_region,
-        "_atomic_compare_exchange_bytes",
-        mutate_after_latest,
-    )
-
-    with pytest.raises(
-        CriticalPipelineError,
-        match="publication bytes mismatch",
-    ):
-        four_region._write_authoritative_latest(lease, pointer)
-
-    assert injected is True
-    assert latest_path.read_bytes() == previous_latest
-    assert lease.latest_write_installed is False
-    assert lease.latest_published is False
-
-
-def test_first_publication_removes_owned_latest_after_postcheck_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state_path, latest_path = _downstream_state_paths(tmp_path)
-    lease = four_region._begin_authoritative_state_transition(
-        state_path=state_path,
-        latest_path=latest_path,
-        run_id=RUN_ID,
-        project_root=tmp_path,
-    )
-    state = {
-        "schema_version": "wb_four_region_downstream_v1",
-        "run_id": RUN_ID,
-        "collection_plan_id": FOUR_REGION_PLAN_ID,
-        "status": "success",
-        "complete": True,
-    }
-    four_region._write_authoritative_state(lease, state)
-    pointer = {
-        "schema_version": "wb_four_region_downstream_v1",
-        "run_id": RUN_ID,
-        "state_path": state_path.relative_to(tmp_path).as_posix(),
-        "state_sha256": lease.expected_state_sha256,
-    }
-    original_exchange = four_region._atomic_compare_exchange_bytes
-    injected = False
-
-    def mutate_after_latest(path: Path, **kwargs) -> None:
-        nonlocal injected
-        original_exchange(path, **kwargs)
-        if path == latest_path and not injected:
-            injected = True
-            state_path.write_bytes(b'{"mutated":"first-publish"}\n')
-            state_path.chmod(0o600)
-
-    monkeypatch.setattr(
-        four_region,
-        "_atomic_compare_exchange_bytes",
-        mutate_after_latest,
-    )
-
-    with pytest.raises(
-        CriticalPipelineError,
-        match="publication bytes mismatch",
-    ):
-        four_region._write_authoritative_latest(lease, pointer)
-
-    assert injected is True
-    assert not latest_path.exists()
-    assert lease.latest_write_installed is False
-    assert lease.latest_published is False
-
-
-def test_publication_compare_exchange_preserves_racing_latest(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    lease, _state_path, latest_path, pointer, _previous_latest = (
-        _publication_transaction(tmp_path)
-    )
-    concurrent_latest = four_region._json_bytes(
-        {
-            "schema_version": "concurrent",
-            "run_id": "concurrent-run",
-        }
-    )
-    original_renameat2 = four_region._renameat2
-    injected = False
-
-    def race_before_exchange(
-        source: Path,
-        destination: Path,
-        flags: int,
-    ) -> None:
-        nonlocal injected
-        if (
-            destination == latest_path
-            and flags == four_region._RENAME_EXCHANGE
-            and not injected
-        ):
-            injected = True
-            latest_path.write_bytes(concurrent_latest)
-            latest_path.chmod(0o600)
-        original_renameat2(source, destination, flags)
-
-    monkeypatch.setattr(four_region, "_renameat2", race_before_exchange)
-
-    with pytest.raises(
-        CriticalPipelineError,
-        match="compare-exchange conflict",
-    ):
-        four_region._write_authoritative_latest(lease, pointer)
-
-    assert injected is True
-    assert latest_path.read_bytes() == concurrent_latest
-    assert lease.latest_write_installed is False
-    assert lease.latest_published is False
-
-
-def test_completed_unpublished_state_retries_without_downstream_rewrite(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    lease, state_path, latest_path, pointer, previous_latest = (
-        _publication_transaction(tmp_path)
+    root, lease, state_path, latest_path, pointer, prior_latest = (
+        _publication_transaction(tmp_path, monkeypatch)
     )
     state_before = state_path.read_bytes()
     state_inode = state_path.stat().st_ino
-    original_fsync_directory = four_region._fsync_directory
-    failed_once = False
+    original_replace = four_region._atomic_replace_bytes
 
-    def one_latest_fsync_failure(path: Path) -> None:
-        nonlocal failed_once
-        if path == latest_path.parent and not failed_once:
-            failed_once = True
-            raise OSError("injected directory fsync failure")
-        original_fsync_directory(path)
+    def fail_before_latest(path: Path, **kwargs) -> None:
+        if path == latest_path:
+            raise OSError("injected replace failure")
+        original_replace(path, **kwargs)
 
     monkeypatch.setattr(
         four_region,
-        "_fsync_directory",
-        one_latest_fsync_failure,
+        "_atomic_replace_bytes",
+        fail_before_latest,
     )
-    with pytest.raises(OSError, match="injected directory fsync failure"):
+    with pytest.raises(OSError, match="injected replace failure"):
         four_region._write_authoritative_latest(lease, pointer)
+    assert latest_path.read_bytes() == prior_latest
 
-    assert latest_path.read_bytes() == previous_latest
-    assert state_path.read_bytes() == state_before
-    assert state_path.stat().st_ino == state_inode
-
+    monkeypatch.setattr(
+        four_region,
+        "_atomic_replace_bytes",
+        original_replace,
+    )
     retry = four_region._begin_authoritative_state_transition(
         state_path=state_path,
         latest_path=latest_path,
         run_id=RUN_ID,
-        project_root=tmp_path,
+        project_root=root,
+        candidate_lineage=pointer["lineage"],
     )
     assert retry.reconcile_only is True
-    assert retry.state_written is True
+    assert retry.already_published is False
     retry_pointer = {
         **pointer,
         "state_sha256": retry.expected_state_sha256,
@@ -1754,62 +1879,279 @@ def test_completed_unpublished_state_retries_without_downstream_rewrite(
 
     assert state_path.read_bytes() == state_before
     assert state_path.stat().st_ino == state_inode
-    published = _read_json(latest_path)
-    assert published["state_sha256"] == hashlib.sha256(state_before).hexdigest()
+    assert _read_json(latest_path)["run_id"] == RUN_ID
 
 
-def test_downstream_reconciles_completed_unpublished_without_stages(
+def test_crash_after_latest_replace_keeps_consistent_candidate_for_reconcile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, lease, state_path, latest_path, pointer, _prior_latest = (
+        _publication_transaction(tmp_path, monkeypatch)
+    )
+    original_replace = four_region._atomic_replace_bytes
+
+    def crash_after_replace(path: Path, **kwargs) -> None:
+        original_replace(path, **kwargs)
+        if path == latest_path:
+            raise RuntimeError("injected crash after replace")
+
+    monkeypatch.setattr(
+        four_region,
+        "_atomic_replace_bytes",
+        crash_after_replace,
+    )
+    with pytest.raises(RuntimeError, match="injected crash"):
+        four_region._write_authoritative_latest(lease, pointer)
+
+    latest_before = latest_path.read_bytes()
+    assert _read_json(latest_path)["run_id"] == RUN_ID
+    assert _read_json(latest_path)["state_sha256"] == hashlib.sha256(
+        state_path.read_bytes()
+    ).hexdigest()
+    retry = four_region._begin_authoritative_state_transition(
+        state_path=state_path,
+        latest_path=latest_path,
+        run_id=RUN_ID,
+        project_root=root,
+        candidate_lineage=pointer["lineage"],
+    )
+    assert retry.already_published is True
+    monkeypatch.setattr(
+        four_region,
+        "_atomic_replace_bytes",
+        original_replace,
+    )
+    four_region._write_authoritative_latest(retry, pointer)
+    assert latest_path.read_bytes() == latest_before
+
+
+def test_post_replace_second_writer_is_never_rolled_back_to_older_latest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, lease, _state_path, latest_path, pointer, _prior_latest = (
+        _publication_transaction(tmp_path, monkeypatch)
+    )
+    original_replace = four_region._atomic_replace_bytes
+    newer_run_id = "20260727_001600Z"
+
+    def install_newer_after_candidate(path: Path, **kwargs) -> None:
+        original_replace(path, **kwargs)
+        if path == latest_path:
+            _write_published_downstream_state(
+                root,
+                run_id=newer_run_id,
+                started_at_utc="2026-07-27T00:16:00+00:00",
+                finished_at_utc="2026-07-27T00:30:00+00:00",
+            )
+
+    monkeypatch.setattr(
+        four_region,
+        "_atomic_replace_bytes",
+        install_newer_after_candidate,
+    )
+    with pytest.raises(
+        CriticalPipelineError,
+        match="publication bytes mismatch",
+    ):
+        four_region._write_authoritative_latest(lease, pointer)
+
+    assert _read_json(latest_path)["run_id"] == newer_run_id
+
+
+def test_directory_fsync_failure_never_triggers_compensating_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, lease, state_path, latest_path, pointer, _prior_latest = (
+        _publication_transaction(tmp_path, monkeypatch)
+    )
+    original_fsync = four_region._fsync_directory
+    failed = False
+
+    def fail_latest_fsync(path: Path) -> None:
+        nonlocal failed
+        if path == latest_path.parent and not failed:
+            failed = True
+            raise OSError("injected latest fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(four_region, "_fsync_directory", fail_latest_fsync)
+    with pytest.raises(OSError, match="injected latest fsync failure"):
+        four_region._write_authoritative_latest(lease, pointer)
+
+    assert _read_json(latest_path)["run_id"] == RUN_ID
+    assert _read_json(latest_path)["state_sha256"] == hashlib.sha256(
+        state_path.read_bytes()
+    ).hexdigest()
+    assert four_region._validate_latest_bytes(
+        latest_path.read_bytes(),
+        project_root=root,
+    )[0]["run_id"] == RUN_ID
+
+
+def test_minimal_completed_state_is_rejected_before_reconcile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, config, plan_path = _project(tmp_path, monkeypatch)
+    lineage = _test_collection_lineage(root, config, plan_path)
     state_path, latest_path = _downstream_state_paths(root)
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    completed = {
-        "schema_version": "wb_four_region_downstream_v1",
-        "run_id": RUN_ID,
-        "collection_plan_id": FOUR_REGION_PLAN_ID,
-        "status": "success",
-        "complete": True,
-        "stage": "complete",
-    }
-    _write_json(state_path, completed)
-    state_before = state_path.read_bytes()
-    state_inode = state_path.stat().st_ino
-
-    result = run_four_region_downstream(
-        config=config,
-        plan_path=plan_path,
-        run_id=RUN_ID,
-        sellers_factory=lambda **_kwargs: pytest.fail(
-            "reconcile must not run sellers"
-        ),
-        warehouse_ingest=lambda **_kwargs: pytest.fail(
-            "reconcile must not run warehouse"
-        ),
-        now=lambda: datetime(
-            2026,
-            7,
-            26,
-            4,
-            0,
-            tzinfo=timezone.utc,
-        ),
+    _write_canonical_json(
+        state_path,
+        {
+            "schema_version": "wb_four_region_downstream_v1",
+            "run_id": RUN_ID,
+            "collection_plan_id": FOUR_REGION_PLAN_ID,
+            "status": "success",
+            "complete": True,
+        },
     )
 
-    assert result == completed
-    assert state_path.read_bytes() == state_before
-    assert state_path.stat().st_ino == state_inode
-    latest = _read_json(latest_path)
-    assert latest["run_id"] == RUN_ID
-    assert latest["state_sha256"] == hashlib.sha256(state_before).hexdigest()
+    with pytest.raises(
+        CriticalPipelineError,
+        match="state contract mismatch",
+    ):
+        four_region._begin_authoritative_state_transition(
+            state_path=state_path,
+            latest_path=latest_path,
+            run_id=RUN_ID,
+            project_root=root,
+            candidate_lineage=lineage,
+        )
+
+
+def test_older_completed_reconcile_cannot_replace_newer_latest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    old_state, latest_path = _write_published_downstream_state(
+        root,
+        run_id=RUN_ID,
+        started_at_utc="2026-07-26T00:16:00+00:00",
+        finished_at_utc="2026-07-26T00:30:00+00:00",
+    )
+    latest_path.unlink()
+    _new_state, latest_path = _write_published_downstream_state(
+        root,
+        run_id="20260727_001600Z",
+        started_at_utc="2026-07-27T00:16:00+00:00",
+        finished_at_utc="2026-07-27T00:30:00+00:00",
+    )
+    old_state_before = old_state.read_bytes()
+    latest_before = latest_path.read_bytes()
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="latest is newer",
+    ):
+        run_four_region_downstream(
+            config=config,
+            plan_path=plan_path,
+            run_id=RUN_ID,
+            sellers_factory=lambda **_kwargs: pytest.fail(
+                "older reconcile must not run sellers"
+            ),
+            warehouse_ingest=lambda **_kwargs: pytest.fail(
+                "older reconcile must not run warehouse"
+            ),
+            now=lambda: datetime(
+                2026,
+                7,
+                26,
+                4,
+                0,
+                tzinfo=timezone.utc,
+            ),
+        )
+
+    assert old_state.read_bytes() == old_state_before
+    assert latest_path.read_bytes() == latest_before
+
+
+def test_newer_completed_state_can_replace_older_latest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, lease, _state_path, latest_path, pointer, _prior_latest = (
+        _publication_transaction(tmp_path, monkeypatch)
+    )
+    four_region._write_authoritative_latest(lease, pointer)
+    assert _read_json(latest_path)["run_id"] == RUN_ID
+
+
+def test_equal_lineage_time_for_different_run_cannot_replace_latest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    state_path, latest_path = _write_published_downstream_state(root)
+    state_payload = _read_json(state_path)
+    state_path.unlink()
+    latest_path.unlink()
+    _other_state, latest_path = _write_published_downstream_state(
+        root,
+        run_id="20260726_001601Z",
+        started_at_utc="2026-07-26T00:16:00+00:00",
+        finished_at_utc="2026-07-26T00:31:00+00:00",
+    )
+    latest_before = latest_path.read_bytes()
+    _write_canonical_json(state_path, state_payload)
+    lineage = _test_collection_lineage(root, config, plan_path)
+
+    with pytest.raises(CriticalPipelineError, match="latest is newer"):
+        four_region._begin_authoritative_state_transition(
+            state_path=state_path,
+            latest_path=latest_path,
+            run_id=RUN_ID,
+            project_root=root,
+            candidate_lineage=lineage,
+        )
+
+    assert latest_path.read_bytes() == latest_before
+
+
+@pytest.mark.parametrize(
+    ("field_path", "replacement"),
+    [
+        (("artifacts", "bridge_sha256"), "0" * 64),
+        (("warehouse", "status"), "failed"),
+        (("lineage", "collection_manifest_sha256"), "1" * 64),
+    ],
+)
+def test_completed_reconcile_rejects_malformed_hash_or_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field_path: tuple[str, str],
+    replacement: str,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    state_path, latest_path = _write_published_downstream_state(root)
+    latest_path.unlink()
+    payload = _read_json(state_path)
+    payload[field_path[0]][field_path[1]] = replacement
+    _write_canonical_json(state_path, payload)
+    lineage = _test_collection_lineage(root, config, plan_path)
+
+    with pytest.raises(CriticalPipelineError):
+        four_region._begin_authoritative_state_transition(
+            state_path=state_path,
+            latest_path=latest_path,
+            run_id=RUN_ID,
+            project_root=root,
+            candidate_lineage=lineage,
+        )
 
 
 def test_authoritative_lease_rejects_inactive_and_reused_writes(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lease, _state_path, _latest_path, pointer, _previous_latest = (
-        _publication_transaction(tmp_path)
+    _root, lease, _state_path, _latest_path, pointer, _prior_latest = (
+        _publication_transaction(tmp_path, monkeypatch)
     )
     four_region._write_authoritative_latest(lease, pointer)
 
