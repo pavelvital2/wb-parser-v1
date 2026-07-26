@@ -1,6 +1,6 @@
 # WB query packs and regions
 
-Status: Stage 1 implemented; runtime collection is not implemented
+Status: Stage 2 isolated runner implemented; live pilot not executed
 
 ## Scope
 
@@ -14,9 +14,9 @@ loaders for future scoped WB collection:
 - fail-closed query-pack provenance;
 - a canonical, secret-free effective-plan snapshot contract for Stage 2.
 
-Stage 1 does not add a CLI command, perform HTTP requests, resolve
-destinations, create run snapshots, write parser state, publish latest data,
-run sellers, refresh the warehouse or change the nightly pipeline.
+Stage 1 itself did not add runtime behavior. Stage 2 adds an explicit isolated
+runner and scoped storage contract, but does not enable the tracked pilot or
+change the nightly pipeline.
 
 ## Tracked configuration
 
@@ -126,6 +126,45 @@ closed.
 Stage 1 does not call this function for the committed disabled pilot plan and
 does not create an effective-plan runtime file.
 
+## Stage 2 isolated runner
+
+The opt-in command is:
+
+```text
+python main.py --config config/config.yaml collection-plan \
+  --plan-file config/wb/collection_plans/{collection_plan_id}.json \
+  --no-publish
+```
+
+The equivalent dedicated launcher is
+`scripts/run_wb_collection_plan.py`. The command fails closed for a disabled
+plan. The committed pilot remains disabled, so neither command performs live
+HTTP unless a later owner-approved change enables an eligible plan.
+
+The runner:
+
+- acquires daily, pipeline, warehouse-refresh and collection-plan locks
+  non-blockingly in that order and retains them through final manifest fsync;
+- resolves `xinfo.dest` before each serial region scope;
+- checks one unchanged egress identity through the same proxy session and stores
+  only a masked value plus an experiment-local salted hash;
+- sends the exact resolved value as the search `dest`;
+- performs one request per task against one pinned endpoint, without retry,
+  fallback switching or proxy rotation;
+- records `resolved_and_sent` only as client-side request lifecycle evidence;
+- never claims that the search server applied the destination;
+- refuses to start within five minutes of the 23:45 MSK preflight cutoff.
+
+All outputs remain under:
+
+```text
+data/{raw,staging,marts}/serp_scoped/{plan}/{region}/{run_id}/
+state/wb_collection_plans/{plan}/{run_id}/
+```
+
+There is no scoped `latest` in Stage 2. The runner never writes global SERP
+latest, seller exports, global run-report latest or warehouse data.
+
 ## Validation
 
 Loaders reject:
@@ -147,6 +186,7 @@ Loaders reject:
 
 ## Stop gate
 
-Stage 2 remains unapproved in this implementation. There is no regional runner,
-HTTP/smoke/pilot, destination resolver, runtime snapshot, lock orchestration,
-scoped storage, warehouse migration, Parser Data API change or schedule.
+The Stage 2 implementation is stopped before live execution. The tracked plan
+and regions remain disabled; no resolver/search smoke or pilot has run.
+Scoped publication, warehouse migration, Parser Data API changes and scheduling
+remain unapproved.

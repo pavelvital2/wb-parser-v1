@@ -45,6 +45,17 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_p = sub.add_parser("cleanup", help="Retention cleanup for runtime files")
     cleanup_p.add_argument("--apply", action="store_true", help="Actually delete files (default is dry-run)")
 
+    collection_plan_p = sub.add_parser(
+        "collection-plan",
+        help="Run one isolated WB collection plan without publication",
+    )
+    collection_plan_p.add_argument("--plan-file", required=True)
+    collection_plan_p.add_argument(
+        "--no-publish",
+        action="store_true",
+        required=True,
+    )
+
     run_p = sub.add_parser("run", help="Run one component or pipeline")
     run_p.add_argument("target", choices=_RUN_TARGETS)
     _add_run_options(run_p)
@@ -296,6 +307,36 @@ def cmd_run(args: argparse.Namespace, target_override: str | None = None) -> int
         return 1
 
 
+def cmd_collection_plan(args: argparse.Namespace) -> int:
+    from app.serp.collection_plan import CollectionPlanValidationError
+    from app.serp.collection_plan_runner import run_collection_plan
+
+    config = load_config(args.config)
+    plan_path = Path(args.plan_file)
+    if not plan_path.is_absolute():
+        plan_path = config.project_root / plan_path
+    try:
+        manifest = run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=args.no_publish,
+        )
+    except (CriticalPipelineError, CollectionPlanValidationError) as exc:
+        print(str(exc))
+        return 1
+    print(
+        json.dumps(
+            {
+                "run_id": manifest["run_id"],
+                "status": manifest["status"],
+                "complete": manifest["complete"],
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -306,6 +347,8 @@ def main() -> int:
         return cmd_runs(args.config, args.limit)
     if args.command == "cleanup":
         return cmd_cleanup(args.config, args.apply)
+    if args.command == "collection-plan":
+        return cmd_collection_plan(args)
     if args.command == "run":
         return cmd_run(args)
     if args.command in _RUN_TARGETS:

@@ -63,18 +63,48 @@ def _unlock_fd(fd: int) -> None:
 
 
 @contextmanager
-def _acquire_recovery_guard(lock_path: Path) -> Iterator[Path]:
+def _acquire_recovery_guard(
+    lock_path: Path,
+    *,
+    blocking: bool = True,
+) -> Iterator[Path]:
     guard_path = _guard_file(lock_path)
     guard_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(guard_path, os.O_CREAT | os.O_RDWR)
+    locked = False
     try:
-        _lock_fd(fd, blocking=True)
+        _lock_fd(fd, blocking=blocking)
+        locked = True
         yield guard_path
     finally:
         try:
-            _unlock_fd(fd)
+            if locked:
+                _unlock_fd(fd)
         finally:
             os.close(fd)
+
+
+@contextmanager
+def acquire_advisory_lock(path: Path) -> Iterator[Path]:
+    """Acquire a persistent-file advisory lock without waiting."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+    locked = False
+    try:
+        try:
+            _lock_fd(fd, blocking=False)
+            locked = True
+        except BlockingIOError as exc:
+            raise RunLockedError(f"Another run is active. lock={path}") from exc
+        yield path
+    finally:
+        if locked:
+            try:
+                _unlock_fd(fd)
+            except OSError:
+                pass
+        os.close(fd)
 
 
 def _pid_alive_windows(pid: int) -> bool:
@@ -200,6 +230,7 @@ def acquire_run_lock(
     run_id: str,
     enabled: bool,
     stale_seconds: int,
+    guard_blocking: bool = True,
 ) -> Iterator[Path | None]:
     if not enabled:
         yield None
@@ -217,49 +248,54 @@ def acquire_run_lock(
         return fd
 
     f = None
-    with _acquire_recovery_guard(lock_path):
-        try:
-            fd = _create_lock()
-        except FileExistsError:
-            recoverable, reason, meta = _recover_existing_lock(lock_path, stale_seconds=stale_seconds)
-            if not recoverable:
-                raise RunLockedError(f"Another run is active. lock={lock_path} reason={reason} meta={meta[:300]}")
-
+    try:
+        with _acquire_recovery_guard(lock_path, blocking=guard_blocking):
             try:
-                lock_path.unlink(missing_ok=True)
                 fd = _create_lock()
-            except FileExistsError as exc:
-                raise RunLockedError(f"Run lock recovery raced with another run: {lock_path} reason={reason}") from exc
-            except Exception as exc:
-                raise RunLockedError(f"Run lock recovery failed: {lock_path} reason={reason} ({exc})") from exc
+            except FileExistsError:
+                recoverable, reason, meta = _recover_existing_lock(lock_path, stale_seconds=stale_seconds)
+                if not recoverable:
+                    raise RunLockedError(f"Another run is active. lock={lock_path} reason={reason} meta={meta[:300]}")
 
-        payload = {
-            "lock_version": 2,
-            "pid": os.getpid(),
-            "ppid": os.getppid(),
-            "hostname": socket.gethostname(),
-            "target": target,
-            "run_id": run_id,
-            "started_at_utc": utc_now_iso(),
-        }
+                try:
+                    lock_path.unlink(missing_ok=True)
+                    fd = _create_lock()
+                except FileExistsError as exc:
+                    raise RunLockedError(f"Run lock recovery raced with another run: {lock_path} reason={reason}") from exc
+                except Exception as exc:
+                    raise RunLockedError(f"Run lock recovery failed: {lock_path} reason={reason} ({exc})") from exc
 
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        f = os.fdopen(fd, "w", encoding="utf-8")
-        try:
-            f.write(json.dumps(payload, ensure_ascii=False))
-            f.flush()
-            os.fsync(f.fileno())
-        except Exception:
+            payload = {
+                "lock_version": 2,
+                "pid": os.getpid(),
+                "ppid": os.getppid(),
+                "hostname": socket.gethostname(),
+                "target": target,
+                "run_id": run_id,
+                "started_at_utc": utc_now_iso(),
+            }
+
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            f = os.fdopen(fd, "w", encoding="utf-8")
             try:
-                lock_path.unlink(missing_ok=True)
+                f.write(json.dumps(payload, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
             except Exception:
-                pass
-            try:
-                f.close()
-            except Exception:
-                pass
-            raise
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                raise
+    except BlockingIOError as exc:
+        raise RunLockedError(
+            f"Run lock recovery guard is busy: {_guard_file(lock_path)}"
+        ) from exc
 
     try:
         yield lock_path
