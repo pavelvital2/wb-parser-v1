@@ -113,6 +113,17 @@ before shared lock acquisition. The final supervisor/cutover must replace the
 pre-cutover mode in a separate reviewed change; it must not silently bypass
 the guard.
 
+Downstream `runs/<run_id>/state.json` is authoritative and may be written only
+while all collection-plan exclusion locks are held. A successful or complete
+state is immutable. `latest.json` is published under the same lock ownership
+and pins the exact state bytes by SHA-256. Rejected resumes, preflight failures,
+lock contention and attempts against an already completed/published run never
+rewrite either file. Their sanitized class-only diagnostics are separate,
+immutable files under
+`state/wb_four_region_nightly/<plan>/attempts/<run_id>/<attempt_id>.json`.
+Failure to persist this best-effort diagnostic must not mask the original
+pipeline error.
+
 ### Scoped Sellers
 
 A complete four-region generation is converted deterministically into:

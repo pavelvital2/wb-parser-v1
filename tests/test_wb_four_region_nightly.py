@@ -14,6 +14,7 @@ import pytest
 
 from app.common.config import load_config
 from app.common.exceptions import CriticalPipelineError
+from app.common.run_lock import acquire_advisory_lock
 from app.serp.collection_plan import (
     EffectiveEndpointPolicy,
     load_collection_plan_bundle,
@@ -60,6 +61,60 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
+    )
+
+
+def _downstream_state_paths(root: Path) -> tuple[Path, Path]:
+    state_path = (
+        root
+        / "state/wb_four_region_nightly"
+        / FOUR_REGION_PLAN_ID
+        / RUN_ID
+        / "state.json"
+    )
+    return state_path, state_path.parent.parent / "latest.json"
+
+
+def _write_published_downstream_state(
+    root: Path,
+) -> tuple[Path, Path]:
+    state_path, latest_path = _downstream_state_paths(root)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        state_path,
+        {
+            "schema_version": "wb_four_region_downstream_v1",
+            "run_id": RUN_ID,
+            "collection_plan_id": FOUR_REGION_PLAN_ID,
+            "status": "success",
+            "complete": True,
+            "stage": "complete",
+        },
+    )
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        latest_path,
+        {
+            "schema_version": "wb_four_region_downstream_v1",
+            "run_id": RUN_ID,
+            "state_path": state_path.relative_to(root).as_posix(),
+            "state_sha256": hashlib.sha256(
+                state_path.read_bytes()
+            ).hexdigest(),
+        },
+    )
+    return state_path, latest_path
+
+
+def _attempt_artifacts(root: Path) -> list[Path]:
+    return sorted(
+        (
+            root
+            / "state/wb_four_region_nightly"
+            / FOUR_REGION_PLAN_ID
+            / "attempts"
+            / RUN_ID
+        ).glob("*.json")
     )
 
 
@@ -882,19 +937,17 @@ def test_launcher_blocks_downstream_for_partial_collection(
     )
     assert four_region_launcher.main() == 1
     assert called["downstream"] is False
-    state = _read_json(
-        tmp_path
-        / "state/wb_four_region_nightly"
-        / FOUR_REGION_PLAN_ID
-        / RUN_ID
-        / "state.json"
-    )
-    assert [item["region_id"] for item in state["regions"]] == list(
+    state_path, _latest_path = _downstream_state_paths(tmp_path)
+    assert not state_path.exists()
+    artifacts = _attempt_artifacts(tmp_path)
+    assert len(artifacts) == 1
+    attempt = _read_json(artifacts[0])
+    assert [item["region_id"] for item in attempt["regions"]] == list(
         FOUR_REGION_IDS
     )
-    assert state["sellers"]["status"] == "not_run"
-    assert state["warehouse"]["status"] == "not_run"
-    assert state["totals"]["missing_supplier_products"] is None
+    assert attempt["stage"] == "collection"
+    assert attempt["lock_ownership"] == "not_acquired"
+    assert attempt["authoritative_state_changed"] is False
 
 
 def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
@@ -1122,18 +1175,17 @@ def test_pre_cutover_downstream_guard_rejects_before_lock(
             now=lambda: current,
         )
     assert lock_calls == 0
-    failure = _read_json(
-        root
-        / "state/wb_four_region_nightly"
-        / FOUR_REGION_PLAN_ID
-        / RUN_ID
-        / "state.json"
-    )
-    assert failure["stage"] == "preflight"
-    assert failure["execution_contract"]["mode"] == (
+    state_path, _latest_path = _downstream_state_paths(root)
+    assert not state_path.exists()
+    artifacts = _attempt_artifacts(root)
+    assert len(artifacts) == 1
+    attempt = _read_json(artifacts[0])
+    assert attempt["stage"] == "preflight"
+    assert attempt["lock_ownership"] == "not_acquired"
+    assert attempt["execution_contract"]["mode"] == (
         PRE_CUTOVER_DOWNSTREAM_MODE
     )
-    assert failure["execution_contract"]["legacy_nightly_start_msk"] == (
+    assert attempt["execution_contract"]["legacy_nightly_start_msk"] == (
         LEGACY_NIGHTLY_START_MSK
     )
 
@@ -1141,8 +1193,11 @@ def test_pre_cutover_downstream_guard_rejects_before_lock(
 def test_pre_cutover_runtime_drift_rejected_before_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    ) -> None:
     root, config, plan_path = _project(tmp_path, monkeypatch)
+    state_path, latest_path = _write_published_downstream_state(root)
+    state_before = state_path.read_bytes()
+    latest_before = latest_path.read_bytes()
     plan = _read_json(plan_path)
     plan["runtime_window"]["scheduled_start_msk"] = "01:00"
     _write_json(plan_path, plan)
@@ -1175,15 +1230,13 @@ def test_pre_cutover_runtime_drift_rejected_before_lock(
             ),
         )
     assert lock_calls == 0
-    failure = _read_json(
-        root
-        / "state/wb_four_region_nightly"
-        / FOUR_REGION_PLAN_ID
-        / RUN_ID
-        / "state.json"
-    )
-    assert failure["stage"] == "preflight"
-    assert failure["execution_contract"] == {
+    assert state_path.read_bytes() == state_before
+    assert latest_path.read_bytes() == latest_before
+    artifacts = _attempt_artifacts(root)
+    assert len(artifacts) == 1
+    attempt = _read_json(artifacts[0])
+    assert attempt["stage"] == "preflight"
+    assert attempt["execution_contract"] == {
         "mode": PRE_CUTOVER_DOWNSTREAM_MODE,
         "legacy_nightly_start_msk": "00:15",
         "legacy_boundary_source": "pre_cutover_contract_v1",
@@ -1245,7 +1298,7 @@ def test_launcher_preserves_authoritative_downstream_failure_state(
     )
     monkeypatch.setattr(
         four_region_launcher,
-        "write_four_region_failure_preview",
+        "write_four_region_failure_attempt",
         lambda **_kwargs: pytest.fail(
             "launcher must not overwrite downstream state"
         ),
@@ -1270,3 +1323,178 @@ def test_launcher_preserves_authoritative_downstream_failure_state(
         "stage": "warehouse",
         "authoritative": True,
     }
+
+
+def test_launcher_rejected_published_resume_preserves_state_and_latest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state_path, latest_path = _write_published_downstream_state(tmp_path)
+    state_before = state_path.read_bytes()
+    latest_before = latest_path.read_bytes()
+    monkeypatch.setattr(
+        four_region_launcher,
+        "load_config",
+        lambda _path: SimpleNamespace(project_root=tmp_path),
+    )
+
+    def rejected_resume(**_kwargs):
+        raise CriticalPipelineError("sensitive-marker-should-not-persist")
+
+    monkeypatch.setattr(
+        four_region_launcher,
+        "run_collection_plan",
+        rejected_resume,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "run_four_region_downstream",
+        lambda **_kwargs: pytest.fail("downstream must remain blocked"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_wb_four_region_nightly.py",
+            "--config",
+            "config/config.yaml",
+            "--plan-file",
+            str(tmp_path / "plan.json"),
+            "--no-publish",
+            "--resume-run-id",
+            RUN_ID,
+        ],
+    )
+
+    assert four_region_launcher.main() == 1
+    assert state_path.read_bytes() == state_before
+    assert latest_path.read_bytes() == latest_before
+    latest = _read_json(latest_path)
+    assert latest["state_sha256"] == hashlib.sha256(state_before).hexdigest()
+    artifacts = _attempt_artifacts(tmp_path)
+    assert len(artifacts) == 1
+    attempt = _read_json(artifacts[0])
+    assert attempt["failure_reason"] == "CriticalPipelineError"
+    assert attempt["lock_ownership"] == "not_acquired"
+    assert attempt["authoritative_state_changed"] is False
+    captured = capsys.readouterr()
+    assert "sensitive-marker" not in captured.err
+    assert "sensitive-marker" not in artifacts[0].read_text(
+        encoding="utf-8"
+    )
+
+
+def test_same_run_downstream_lock_contention_preserves_published_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    state_path, latest_path = _write_published_downstream_state(root)
+    state_before = state_path.read_bytes()
+    latest_before = latest_path.read_bytes()
+    paths = ScopedPaths.build(
+        project_root=root,
+        collection_plan_id=FOUR_REGION_PLAN_ID,
+        run_id=RUN_ID,
+    )
+
+    with acquire_advisory_lock(paths.lock_paths[0]):
+        with pytest.raises(CriticalPipelineError):
+            run_four_region_downstream(
+                config=config,
+                plan_path=plan_path,
+                run_id=RUN_ID,
+                now=lambda: datetime(
+                    2026,
+                    7,
+                    26,
+                    4,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+            )
+
+    assert state_path.read_bytes() == state_before
+    assert latest_path.read_bytes() == latest_before
+    artifacts = _attempt_artifacts(root)
+    assert len(artifacts) == 1
+    attempt = _read_json(artifacts[0])
+    assert attempt["stage"] == "lock_acquisition"
+    assert attempt["lock_ownership"] == "not_acquired"
+
+
+def test_downstream_rejects_published_state_under_locks_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    state_path, latest_path = _write_published_downstream_state(root)
+    state_before = state_path.read_bytes()
+    latest_before = latest_path.read_bytes()
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="published downstream state is immutable",
+    ):
+        run_four_region_downstream(
+            config=config,
+            plan_path=plan_path,
+            run_id=RUN_ID,
+            sellers_factory=lambda **_kwargs: pytest.fail(
+                "completed state must fail before sellers"
+            ),
+            warehouse_ingest=lambda **_kwargs: pytest.fail(
+                "completed state must fail before warehouse"
+            ),
+            now=lambda: datetime(
+                2026,
+                7,
+                26,
+                4,
+                0,
+                tzinfo=timezone.utc,
+            ),
+        )
+
+    assert state_path.read_bytes() == state_before
+    assert latest_path.read_bytes() == latest_before
+    artifacts = _attempt_artifacts(root)
+    assert len(artifacts) == 1
+    attempt = _read_json(artifacts[0])
+    assert attempt["stage"] == "state_transition"
+    assert attempt["lock_ownership"] == "acquired"
+
+
+def test_attempt_artifact_failure_does_not_mask_preflight_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["runtime_window"]["scheduled_start_msk"] = "01:00"
+    _write_json(plan_path, plan)
+    monkeypatch.setattr(
+        "app.serp.four_region_nightly._immutable_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("diagnostic write failed")
+        ),
+    )
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="reviewed runtime contract mismatch",
+    ):
+        run_four_region_downstream(
+            config=config,
+            plan_path=plan_path,
+            run_id=RUN_ID,
+            now=lambda: datetime(
+                2026,
+                7,
+                25,
+                21,
+                5,
+                tzinfo=timezone.utc,
+            ),
+        )

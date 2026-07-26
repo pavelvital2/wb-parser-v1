@@ -19,7 +19,7 @@ from app.serp.collection_plan_runner import run_collection_plan
 from app.serp.four_region_nightly import (
     PRE_CUTOVER_DOWNSTREAM_MODE,
     run_four_region_downstream,
-    write_four_region_failure_preview,
+    write_four_region_failure_attempt,
 )
 
 
@@ -88,12 +88,12 @@ def main() -> int:
         FileNotFoundError,
     ) as exc:
         if config is not None and not downstream_started:
-            write_four_region_failure_preview(
+            write_four_region_failure_attempt(
                 config=config,
                 run_id=run_id,
                 error=exc,
             )
-        print(str(exc), file=sys.stderr)
+        print(f"{exc.__class__.__name__}: operation failed", file=sys.stderr)
         return 1
     print(
         json.dumps(

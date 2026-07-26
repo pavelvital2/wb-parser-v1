@@ -482,8 +482,13 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   Its versioned legacy boundary is fixed at `00:15` MSK and must never be
   derived from mutable collection-plan runtime fields. The v2 plan runtime
   window must exact-match its reviewed contract; any drift fails before locks.
-  Downstream is the authoritative failure-state writer after it starts; the
-  launcher may write a collection preview only before that boundary.
+  Downstream may write authoritative run state only while it owns all
+  collection-plan exclusion locks. Completed/published run state is immutable,
+  and `latest.json` pins its exact SHA-256. Rejected resumes, preflight
+  failures and lock contention must not mutate run state or latest; they use
+  unique immutable sanitized attempt artifacts below
+  `state/wb_four_region_nightly/<plan>/attempts/<run_id>/`. Diagnostic write
+  failure must not mask the original pipeline error.
   Scoped `regional_run_quality.source_row_sha256` must cover every retained
   row field except the hash itself.
   Operational contract:

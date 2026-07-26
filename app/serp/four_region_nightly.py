@@ -4,7 +4,9 @@ import csv
 import hashlib
 import json
 import os
+import re
 import tempfile
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
@@ -37,6 +39,7 @@ EXPECTED_QUERIES = 30
 MAX_PAGES = 1200
 MAX_POSITIONS = 120000
 DOWNSTREAM_SCHEMA = "wb_four_region_downstream_v1"
+DOWNSTREAM_ATTEMPT_SCHEMA = "wb_four_region_attempt_v1"
 BRIDGE_FIELDS = list(PRODUCT_FIELDS)
 PRE_CUTOVER_DOWNSTREAM_MODE = "pre_cutover_legacy_nightly_protected_v1"
 LEGACY_NIGHTLY_START_MSK = "00:15"
@@ -50,6 +53,7 @@ REVIEWED_FOUR_REGION_RUNTIME_WINDOW = CollectionRuntimeWindow(
     finalization_reserve_seconds=60,
 )
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+_STATE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +146,17 @@ class DownstreamExecutionContract:
         }
 
 
+@dataclass(slots=True)
+class _AuthoritativeStateLease:
+    state_path: Path
+    latest_path: Path
+    run_id: str
+    prior_state_sha256: str | None
+    prior_latest_sha256: str | None
+    active: bool = True
+    state_written: bool = False
+
+
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -205,6 +220,234 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     finally:
         if temp is not None:
             temp.unlink(missing_ok=True)
+
+
+def _safe_state_parent(path: Path, *, project_root: Path) -> None:
+    root = Path(os.path.abspath(project_root))
+    lexical = Path(os.path.abspath(path))
+    try:
+        relative = lexical.parent.relative_to(root)
+    except ValueError as exc:
+        raise CriticalPipelineError(
+            "downstream state path escapes project root"
+        ) from exc
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise CriticalPipelineError(
+                "downstream state path uses symlink"
+            )
+        if current.exists():
+            if not current.is_dir():
+                raise CriticalPipelineError(
+                    "downstream state parent is not a directory"
+                )
+            continue
+        current.mkdir(mode=0o700)
+        parent_fd = os.open(current.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+
+def _immutable_json(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    project_root: Path,
+) -> None:
+    _safe_state_parent(path, project_root=project_root)
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
+        + "\n"
+    ).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _optional_regular_bytes(path: Path) -> bytes | None:
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise CriticalPipelineError(
+            "downstream authoritative state path is unsafe"
+        )
+    return path.read_bytes()
+
+
+def _begin_authoritative_state_transition(
+    *,
+    state_path: Path,
+    latest_path: Path,
+    run_id: str,
+    project_root: Path,
+) -> _AuthoritativeStateLease:
+    _safe_state_parent(state_path, project_root=project_root)
+    _safe_state_parent(latest_path, project_root=project_root)
+    state_bytes = _optional_regular_bytes(state_path)
+    latest_bytes = _optional_regular_bytes(latest_path)
+    state_payload: dict[str, Any] | None = None
+    if state_bytes is not None:
+        try:
+            loaded = json.loads(state_bytes)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise CriticalPipelineError(
+                "downstream authoritative state is invalid"
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise CriticalPipelineError(
+                "downstream authoritative state is invalid"
+            )
+        state_payload = loaded
+        if (
+            state_payload.get("schema_version") != DOWNSTREAM_SCHEMA
+            or state_payload.get("run_id") != run_id
+            or state_payload.get("collection_plan_id")
+            != FOUR_REGION_PLAN_ID
+            or state_payload.get("status") not in {"failed", "success"}
+            or type(state_payload.get("complete")) is not bool
+        ):
+            raise CriticalPipelineError(
+                "downstream authoritative state contract mismatch"
+            )
+
+    if latest_bytes is not None:
+        try:
+            loaded_latest = json.loads(latest_bytes)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise CriticalPipelineError(
+                "downstream latest pointer is invalid"
+            ) from exc
+        if not isinstance(loaded_latest, dict):
+            raise CriticalPipelineError(
+                "downstream latest pointer is invalid"
+            )
+        if loaded_latest.get("run_id") == run_id:
+            if state_bytes is None:
+                raise CriticalPipelineError(
+                    "published downstream state is missing"
+                )
+            expected_state_path = state_path.relative_to(
+                project_root
+            ).as_posix()
+            if (
+                loaded_latest.get("state_path") != expected_state_path
+                or loaded_latest.get("state_sha256")
+                != _sha256_bytes(state_bytes)
+            ):
+                raise CriticalPipelineError(
+                    "published downstream state integrity mismatch"
+                )
+            raise CriticalPipelineError(
+                "published downstream state is immutable"
+            )
+
+    if state_payload is not None and (
+        state_payload["status"] == "success"
+        or state_payload["complete"] is True
+    ):
+        raise CriticalPipelineError(
+            "completed downstream state is immutable"
+        )
+    return _AuthoritativeStateLease(
+        state_path=state_path,
+        latest_path=latest_path,
+        run_id=run_id,
+        prior_state_sha256=(
+            _sha256_bytes(state_bytes)
+            if state_bytes is not None
+            else None
+        ),
+        prior_latest_sha256=(
+            _sha256_bytes(latest_bytes)
+            if latest_bytes is not None
+            else None
+        ),
+    )
+
+
+def _write_authoritative_state(
+    lease: _AuthoritativeStateLease,
+    payload: Mapping[str, Any],
+) -> None:
+    if not lease.active or lease.state_written:
+        raise CriticalPipelineError(
+            "downstream authoritative state lease is not writable"
+        )
+    if (
+        payload.get("schema_version") != DOWNSTREAM_SCHEMA
+        or payload.get("run_id") != lease.run_id
+        or payload.get("collection_plan_id") != FOUR_REGION_PLAN_ID
+        or payload.get("status") not in {"failed", "success"}
+        or type(payload.get("complete")) is not bool
+        or (
+            payload.get("status") == "success"
+            and payload.get("complete") is not True
+        )
+        or (
+            payload.get("status") == "failed"
+            and payload.get("complete") is not False
+        )
+    ):
+        raise CriticalPipelineError(
+            "downstream authoritative state transition is invalid"
+        )
+    current = _optional_regular_bytes(lease.state_path)
+    current_sha256 = (
+        _sha256_bytes(current)
+        if current is not None
+        else None
+    )
+    if current_sha256 != lease.prior_state_sha256:
+        raise CriticalPipelineError(
+            "downstream authoritative state changed during transition"
+        )
+    _atomic_json(lease.state_path, payload)
+    lease.prior_state_sha256 = _sha256(lease.state_path)
+    lease.state_written = True
+
+
+def _write_authoritative_latest(
+    lease: _AuthoritativeStateLease,
+    payload: Mapping[str, Any],
+) -> None:
+    if (
+        not lease.active
+        or not lease.state_written
+        or payload.get("run_id") != lease.run_id
+        or payload.get("state_sha256") != lease.prior_state_sha256
+    ):
+        raise CriticalPipelineError(
+            "downstream latest transition is invalid"
+        )
+    current = _optional_regular_bytes(lease.latest_path)
+    current_sha256 = (
+        _sha256_bytes(current)
+        if current is not None
+        else None
+    )
+    if current_sha256 != lease.prior_latest_sha256:
+        raise CriticalPipelineError(
+            "downstream latest changed during transition"
+        )
+    _atomic_json(lease.latest_path, payload)
+    lease.prior_latest_sha256 = _sha256(lease.latest_path)
 
 
 def _load_scoped_products(path: Path) -> list[dict[str, str]]:
@@ -464,84 +707,121 @@ def build_four_region_inputs(
     )
 
 
-def write_four_region_failure_preview(
+def write_four_region_failure_attempt(
     *,
     config: AppConfig,
     run_id: str,
     error: Exception,
-) -> dict[str, Any]:
-    manifest_path = (
-        config.project_root
-        / "state/wb_collection_plans"
-        / FOUR_REGION_PLAN_ID
-        / run_id
-        / "manifest.json"
-    )
-    manifest: dict[str, Any] = {}
-    if manifest_path.is_file() and not manifest_path.is_symlink():
-        try:
-            manifest = _json(manifest_path)
-        except CriticalPipelineError:
-            manifest = {}
-    manifest_regions = {
-        item.get("region_id"): item
-        for item in manifest.get("regions", [])
-        if isinstance(item, dict)
-        and item.get("region_id") in FOUR_REGION_IDS
-    }
-    state = {
-        "schema_version": DOWNSTREAM_SCHEMA,
-        "run_id": run_id,
-        "collection_plan_id": FOUR_REGION_PLAN_ID,
-        "status": "failed",
-        "complete": False,
-        "stage": "collection",
-        "finished_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat(),
-        "regions": [
-            {
-                "region_id": region_id,
-                "status": manifest_regions.get(region_id, {}).get(
-                    "status",
-                    "not_started",
-                ),
+    stage: str = "collection",
+    lock_ownership: str = "not_acquired",
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    attempt_id: str | None = None,
+) -> dict[str, Any] | None:
+    try:
+        if not _STATE_ID_RE.fullmatch(run_id):
+            return None
+        created_at = now()
+        if created_at.tzinfo is None:
+            return None
+        effective_attempt_id = attempt_id or (
+            created_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+            + "-"
+            + uuid.uuid4().hex
+        )
+        if not _STATE_ID_RE.fullmatch(effective_attempt_id):
+            return None
+        manifest_path = (
+            config.project_root
+            / "state/wb_collection_plans"
+            / FOUR_REGION_PLAN_ID
+            / run_id
+            / "manifest.json"
+        )
+        manifest: dict[str, Any] = {}
+        if manifest_path.is_file() and not manifest_path.is_symlink():
+            try:
+                manifest = _json(manifest_path)
+            except CriticalPipelineError:
+                manifest = {}
+        manifest_regions = {
+            item.get("region_id"): item
+            for item in manifest.get("regions", [])
+            if isinstance(item, dict)
+            and item.get("region_id") in FOUR_REGION_IDS
+        }
+        artifact_path = (
+            config.project_root
+            / "state/wb_four_region_nightly"
+            / FOUR_REGION_PLAN_ID
+            / "attempts"
+            / run_id
+            / f"{effective_attempt_id}.json"
+        )
+        payload = {
+            "schema_version": DOWNSTREAM_ATTEMPT_SCHEMA,
+            "attempt_id": effective_attempt_id,
+            "run_id": run_id,
+            "collection_plan_id": FOUR_REGION_PLAN_ID,
+            "status": "failed",
+            "stage": stage,
+            "created_at_utc": created_at.astimezone(UTC)
+            .replace(microsecond=0)
+            .isoformat(),
+            "lock_ownership": lock_ownership,
+            "authoritative_state_changed": False,
+            "execution_contract": (
+                DownstreamExecutionContract.pre_cutover().evidence()
+            ),
+            "regions": [
+                {
+                    "region_id": region_id,
+                    "status": manifest_regions.get(region_id, {}).get(
+                        "status",
+                        "not_started",
+                    ),
+                    "pages": int(
+                        manifest_regions.get(region_id, {}).get(
+                            "pages_ok",
+                            0,
+                        )
+                    ),
+                    "positions": int(
+                        manifest_regions.get(region_id, {}).get(
+                            "products_ok",
+                            0,
+                        )
+                    ),
+                }
+                for region_id in FOUR_REGION_IDS
+            ],
+            "totals": {
                 "pages": int(
-                    manifest_regions.get(region_id, {}).get("pages_ok", 0)
+                    manifest.get("totals", {}).get("pages_ok", 0)
                 ),
                 "positions": int(
-                    manifest_regions.get(region_id, {}).get("products_ok", 0)
+                    manifest.get("totals", {}).get("products_ok", 0)
                 ),
-            }
-            for region_id in FOUR_REGION_IDS
-        ],
-        "totals": {
-            "pages": int(manifest.get("totals", {}).get("pages_ok", 0)),
-            "positions": int(
-                manifest.get("totals", {}).get("products_ok", 0)
-            ),
-            "unique_products": 0,
-            "unique_suppliers": 0,
-            "missing_supplier_products": None,
-            "duplicate_product_positions": int(
-                manifest.get("totals", {}).get(
-                    "duplicate_product_positions",
-                    0,
-                )
-            ),
-            "max_position_capacity": MAX_POSITIONS,
-        },
-        "sellers": {"status": "not_run"},
-        "warehouse": {"status": "not_run"},
-        "failure_reason": error.__class__.__name__,
-    }
-    state_path = (
-        config.project_root
-        / "state/wb_four_region_nightly"
-        / FOUR_REGION_PLAN_ID
-        / run_id
-        / "state.json"
-    )
-    _atomic_json(state_path, state)
-    return state
+                "duplicate_product_positions": int(
+                    manifest.get("totals", {}).get(
+                        "duplicate_product_positions",
+                        0,
+                    )
+                ),
+                "max_position_capacity": MAX_POSITIONS,
+            },
+            "failure_reason": error.__class__.__name__,
+            "artifact_path": artifact_path.relative_to(
+                config.project_root
+            ).as_posix(),
+        }
+        _immutable_json(
+            artifact_path,
+            payload,
+            project_root=config.project_root,
+        )
+        return payload
+    except Exception:
+        return None
 
 
 def _input_state(
@@ -650,6 +930,234 @@ def _warehouse_failure_state(
     return {"status": "not_run"}
 
 
+def _run_locked_four_region_downstream(
+    *,
+    config: AppConfig,
+    bundle: CollectionPlanBundle,
+    paths: ScopedPaths,
+    state_dir: Path,
+    state_path: Path,
+    latest_path: Path,
+    run_id: str,
+    deadline: DeadlineGuard,
+    execution_contract: DownstreamExecutionContract,
+    sellers_factory: Callable[..., SellersEngine],
+    warehouse_ingest: Callable[..., dict[str, Any]],
+) -> dict[str, Any]:
+    stage = "state_transition"
+    try:
+        lease = _begin_authoritative_state_transition(
+            state_path=state_path,
+            latest_path=latest_path,
+            run_id=run_id,
+            project_root=config.project_root,
+        )
+    except Exception as exc:
+        write_four_region_failure_attempt(
+            config=config,
+            run_id=run_id,
+            error=exc,
+            stage=stage,
+            lock_ownership="acquired",
+        )
+        raise
+
+    inputs: FourRegionInputs | None = None
+    seller_scope: SellersRunScope | None = None
+    sellers_result: Mapping[str, Any] | None = None
+    warehouse_result: Mapping[str, Any] | None = None
+    try:
+        stage = "input_build"
+        inputs = build_four_region_inputs(
+            config=config,
+            bundle=bundle,
+            run_id=run_id,
+        )
+        db = StateDB(state_dir / "sellers.sqlite")
+        db.init_schema()
+        context = RunContext(
+            run_id=run_id,
+            pipeline="wb_four_region_nightly",
+            component="sellers_regional",
+            started_at_utc=utc_now_iso(),
+        )
+        seller_scope = SellersRunScope(
+            input_products_path=inputs.seller_input_path,
+            raw_dir=config.project_root
+            / "data/raw/sellers_scoped"
+            / FOUR_REGION_PLAN_ID
+            / run_id,
+            staging_dir=config.project_root
+            / "data/staging/sellers_scoped"
+            / FOUR_REGION_PLAN_ID
+            / run_id,
+            mart_dir=config.project_root
+            / "data/marts/sellers_scoped"
+            / FOUR_REGION_PLAN_ID
+            / run_id,
+            checkpoint_component=(
+                f"sellers_regional:{FOUR_REGION_PLAN_ID}"
+            ),
+            request_timeout_provider=deadline.request_timeout,
+        )
+        stage = "sellers"
+        sellers_result = sellers_factory(
+            config=config,
+            db=db,
+            ctx=context,
+            run_scope=seller_scope,
+        ).run()
+        if (
+            sellers_result.get("status") != "success"
+            or int(sellers_result.get("items_error", 0)) != 0
+        ):
+            raise CriticalPipelineError(
+                "regional sellers stage is partial"
+            )
+        deadline.ensure_active()
+        stage = "warehouse"
+        warehouse_result = warehouse_ingest(
+            project_root=config.project_root,
+            run_id=run_id,
+            collection_plan_id=FOUR_REGION_PLAN_ID,
+            bridge_path=inputs.bridge_path,
+            sellers_path=Path(
+                str(sellers_result["mart_sellers_path"])
+            ),
+            collection_manifest_path=paths.manifest_path,
+        )
+        if warehouse_result.get("status") not in {
+            "success",
+            "already_ingested",
+        }:
+            raise CriticalPipelineError(
+                "regional warehouse stage failed"
+            )
+        deadline.ensure_active()
+        stage = "state_publication"
+        state = {
+            "schema_version": DOWNSTREAM_SCHEMA,
+            "run_id": run_id,
+            "collection_plan_id": FOUR_REGION_PLAN_ID,
+            "status": "success",
+            "complete": True,
+            "stage": "complete",
+            "execution_contract": execution_contract.evidence(),
+            "finished_at_utc": datetime.now(UTC)
+            .replace(microsecond=0)
+            .isoformat(),
+            "regions": [
+                {
+                    "region_id": region_id,
+                    **inputs.region_counts[region_id],
+                }
+                for region_id in FOUR_REGION_IDS
+            ],
+            "totals": {
+                "pages": sum(
+                    values["pages"]
+                    for values in inputs.region_counts.values()
+                ),
+                "positions": inputs.positions_count,
+                "unique_products": inputs.unique_products_count,
+                "unique_suppliers": inputs.unique_suppliers_count,
+                "missing_supplier_products": (
+                    inputs.missing_supplier_products
+                ),
+                "duplicate_product_positions": (
+                    inputs.duplicate_product_positions
+                ),
+                "max_position_capacity": MAX_POSITIONS,
+            },
+            "sellers": {
+                "status": "success",
+                "items_ok": int(sellers_result["items_ok"]),
+                "items_error": int(sellers_result["items_error"]),
+                "source_sha256": inputs.seller_input_sha256,
+            },
+            "warehouse": {
+                "status": warehouse_result["status"],
+                "positions_count": int(
+                    warehouse_result["positions_count"]
+                ),
+                "sellers_count": int(
+                    warehouse_result["sellers_count"]
+                ),
+                "legacy_yaroslavl": warehouse_result["legacy"],
+            },
+            "failure_reason": None,
+            "artifacts": {
+                "bridge_path": inputs.bridge_path.relative_to(
+                    config.project_root
+                ).as_posix(),
+                "bridge_sha256": inputs.bridge_sha256,
+                "seller_input_path": (
+                    inputs.seller_input_path.relative_to(
+                        config.project_root
+                    ).as_posix()
+                ),
+                "seller_input_sha256": inputs.seller_input_sha256,
+            },
+        }
+        _write_authoritative_state(lease, state)
+        pointer = {
+            "schema_version": DOWNSTREAM_SCHEMA,
+            "run_id": run_id,
+            "state_path": state_path.relative_to(
+                config.project_root
+            ).as_posix(),
+            "state_sha256": lease.prior_state_sha256,
+        }
+        _write_authoritative_latest(lease, pointer)
+        return state
+    except Exception as exc:
+        if not lease.state_written:
+            regions, totals = _input_state(inputs)
+            failure = {
+                "schema_version": DOWNSTREAM_SCHEMA,
+                "run_id": run_id,
+                "collection_plan_id": FOUR_REGION_PLAN_ID,
+                "status": "failed",
+                "complete": False,
+                "stage": stage,
+                "execution_contract": execution_contract.evidence(),
+                "finished_at_utc": datetime.now(UTC)
+                .replace(microsecond=0)
+                .isoformat(),
+                "regions": regions,
+                "totals": totals,
+                "sellers": _seller_failure_state(
+                    result=sellers_result,
+                    scope=seller_scope,
+                    stage=stage,
+                    source_sha256=(
+                        inputs.seller_input_sha256
+                        if inputs is not None
+                        else None
+                    ),
+                ),
+                "warehouse": _warehouse_failure_state(
+                    result=warehouse_result,
+                    stage=stage,
+                ),
+                "failure_reason": exc.__class__.__name__,
+            }
+            try:
+                _write_authoritative_state(lease, failure)
+            except Exception:
+                pass
+        write_four_region_failure_attempt(
+            config=config,
+            run_id=run_id,
+            error=exc,
+            stage=stage,
+            lock_ownership="acquired",
+        )
+        raise
+    finally:
+        lease.active = False
+
+
 def run_four_region_downstream(
     *,
     config: AppConfig,
@@ -673,12 +1181,9 @@ def run_four_region_downstream(
     )
     state_path = state_dir / "state.json"
     latest_path = state_dir.parent / "latest.json"
-    inputs: FourRegionInputs | None = None
-    seller_scope: SellersRunScope | None = None
-    sellers_result: Mapping[str, Any] | None = None
-    warehouse_result: Mapping[str, Any] | None = None
     execution_contract = DownstreamExecutionContract.pre_cutover()
     stage = "preflight"
+    locks_owned = False
     try:
         bundle = load_collection_plan_bundle(
             project_root=config.project_root,
@@ -706,167 +1211,27 @@ def run_four_region_downstream(
             paths=paths,
             stale_seconds=config.runtime.lock_stale_seconds,
         ):
-            stage = "input_build"
-            inputs = build_four_region_inputs(
+            locks_owned = True
+            return _run_locked_four_region_downstream(
                 config=config,
                 bundle=bundle,
+                paths=paths,
+                state_dir=state_dir,
+                state_path=state_path,
+                latest_path=latest_path,
                 run_id=run_id,
+                deadline=deadline,
+                execution_contract=execution_contract,
+                sellers_factory=sellers_factory,
+                warehouse_ingest=warehouse_ingest,
             )
-            db = StateDB(state_dir / "sellers.sqlite")
-            db.init_schema()
-            context = RunContext(
-                run_id=run_id,
-                pipeline="wb_four_region_nightly",
-                component="sellers_regional",
-                started_at_utc=utc_now_iso(),
-            )
-            seller_scope = SellersRunScope(
-                input_products_path=inputs.seller_input_path,
-                raw_dir=config.project_root
-                / "data/raw/sellers_scoped"
-                / FOUR_REGION_PLAN_ID
-                / run_id,
-                staging_dir=config.project_root
-                / "data/staging/sellers_scoped"
-                / FOUR_REGION_PLAN_ID
-                / run_id,
-                mart_dir=config.project_root
-                / "data/marts/sellers_scoped"
-                / FOUR_REGION_PLAN_ID
-                / run_id,
-                checkpoint_component=f"sellers_regional:{FOUR_REGION_PLAN_ID}",
-                request_timeout_provider=deadline.request_timeout,
-            )
-            stage = "sellers"
-            sellers_result = sellers_factory(
-                config=config,
-                db=db,
-                ctx=context,
-                run_scope=seller_scope,
-            ).run()
-            if (
-                sellers_result.get("status") != "success"
-                or int(sellers_result.get("items_error", 0)) != 0
-            ):
-                raise CriticalPipelineError("regional sellers stage is partial")
-            deadline.ensure_active()
-            stage = "warehouse"
-            warehouse_result = warehouse_ingest(
-                project_root=config.project_root,
-                run_id=run_id,
-                collection_plan_id=FOUR_REGION_PLAN_ID,
-                bridge_path=inputs.bridge_path,
-                sellers_path=Path(str(sellers_result["mart_sellers_path"])),
-                collection_manifest_path=paths.manifest_path,
-            )
-            if warehouse_result.get("status") not in {
-                "success",
-                "already_ingested",
-            }:
-                raise CriticalPipelineError("regional warehouse stage failed")
-            deadline.ensure_active()
-            stage = "state_publication"
-            state = {
-                "schema_version": DOWNSTREAM_SCHEMA,
-                "run_id": run_id,
-                "collection_plan_id": FOUR_REGION_PLAN_ID,
-                "status": "success",
-                "complete": True,
-                "stage": "complete",
-                "execution_contract": execution_contract.evidence(),
-                "finished_at_utc": datetime.now(UTC)
-                .replace(microsecond=0)
-                .isoformat(),
-                "regions": [
-                    {
-                        "region_id": region_id,
-                        **inputs.region_counts[region_id],
-                    }
-                    for region_id in FOUR_REGION_IDS
-                ],
-                "totals": {
-                    "pages": sum(
-                        values["pages"] for values in inputs.region_counts.values()
-                    ),
-                    "positions": inputs.positions_count,
-                    "unique_products": inputs.unique_products_count,
-                    "unique_suppliers": inputs.unique_suppliers_count,
-                    "missing_supplier_products": (
-                        inputs.missing_supplier_products
-                    ),
-                    "duplicate_product_positions": (
-                        inputs.duplicate_product_positions
-                    ),
-                    "max_position_capacity": MAX_POSITIONS,
-                },
-                "sellers": {
-                    "status": "success",
-                    "items_ok": int(sellers_result["items_ok"]),
-                    "items_error": int(sellers_result["items_error"]),
-                    "source_sha256": inputs.seller_input_sha256,
-                },
-                "warehouse": {
-                    "status": warehouse_result["status"],
-                    "positions_count": int(
-                        warehouse_result["positions_count"]
-                    ),
-                    "sellers_count": int(warehouse_result["sellers_count"]),
-                    "legacy_yaroslavl": warehouse_result["legacy"],
-                },
-                "failure_reason": None,
-                "artifacts": {
-                    "bridge_path": inputs.bridge_path.relative_to(
-                        config.project_root
-                    ).as_posix(),
-                    "bridge_sha256": inputs.bridge_sha256,
-                    "seller_input_path": inputs.seller_input_path.relative_to(
-                        config.project_root
-                    ).as_posix(),
-                    "seller_input_sha256": inputs.seller_input_sha256,
-                },
-            }
-            _atomic_json(state_path, state)
-            deadline.ensure_active()
-            pointer = {
-                "schema_version": DOWNSTREAM_SCHEMA,
-                "run_id": run_id,
-                "state_path": state_path.relative_to(
-                    config.project_root
-                ).as_posix(),
-                "state_sha256": _sha256(state_path),
-            }
-            _atomic_json(latest_path, pointer)
-            return state
     except Exception as exc:
-        regions, totals = _input_state(inputs)
-        failure = {
-            "schema_version": DOWNSTREAM_SCHEMA,
-            "run_id": run_id,
-            "collection_plan_id": FOUR_REGION_PLAN_ID,
-            "status": "failed",
-            "complete": False,
-            "stage": stage,
-            "execution_contract": execution_contract.evidence(),
-            "finished_at_utc": datetime.now(UTC)
-            .replace(microsecond=0)
-            .isoformat(),
-            "regions": regions,
-            "totals": totals,
-            "sellers": _seller_failure_state(
-                result=sellers_result,
-                scope=seller_scope,
+        if not locks_owned:
+            write_four_region_failure_attempt(
+                config=config,
+                run_id=run_id,
+                error=exc,
                 stage=stage,
-                source_sha256=(
-                    inputs.seller_input_sha256
-                    if inputs is not None
-                    else None
-                ),
-            ),
-            "warehouse": _warehouse_failure_state(
-                result=warehouse_result,
-                stage=stage,
-            ),
-            "failure_reason": exc.__class__.__name__,
-        }
-        _atomic_json(state_path, failure)
+                lock_ownership="not_acquired",
+            )
         raise
