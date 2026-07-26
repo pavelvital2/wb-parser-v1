@@ -272,6 +272,78 @@ def test_loader_performs_zero_network_calls_and_no_implicit_writes(
     assert after == before
 
 
+def test_bundle_rejects_plan_and_registry_outside_project_root(tmp_path: Path) -> None:
+    root = _copy_stage1_config(tmp_path)
+    external_plan = tmp_path / "external-plan.json"
+    external_registry = tmp_path / "external-regions.json"
+    shutil.copy2(root / PLAN_RELATIVE, external_plan)
+    shutil.copy2(root / REGIONS_RELATIVE, external_registry)
+
+    with pytest.raises(CollectionPlanValidationError, match="plan_path must be inside"):
+        load_collection_plan_bundle(
+            project_root=root,
+            plan_path=external_plan,
+            region_registry_path=root / REGIONS_RELATIVE,
+        )
+    with pytest.raises(
+        CollectionPlanValidationError,
+        match="region_registry_path must be inside",
+    ):
+        load_collection_plan_bundle(
+            project_root=root,
+            plan_path=root / PLAN_RELATIVE,
+            region_registry_path=external_registry,
+        )
+
+
+def test_bundle_rejects_noncanonical_and_symlinked_sources(tmp_path: Path) -> None:
+    root = _copy_stage1_config(tmp_path)
+    nested_plan = root / "config/wb/collection_plans/nested/plan.json"
+    nested_plan.parent.mkdir()
+    shutil.copy2(root / PLAN_RELATIVE, nested_plan)
+    alternate_registry = root / "config/wb/alternate-regions.json"
+    shutil.copy2(root / REGIONS_RELATIVE, alternate_registry)
+
+    with pytest.raises(CollectionPlanValidationError, match="direct child"):
+        load_collection_plan_bundle(
+            project_root=root,
+            plan_path=nested_plan,
+            region_registry_path=root / REGIONS_RELATIVE,
+        )
+    with pytest.raises(CollectionPlanValidationError, match="must be exactly"):
+        load_collection_plan_bundle(
+            project_root=root,
+            plan_path=root / PLAN_RELATIVE,
+            region_registry_path=alternate_registry,
+        )
+
+    plan_link = root / "config/wb/collection_plans/linked-plan.json"
+    plan_link.symlink_to(root / PLAN_RELATIVE)
+    with pytest.raises(CollectionPlanValidationError, match="symlinks"):
+        load_collection_plan_bundle(
+            project_root=root,
+            plan_path=plan_link,
+            region_registry_path=root / REGIONS_RELATIVE,
+        )
+
+    registry_target = root / "config/wb/regions-target.json"
+    (root / REGIONS_RELATIVE).replace(registry_target)
+    (root / REGIONS_RELATIVE).symlink_to(registry_target)
+    with pytest.raises(CollectionPlanValidationError, match="symlinks"):
+        _load_bundle(root)
+
+
+def test_bundle_rejects_symlinked_query_pack(tmp_path: Path) -> None:
+    root = _copy_stage1_config(tmp_path)
+    pack_path = root / PACK_RELATIVE
+    pack_target = root / "config/wb/query_packs/pack-target.json"
+    pack_path.replace(pack_target)
+    pack_path.symlink_to(pack_target)
+
+    with pytest.raises(CollectionPlanValidationError, match="symlinks"):
+        _load_bundle(root)
+
+
 @pytest.mark.parametrize(
     ("mutator", "error_match"),
     [
@@ -483,6 +555,125 @@ def test_effective_plan_hash_is_canonical_and_secret_free(tmp_path: Path) -> Non
     changed["depth"] = 200
     with pytest.raises(CollectionPlanValidationError, match="depth must be one of"):
         canonical_effective_plan_sha256(changed)
+
+
+@pytest.mark.parametrize(
+    "invalid_dest",
+    [
+        "Bearer secret\nsecond-line",
+        " -535680",
+        "-535680 ",
+        "1\t2",
+        "12345678901234567",
+        "",
+    ],
+)
+def test_effective_plan_builder_rejects_unsafe_destination_ids(
+    tmp_path: Path,
+    invalid_dest: str,
+) -> None:
+    root = _copy_stage1_config(tmp_path)
+    _enable_pilot(root)
+    bundle = _load_bundle(root)
+    destinations = _resolved_destinations()
+    destinations["moscow"] = ResolvedDestination(
+        region_id="moscow",
+        dest_id_observed=invalid_dest,
+        dest_resolved_at_utc="2026-07-26T07:31:00Z",
+    )
+
+    with pytest.raises(CollectionPlanValidationError, match="must match"):
+        build_effective_plan_snapshot(
+            bundle,
+            resolved_destinations=destinations,
+            page_size=100,
+            endpoint_policy=_endpoint_policy(),
+        )
+
+
+def test_effective_plan_validator_rejects_unsafe_destination_id(
+    tmp_path: Path,
+) -> None:
+    root = _copy_stage1_config(tmp_path)
+    _enable_pilot(root)
+    snapshot = build_effective_plan_snapshot(
+        _load_bundle(root),
+        resolved_destinations=_resolved_destinations(),
+        page_size=100,
+        endpoint_policy=_endpoint_policy(),
+    )
+    snapshot["regions"][0]["dest_id_observed"] = "Bearer secret\nsecond-line"
+
+    with pytest.raises(CollectionPlanValidationError, match="must match"):
+        canonical_effective_plan_sha256(snapshot)
+
+
+def test_effective_plan_rejects_duplicate_destinations(tmp_path: Path) -> None:
+    root = _copy_stage1_config(tmp_path)
+    _enable_pilot(root)
+    bundle = _load_bundle(root)
+    destinations = _resolved_destinations()
+    destinations["rostov-on-don"] = ResolvedDestination(
+        region_id="rostov-on-don",
+        dest_id_observed=destinations["moscow"].dest_id_observed,
+        dest_resolved_at_utc="2026-07-26T07:31:01Z",
+    )
+
+    with pytest.raises(CollectionPlanValidationError, match="distinct"):
+        build_effective_plan_snapshot(
+            bundle,
+            resolved_destinations=destinations,
+            page_size=100,
+            endpoint_policy=_endpoint_policy(),
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_timestamp",
+    [
+        "2026-07-26 07:31:00+00:00",
+        "2026-07-26T10:31:00+03:00",
+        "2026-02-30T07:31:00Z",
+    ],
+)
+def test_effective_plan_rejects_non_rfc3339_utc_timestamps(
+    tmp_path: Path,
+    invalid_timestamp: str,
+) -> None:
+    root = _copy_stage1_config(tmp_path)
+    _enable_pilot(root)
+    bundle = _load_bundle(root)
+    destinations = _resolved_destinations()
+    destinations["moscow"] = ResolvedDestination(
+        region_id="moscow",
+        dest_id_observed="-535680",
+        dest_resolved_at_utc=invalid_timestamp,
+    )
+
+    with pytest.raises(CollectionPlanValidationError, match="RFC 3339 UTC"):
+        build_effective_plan_snapshot(
+            bundle,
+            resolved_destinations=destinations,
+            page_size=100,
+            endpoint_policy=_endpoint_policy(),
+        )
+
+
+def test_effective_plan_validator_rejects_non_rfc3339_utc_timestamp(
+    tmp_path: Path,
+) -> None:
+    root = _copy_stage1_config(tmp_path)
+    _enable_pilot(root)
+    snapshot = build_effective_plan_snapshot(
+        _load_bundle(root),
+        resolved_destinations=_resolved_destinations(),
+        page_size=100,
+        endpoint_policy=_endpoint_policy(),
+    )
+    snapshot["regions"][0]["dest_resolved_at_utc"] = "2026-07-26 07:31:00+00:00"
+
+    with pytest.raises(CollectionPlanValidationError, match="RFC 3339 UTC"):
+        canonical_effective_plan_sha256(snapshot)
 
 
 def test_committed_disabled_plan_cannot_create_runtime_snapshot() -> None:

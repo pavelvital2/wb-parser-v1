@@ -82,6 +82,12 @@ SHA-256` mapping. Stage 2 must call this only while holding the documented
 plan-specific lock. Reusing an identity with a different hash fails closed;
 malformed provenance is never overwritten.
 
+Bundle loading is restricted to the project configuration tree. The plan must
+be a regular JSON file directly under `config/wb/collection_plans`, the region
+registry must be exactly `config/wb/regions.json`, and the referenced query pack
+must be a regular JSON file under `config/wb/query_packs`. Paths outside the
+project, nested plan paths, symlinks and symlink-based path escapes fail closed.
+
 ## Hash semantics
 
 The source hashes are SHA-256 over the exact bytes read:
@@ -111,6 +117,12 @@ pinned endpoint, and resolver values with
 allowlist and has no fields for cookies, request headers, credentials, tokens,
 proxy URLs or full egress IPs.
 
+`dest_id_observed` is limited to the non-secret WB destination contract
+`[+-]?[0-9]{1,16}`. Resolution timestamps must be valid RFC 3339 UTC values
+using `T` and either `Z` or `+00:00`. When
+`require_distinct_destinations=true`, duplicate observed destination IDs fail
+closed.
+
 Stage 1 does not call this function for the committed disabled pilot plan and
 does not create an effective-plan runtime file.
 
@@ -125,9 +137,12 @@ Loaders reject:
 - unknown category, query or region references;
 - enabled queries under disabled categories;
 - enabled plans referencing disabled packs, queries, categories or regions;
+- external, non-canonical or symlinked bundle source paths;
 - unsafe query-pack paths;
 - unsupported depth or unsafe publication/sellers/rotation modes;
 - non-null destination observations in tracked Stage 1 region config;
+- unsafe destination IDs, non-UTC/non-RFC-3339 timestamps and duplicate
+  resolved destinations;
 - malformed provenance and query-pack identity/hash mismatches.
 
 ## Stop gate

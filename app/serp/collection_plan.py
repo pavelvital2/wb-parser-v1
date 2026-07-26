@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +24,12 @@ SUPPORTED_DEPTHS = frozenset({100})
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_WB_DEST_ID_RE = re.compile(r"^[+-]?[0-9]{1,16}$")
+_RFC3339_UTC_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)$"
+)
 
 
 class CollectionPlanValidationError(ValueError):
@@ -716,16 +723,73 @@ def load_collection_plan(path: Path | str) -> CollectionPlan:
     )
 
 
-def _resolve_project_file(project_root: Path, relative_path: str) -> Path:
+def _require_regular_project_file(
+    path: Path | str,
+    *,
+    project_root: Path,
+    field: str,
+    exact_path: Path | None = None,
+    allowed_root: Path | None = None,
+    direct_child: bool = False,
+) -> Path:
     root = project_root.resolve()
-    resolved = (root / relative_path).resolve()
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    lexical_path = Path(os.path.abspath(candidate))
+
     try:
-        resolved.relative_to(root)
+        relative_path = lexical_path.relative_to(root)
     except ValueError as exc:
         raise CollectionPlanValidationError(
-            f"path escapes project root: {relative_path}"
+            f"{field} must be inside project root"
         ) from exc
-    return resolved
+
+    if exact_path is not None and lexical_path != exact_path:
+        raise CollectionPlanValidationError(
+            f"{field} must be exactly {exact_path.relative_to(root).as_posix()}"
+        )
+
+    if allowed_root is not None:
+        try:
+            allowed_relative = lexical_path.relative_to(allowed_root)
+        except ValueError as exc:
+            raise CollectionPlanValidationError(
+                f"{field} must be inside {allowed_root.relative_to(root).as_posix()}"
+            ) from exc
+        if direct_child and len(allowed_relative.parts) != 1:
+            raise CollectionPlanValidationError(
+                f"{field} must be a direct child of "
+                f"{allowed_root.relative_to(root).as_posix()}"
+            )
+
+    current = root
+    for part in relative_path.parts:
+        current /= part
+        if current.is_symlink():
+            raise CollectionPlanValidationError(f"{field} must not use symlinks")
+
+    try:
+        mode = lexical_path.stat().st_mode
+    except OSError as exc:
+        raise CollectionPlanValidationError(
+            f"{field} must be a readable regular file: {exc}"
+        ) from exc
+    if not stat.S_ISREG(mode):
+        raise CollectionPlanValidationError(f"{field} must be a regular file")
+    if lexical_path.suffix != ".json":
+        raise CollectionPlanValidationError(f"{field} must be a JSON file")
+    return lexical_path
+
+
+def _resolve_project_file(project_root: Path, relative_path: str) -> Path:
+    root = project_root.resolve()
+    return _require_regular_project_file(
+        relative_path,
+        project_root=root,
+        field="collection_plan.query_pack_file",
+        allowed_root=root / "config/wb/query_packs",
+    )
 
 
 def _validate_bundle_references(bundle: CollectionPlanBundle) -> None:
@@ -802,8 +866,21 @@ def load_collection_plan_bundle(
     provenance_path: Path | str | None = None,
 ) -> CollectionPlanBundle:
     root = Path(project_root).resolve()
-    plan = load_collection_plan(plan_path)
-    registry = load_region_registry(region_registry_path)
+    plan_source = _require_regular_project_file(
+        plan_path,
+        project_root=root,
+        field="plan_path",
+        allowed_root=root / "config/wb/collection_plans",
+        direct_child=True,
+    )
+    registry_source = _require_regular_project_file(
+        region_registry_path,
+        project_root=root,
+        field="region_registry_path",
+        exact_path=root / "config/wb/regions.json",
+    )
+    plan = load_collection_plan(plan_source)
+    registry = load_region_registry(registry_source)
     pack_path = _resolve_project_file(root, plan.query_pack_file)
     pack = load_query_pack(pack_path)
 
@@ -962,13 +1039,27 @@ def register_query_pack_provenance(
 
 def _validate_utc_timestamp(value: Any, *, field: str) -> str:
     text = _require_string(value, field=field)
+    if not _RFC3339_UTC_RE.fullmatch(text):
+        raise CollectionPlanValidationError(
+            f"{field} must be a strict RFC 3339 UTC timestamp"
+        )
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise CollectionPlanValidationError(f"{field} must be an RFC 3339 timestamp") from exc
+        raise CollectionPlanValidationError(
+            f"{field} must be a strict RFC 3339 UTC timestamp"
+        ) from exc
     if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
         raise CollectionPlanValidationError(f"{field} must use UTC")
     return text
+
+
+def _require_wb_dest_id(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not _WB_DEST_ID_RE.fullmatch(value):
+        raise CollectionPlanValidationError(
+            f"{field} must match [+-]?[0-9]{{1,16}}"
+        )
+    return value
 
 
 def build_effective_plan_snapshot(
@@ -1045,7 +1136,7 @@ def build_effective_plan_snapshot(
                 "latitude": region_by_id[region_id].latitude,
                 "longitude": region_by_id[region_id].longitude,
                 "address_label": region_by_id[region_id].address_label,
-                "dest_id_observed": _require_string(
+                "dest_id_observed": _require_wb_dest_id(
                     resolution.dest_id_observed,
                     field=f"resolved_destinations.{region_id}.dest_id_observed",
                 ),
@@ -1154,6 +1245,7 @@ def _validate_effective_plan_snapshot(snapshot: Mapping[str, Any]) -> None:
 
     region_items = _require_list(snapshot["regions"], field="effective_plan.regions")
     region_ids: set[str] = set()
+    destination_ids: list[str] = []
     for index, raw_region in enumerate(region_items):
         field = f"effective_plan.regions[{index}]"
         region = _require_object(raw_region, field=field)
@@ -1193,7 +1285,12 @@ def _validate_effective_plan_snapshot(snapshot: Mapping[str, Any]) -> None:
             maximum=Decimal("180"),
         )
         _require_string(region["address_label"], field=f"{field}.address_label")
-        _require_string(region["dest_id_observed"], field=f"{field}.dest_id_observed")
+        destination_ids.append(
+            _require_wb_dest_id(
+                region["dest_id_observed"],
+                field=f"{field}.dest_id_observed",
+            )
+        )
         _validate_utc_timestamp(
             region["dest_resolved_at_utc"],
             field=f"{field}.dest_resolved_at_utc",
@@ -1294,6 +1391,10 @@ def _validate_effective_plan_snapshot(snapshot: Mapping[str, Any]) -> None:
     if not quality.require_constant_egress or not quality.require_distinct_destinations:
         raise CollectionPlanValidationError(
             "effective_plan quality must require constant egress and distinct destinations"
+        )
+    if len(set(destination_ids)) != len(destination_ids):
+        raise CollectionPlanValidationError(
+            "effective_plan requires distinct dest_id_observed values"
         )
 
 
