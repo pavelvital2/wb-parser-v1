@@ -468,10 +468,21 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   `daily_run_quality.items_ok` remains a separate metric. Scoped regional
   seller resume must canonicalize one final row per expected supplier, require
   successful checkpoint/output agreement and report full verified-mart totals.
+  Critical deadline/cancellation pipeline exceptions from scoped sellers must
+  abort the loop immediately; they must not be downgraded to ordinary seller
+  network errors.
   For duplicate `nmId` occurrences, seller input chooses the first plan-ordered
   row with a non-empty `supplier_id`; all-missing products retain their first
   row and increment `missing_supplier_products`. The position bridge remains
   unchanged.
+  Before final cutover, four-region downstream uses the explicit
+  `pre_cutover_legacy_nightly_protected_v1` mode. It must reject protected or
+  insufficient-clearance starts before acquiring any shared lock; changing
+  this mode belongs to a separately reviewed supervisor/cutover change.
+  Downstream is the authoritative failure-state writer after it starts; the
+  launcher may write a collection preview only before that boundary.
+  Scoped `regional_run_quality.source_row_sha256` must cover every retained
+  row field except the hash itself.
   Operational contract:
   `docs/tasks/WB_FOUR_REGION_NIGHTLY_EXECPLAN_20260726.md`.
 - A WB top-20 product-only SERP run on 2026-06-12

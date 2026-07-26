@@ -96,6 +96,15 @@ warehouse/final pointer publication recheck the deadline. A completed SERP run
 whose downstream window expires is continued with an explicit
 `--downstream-only-run-id`; SERP is not repeated.
 
+Before final cutover, downstream additionally runs under the explicit
+`pre_cutover_legacy_nightly_protected_v1` execution contract. Before taking
+any shared lock it rejects starts during the protected interval beginning at
+the plan's 00:15 MSK boundary and rejects starts with less than the plan's
+minimum resume window before the next 00:15 boundary. The protected interval
+uses the reviewed maximum invocation duration from the plan. The final
+supervisor/cutover must replace this mode in a separate reviewed change; it
+must not silently bypass the guard.
+
 ### Scoped Sellers
 
 A complete four-region generation is converted deterministically into:
@@ -139,6 +148,11 @@ total, capped total, actual pages/positions, terminal reason, duplicate count,
 segment hash and egress verification for every region/query. These tables are
 the Phase A source contract for future regional summary, changes, movers,
 seller changes, run-quality and aggregate API work.
+
+The scoped `regional_run_quality.source_row_sha256` is computed from every
+retained column except the hash itself, including timing/deadline, query-pack
+provenance, actual and maximum counters, endpoint usage and source manifest
+hash. Any retained-field change therefore changes the row identity.
 
 Existing global WB warehouse history is migrated read-only into the regional
 warehouse with:
@@ -199,6 +213,12 @@ Phase A writes a scoped owner-report preview/state only. It includes every
 region, total pages/positions, unique products, seller status/counts,
 warehouse status and an explicit partial/failure reason. It does not send a
 Telegram message and does not modify the existing notifier.
+
+Once downstream starts, it is the sole writer of failure state. The state
+records the actual stage, completed input totals, available seller result or
+interrupted seller progress, warehouse status and a class-only sanitized
+failure reason. The launcher may write a collection preview only before
+downstream has begun.
 
 ## Locking And Publication
 

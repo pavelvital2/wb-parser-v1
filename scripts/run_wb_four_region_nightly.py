@@ -17,6 +17,7 @@ from app.common.exceptions import CriticalPipelineError
 from app.serp.collection_plan import CollectionPlanValidationError
 from app.serp.collection_plan_runner import run_collection_plan
 from app.serp.four_region_nightly import (
+    PRE_CUTOVER_DOWNSTREAM_MODE,
     run_four_region_downstream,
     write_four_region_failure_preview,
 )
@@ -50,6 +51,7 @@ def main() -> int:
         "%Y%m%d_%H%M%SZ"
         )
     )
+    downstream_started = False
     try:
         config = load_config(args.config)
         plan_path = Path(args.plan_file)
@@ -73,17 +75,19 @@ def main() -> int:
                 raise CriticalPipelineError(
                     "four-region collection is incomplete; downstream blocked"
                 )
+        downstream_started = True
         downstream = run_four_region_downstream(
             config=config,
             plan_path=plan_path,
             run_id=str(manifest["run_id"]),
+            execution_mode=PRE_CUTOVER_DOWNSTREAM_MODE,
         )
     except (
         CriticalPipelineError,
         CollectionPlanValidationError,
         FileNotFoundError,
     ) as exc:
-        if config is not None:
+        if config is not None and not downstream_started:
             write_four_region_failure_preview(
                 config=config,
                 run_id=run_id,

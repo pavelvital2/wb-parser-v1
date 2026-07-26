@@ -13,7 +13,9 @@ from app.warehouse.wb_regional import (
     DUCKDB_MAX_THREADS,
     DUCKDB_MEMORY_LIMIT,
     DUCKDB_MEMORY_LIMIT_SETTING,
+    REGIONAL_RUN_QUALITY_HASH_FIELDS,
     _create_schema,
+    _regional_run_quality_sha256,
     bounded_regional_connection,
     ingest_regional_run,
     migrate_legacy_yaroslavl,
@@ -349,6 +351,52 @@ def test_regional_warehouse_is_idempotent_and_assigns_legacy_to_yaroslavl(
         "endpoint_usage_json",
         "source_manifest_sha256",
     }.issubset(run_quality_columns)
+
+
+def test_regional_run_quality_hash_covers_every_retained_field(
+    tmp_path: Path,
+) -> None:
+    bridge_path, sellers_path = _sources(tmp_path)
+    ingest_regional_run(
+        project_root=tmp_path,
+        run_id="20260726_001600Z",
+        collection_plan_id="shevron-four-regions-top1000-v2",
+        bridge_path=bridge_path,
+        sellers_path=sellers_path,
+    )
+    database = duckdb.connect(
+        str(tmp_path / "data/warehouse/wb_regional/wb_regional.duckdb"),
+        read_only=True,
+    )
+    try:
+        description = database.execute(
+            "DESCRIBE regional_run_quality"
+        ).fetchall()
+        columns = [row[0] for row in description]
+        values = database.execute(
+            "SELECT * FROM regional_run_quality "
+            "WHERE region_id = 'moscow'"
+        ).fetchone()
+    finally:
+        database.close()
+    assert values is not None
+    stored = dict(zip(columns, values, strict=True))
+    stored_hash = stored.pop("source_row_sha256")
+    assert tuple(stored) == REGIONAL_RUN_QUALITY_HASH_FIELDS
+    assert _regional_run_quality_sha256(stored) == stored_hash
+
+    for field in REGIONAL_RUN_QUALITY_HASH_FIELDS:
+        mutated = dict(stored)
+        value = mutated[field]
+        if value is None:
+            mutated[field] = 1.0
+        elif type(value) is bool:
+            mutated[field] = not value
+        elif isinstance(value, int | float):
+            mutated[field] = value + 1
+        else:
+            mutated[field] = f"{value}-changed"
+        assert _regional_run_quality_sha256(mutated) != stored_hash, field
 
 
 def test_regional_warehouse_rejects_changed_source_for_same_run(

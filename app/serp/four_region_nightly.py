@@ -6,17 +6,22 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from zoneinfo import ZoneInfo
 
 from app.common.config import AppConfig
-from app.common.csv_io import write_csv_rows
+from app.common.csv_io import read_csv_rows, write_csv_rows
 from app.common.exceptions import CriticalPipelineError
 from app.common.run_context import RunContext, utc_now_iso
 from app.common.state_db import StateDB
 from app.sellers.engine import SellersEngine, SellersRunScope
-from app.serp.collection_plan import CollectionPlanBundle, load_collection_plan_bundle
+from app.serp.collection_plan import (
+    CollectionPlanBundle,
+    CollectionRuntimeWindow,
+    load_collection_plan_bundle,
+)
 from app.serp.collection_plan_runner import (
     DeadlineGuard,
     PRODUCT_FIELDS,
@@ -33,6 +38,8 @@ MAX_PAGES = 1200
 MAX_POSITIONS = 120000
 DOWNSTREAM_SCHEMA = "wb_four_region_downstream_v1"
 BRIDGE_FIELDS = list(PRODUCT_FIELDS)
+PRE_CUTOVER_DOWNSTREAM_MODE = "pre_cutover_legacy_nightly_protected_v1"
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +55,82 @@ class FourRegionInputs:
     missing_supplier_products: int
     duplicate_product_positions: int
     region_counts: Mapping[str, Mapping[str, int]]
+
+
+@dataclass(frozen=True, slots=True)
+class DownstreamExecutionContract:
+    mode: str
+    protected_start_msk: str
+    protected_duration_seconds: int
+    minimum_clearance_seconds: int
+
+    @classmethod
+    def pre_cutover(
+        cls,
+        runtime_window: CollectionRuntimeWindow,
+    ) -> "DownstreamExecutionContract":
+        return cls(
+            mode=PRE_CUTOVER_DOWNSTREAM_MODE,
+            protected_start_msk=runtime_window.scheduled_start_msk,
+            protected_duration_seconds=(
+                runtime_window.max_invocation_runtime_seconds
+            ),
+            minimum_clearance_seconds=(
+                runtime_window.minimum_resume_window_seconds
+            ),
+        )
+
+    def ensure_start_allowed(self, current: datetime) -> None:
+        if self.mode != PRE_CUTOVER_DOWNSTREAM_MODE:
+            raise CriticalPipelineError(
+                "unsupported downstream execution contract"
+            )
+        if current.tzinfo is None:
+            raise CriticalPipelineError(
+                "downstream clock must return timezone-aware datetime"
+            )
+        try:
+            hour, minute = (
+                int(part)
+                for part in self.protected_start_msk.split(":", 1)
+            )
+            protected_time = time(hour, minute)
+        except (TypeError, ValueError) as exc:
+            raise CriticalPipelineError(
+                "downstream protected start is invalid"
+            ) from exc
+        current_msk = current.astimezone(MOSCOW_TZ)
+        protected_start = datetime.combine(
+            current_msk.date(),
+            protected_time,
+            tzinfo=MOSCOW_TZ,
+        )
+        protected_end = protected_start + timedelta(
+            seconds=self.protected_duration_seconds
+        )
+        if protected_start <= current_msk < protected_end:
+            raise CriticalPipelineError(
+                "downstream blocked by protected legacy nightly window"
+            )
+        next_protected_start = (
+            protected_start
+            if current_msk < protected_start
+            else protected_start + timedelta(days=1)
+        )
+        if (
+            next_protected_start - current_msk
+        ).total_seconds() < self.minimum_clearance_seconds:
+            raise CriticalPipelineError(
+                "downstream has insufficient clearance before legacy nightly"
+            )
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "protected_start_msk": self.protected_start_msk,
+            "protected_duration_seconds": self.protected_duration_seconds,
+            "minimum_clearance_seconds": self.minimum_clearance_seconds,
+        }
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -399,6 +482,7 @@ def write_four_region_failure_preview(
         "collection_plan_id": FOUR_REGION_PLAN_ID,
         "status": "failed",
         "complete": False,
+        "stage": "collection",
         "finished_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "regions": [
             {
@@ -434,9 +518,7 @@ def write_four_region_failure_preview(
         },
         "sellers": {"status": "not_run"},
         "warehouse": {"status": "not_run"},
-        "failure_reason": str(
-            getattr(error, "code", error.__class__.__name__)
-        ).replace("\n", " ")[:100],
+        "failure_reason": error.__class__.__name__,
     }
     state_path = (
         config.project_root
@@ -449,6 +531,112 @@ def write_four_region_failure_preview(
     return state
 
 
+def _input_state(
+    inputs: FourRegionInputs | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if inputs is None:
+        return [], {
+            "pages": 0,
+            "positions": 0,
+            "unique_products": 0,
+            "unique_suppliers": 0,
+            "missing_supplier_products": None,
+            "duplicate_product_positions": 0,
+            "max_position_capacity": MAX_POSITIONS,
+        }
+    return (
+        [
+            {
+                "region_id": region_id,
+                "status": "success",
+                **inputs.region_counts[region_id],
+            }
+            for region_id in FOUR_REGION_IDS
+        ],
+        {
+            "pages": sum(
+                values["pages"]
+                for values in inputs.region_counts.values()
+            ),
+            "positions": inputs.positions_count,
+            "unique_products": inputs.unique_products_count,
+            "unique_suppliers": inputs.unique_suppliers_count,
+            "missing_supplier_products": inputs.missing_supplier_products,
+            "duplicate_product_positions": (
+                inputs.duplicate_product_positions
+            ),
+            "max_position_capacity": MAX_POSITIONS,
+        },
+    )
+
+
+def _seller_failure_state(
+    *,
+    result: Mapping[str, Any] | None,
+    scope: SellersRunScope | None,
+    stage: str,
+    source_sha256: str | None,
+) -> dict[str, Any]:
+    if result is not None:
+        return {
+            "status": str(result.get("status", "failed")),
+            "items_ok": int(result.get("items_ok", 0)),
+            "items_error": int(result.get("items_error", 0)),
+            "processed_sellers": int(
+                result.get("processed_sellers", 0)
+            ),
+            "source_sha256": source_sha256,
+        }
+    if stage != "sellers" or scope is None:
+        return {"status": "not_run"}
+    progress: dict[str, Any] = {
+        "status": "interrupted",
+        "items_ok": 0,
+        "items_error": 0,
+        "processed_sellers": 0,
+        "source_sha256": source_sha256,
+    }
+    mart_path = scope.mart_dir / "sellers_daily.csv"
+    if not mart_path.is_file() or mart_path.is_symlink():
+        return progress
+    try:
+        latest_by_seller: dict[str, str] = {}
+        for row in read_csv_rows(mart_path):
+            seller_id = str(row.get("supplier_id", "")).strip()
+            status = str(row.get("status", "")).strip()
+            if seller_id and status in {"success", "error"}:
+                latest_by_seller[seller_id] = status
+        progress["items_ok"] = sum(
+            status == "success"
+            for status in latest_by_seller.values()
+        )
+        progress["items_error"] = sum(
+            status == "error"
+            for status in latest_by_seller.values()
+        )
+        progress["processed_sellers"] = len(latest_by_seller)
+    except (OSError, UnicodeError, csv.Error):
+        progress["progress_status"] = "unavailable"
+    return progress
+
+
+def _warehouse_failure_state(
+    *,
+    result: Mapping[str, Any] | None,
+    stage: str,
+) -> dict[str, Any]:
+    if result is not None:
+        state = {"status": str(result.get("status", "failed"))}
+        for field in ("positions_count", "sellers_count"):
+            value = result.get(field)
+            if type(value) is int and value >= 0:
+                state[field] = value
+        return state
+    if stage == "warehouse":
+        return {"status": "failed"}
+    return {"status": "not_run"}
+
+
 def run_four_region_downstream(
     *,
     config: AppConfig,
@@ -457,21 +645,8 @@ def run_four_region_downstream(
     sellers_factory: Callable[..., SellersEngine] = SellersEngine,
     warehouse_ingest: Callable[..., dict[str, Any]] = ingest_regional_run,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    execution_mode: str = PRE_CUTOVER_DOWNSTREAM_MODE,
 ) -> dict[str, Any]:
-    bundle = load_collection_plan_bundle(
-        project_root=config.project_root,
-        plan_path=plan_path,
-        region_registry_path=config.project_root / "config/wb/regions.json",
-    )
-    validate_four_region_bundle(bundle)
-    runtime_window = bundle.collection_plan.runtime_window
-    if runtime_window is None:
-        raise CriticalPipelineError("four-region runtime window is missing")
-    deadline = DeadlineGuard.for_runtime_window(
-        runtime_window,
-        resume=True,
-        now=now,
-    )
     paths = ScopedPaths.build(
         project_root=config.project_root,
         collection_plan_id=FOUR_REGION_PLAN_ID,
@@ -486,11 +661,42 @@ def run_four_region_downstream(
     state_path = state_dir / "state.json"
     latest_path = state_dir.parent / "latest.json"
     inputs: FourRegionInputs | None = None
+    seller_scope: SellersRunScope | None = None
+    sellers_result: Mapping[str, Any] | None = None
+    warehouse_result: Mapping[str, Any] | None = None
+    execution_contract: DownstreamExecutionContract | None = None
+    stage = "preflight"
     try:
+        bundle = load_collection_plan_bundle(
+            project_root=config.project_root,
+            plan_path=plan_path,
+            region_registry_path=config.project_root / "config/wb/regions.json",
+        )
+        validate_four_region_bundle(bundle)
+        runtime_window = bundle.collection_plan.runtime_window
+        if runtime_window is None:
+            raise CriticalPipelineError(
+                "four-region runtime window is missing"
+            )
+        execution_contract = DownstreamExecutionContract.pre_cutover(
+            runtime_window
+        )
+        if execution_mode != execution_contract.mode:
+            raise CriticalPipelineError(
+                "downstream execution mode is not approved"
+            )
+        execution_contract.ensure_start_allowed(now())
+        deadline = DeadlineGuard.for_runtime_window(
+            runtime_window,
+            resume=True,
+            now=now,
+        )
+        stage = "lock_acquisition"
         with acquire_collection_plan_locks(
             paths=paths,
             stale_seconds=config.runtime.lock_stale_seconds,
         ):
+            stage = "input_build"
             inputs = build_four_region_inputs(
                 config=config,
                 bundle=bundle,
@@ -521,6 +727,7 @@ def run_four_region_downstream(
                 checkpoint_component=f"sellers_regional:{FOUR_REGION_PLAN_ID}",
                 request_timeout_provider=deadline.request_timeout,
             )
+            stage = "sellers"
             sellers_result = sellers_factory(
                 config=config,
                 db=db,
@@ -533,6 +740,7 @@ def run_four_region_downstream(
             ):
                 raise CriticalPipelineError("regional sellers stage is partial")
             deadline.ensure_active()
+            stage = "warehouse"
             warehouse_result = warehouse_ingest(
                 project_root=config.project_root,
                 run_id=run_id,
@@ -547,12 +755,15 @@ def run_four_region_downstream(
             }:
                 raise CriticalPipelineError("regional warehouse stage failed")
             deadline.ensure_active()
+            stage = "state_publication"
             state = {
                 "schema_version": DOWNSTREAM_SCHEMA,
                 "run_id": run_id,
                 "collection_plan_id": FOUR_REGION_PLAN_ID,
                 "status": "success",
                 "complete": True,
+                "stage": "complete",
+                "execution_contract": execution_contract.evidence(),
                 "finished_at_utc": datetime.now(UTC)
                 .replace(microsecond=0)
                 .isoformat(),
@@ -617,31 +828,41 @@ def run_four_region_downstream(
             _atomic_json(latest_path, pointer)
             return state
     except Exception as exc:
+        regions, totals = _input_state(inputs)
         failure = {
             "schema_version": DOWNSTREAM_SCHEMA,
             "run_id": run_id,
             "collection_plan_id": FOUR_REGION_PLAN_ID,
             "status": "failed",
             "complete": False,
+            "stage": stage,
+            "execution_contract": (
+                execution_contract.evidence()
+                if execution_contract is not None
+                else {
+                    "mode": execution_mode,
+                    "status": "not_validated",
+                }
+            ),
             "finished_at_utc": datetime.now(UTC)
             .replace(microsecond=0)
             .isoformat(),
-            "regions": [],
-            "totals": {
-                "pages": 0,
-                "positions": 0,
-                "unique_products": 0,
-                "unique_suppliers": 0,
-                "missing_supplier_products": (
-                    inputs.missing_supplier_products
+            "regions": regions,
+            "totals": totals,
+            "sellers": _seller_failure_state(
+                result=sellers_result,
+                scope=seller_scope,
+                stage=stage,
+                source_sha256=(
+                    inputs.seller_input_sha256
                     if inputs is not None
                     else None
                 ),
-                "duplicate_product_positions": 0,
-                "max_position_capacity": MAX_POSITIONS,
-            },
-            "sellers": {"status": "not_run"},
-            "warehouse": {"status": "not_run"},
+            ),
+            "warehouse": _warehouse_failure_state(
+                result=warehouse_result,
+                stage=stage,
+            ),
             "failure_reason": exc.__class__.__name__,
         }
         _atomic_json(state_path, failure)

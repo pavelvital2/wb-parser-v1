@@ -353,6 +353,99 @@ def test_scoped_sellers_deduplicate_suppliers_without_global_latest(
     assert len(read_csv_rows(Path(str(result["mart_sellers_path"])))) == 1
 
 
+def test_scoped_sellers_deadline_aborts_without_processing_next_sellers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(str(_make_config(tmp_path)))
+    input_path = (
+        tmp_path
+        / "data/marts/wb_four_region/plan/run/products_for_sellers.csv"
+    )
+    _write_products_csv(
+        input_path,
+        [
+            {
+                "run_id": "regional-run",
+                "query": f"q{index}",
+                "query_group": "pack",
+                "nmId": str(index),
+                "supplier_id": str(index * 1000),
+                "supplier_name": f"seller-{index}",
+                "status": "success",
+            }
+            for index in range(1, 4)
+        ],
+    )
+    db = StateDB(tmp_path / "state/wb_four_region/plan/run/sellers.sqlite")
+    db.init_schema()
+    ctx = RunContext(
+        run_id="20260726_001600Z",
+        pipeline="wb_four_region_nightly",
+        component="sellers_regional",
+        started_at_utc=utc_now_iso(),
+    )
+    timeout_calls = 0
+
+    def request_timeout(configured: float) -> float:
+        nonlocal timeout_calls
+        timeout_calls += 1
+        if timeout_calls == 2:
+            raise CriticalPipelineError("regional seller deadline reached")
+        return configured
+
+    scope = SellersRunScope(
+        input_products_path=input_path,
+        raw_dir=tmp_path / "data/raw/sellers_scoped/plan/run",
+        staging_dir=tmp_path / "data/staging/sellers_scoped/plan/run",
+        mart_dir=tmp_path / "data/marts/sellers_scoped/plan/run",
+        checkpoint_component="sellers_regional:plan",
+        request_timeout_provider=request_timeout,
+    )
+    response = _FakeSellerResponse(200, _success_payload("1000"))
+
+    class RecordingSession(_FakeSellerSession):
+        def __init__(self) -> None:
+            super().__init__(response)
+            self.calls = 0
+
+        def get(self, *args, **kwargs) -> _FakeSellerResponse:
+            self.calls += 1
+            self.response = _FakeSellerResponse(
+                200,
+                _success_payload("1000"),
+            )
+            return self.response
+
+    session = RecordingSession()
+    monkeypatch.setattr(
+        SellersEngine,
+        "_build_session",
+        lambda self: nullcontext(session),
+    )
+    monkeypatch.setattr(
+        "app.sellers.engine.time.sleep",
+        lambda _seconds: None,
+    )
+    with pytest.raises(
+        CriticalPipelineError,
+        match="regional seller deadline reached",
+    ):
+        SellersEngine(
+            config=config,
+            db=db,
+            ctx=ctx,
+            run_scope=scope,
+        ).run()
+    assert timeout_calls == 2
+    assert session.calls == 1
+    mart_rows = read_csv_rows(scope.mart_dir / "sellers_daily.csv")
+    assert [row["supplier_id"] for row in mart_rows] == ["1000"]
+    assert db.get_checkpoint(scope.checkpoint_component, "1000")
+    assert db.get_checkpoint(scope.checkpoint_component, "2000") is None
+    assert db.get_checkpoint(scope.checkpoint_component, "3000") is None
+
+
 def test_scoped_sellers_partial_resume_reports_full_verified_mart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

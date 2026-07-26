@@ -26,10 +26,56 @@ DUCKDB_MEMORY_LIMIT = "1GiB"
 DUCKDB_MEMORY_LIMIT_SETTING = "1.0 GiB"
 DUCKDB_MAX_THREADS = 2
 STALE_TEMP_SECONDS = 24 * 60 * 60
+REGIONAL_RUN_QUALITY_HASH_FIELDS = (
+    "run_id",
+    "run_date",
+    "region_id",
+    "region_provenance",
+    "collection_plan_id",
+    "query_pack_id",
+    "query_pack_version",
+    "status",
+    "complete",
+    "started_at_utc",
+    "finished_at_utc",
+    "deadline_utc",
+    "duration_seconds",
+    "items_ok",
+    "items_error",
+    "components_count",
+    "queries_expected",
+    "queries_ok",
+    "pages_max",
+    "pages_ok",
+    "positions_max",
+    "positions_ok",
+    "duplicate_product_positions",
+    "endpoint_usage_json",
+    "source_manifest_sha256",
+)
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _regional_run_quality_sha256(row: dict[str, Any]) -> str:
+    if set(row) != set(REGIONAL_RUN_QUALITY_HASH_FIELDS):
+        raise CriticalPipelineError(
+            "regional run quality hash payload does not match retained fields"
+        )
+    payload = {
+        field: row[field]
+        for field in REGIONAL_RUN_QUALITY_HASH_FIELDS
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _read_semicolon_csv(path: Path) -> list[dict[str, str]]:
@@ -1311,24 +1357,58 @@ def ingest_regional_run(
                 ]
                 run_quality_payload = {
                     "run_id": run_id,
+                    "run_date": _run_date(run_id),
                     "region_id": region_id,
-                    "status": region.get("status"),
-                    "complete": region.get("complete"),
-                    "queries_ok": region.get("queries_ok"),
-                    "pages_ok": region.get("pages_ok"),
-                    "positions_ok": region.get("products_ok"),
-                    "duplicate_product_positions": region.get(
-                        "duplicate_product_positions",
-                        0,
+                    "region_provenance": COLLECTED_REGION_PROVENANCE,
+                    "collection_plan_id": collection_plan_id,
+                    "query_pack_id": collection_manifest.get(
+                        "query_pack_id",
+                        "",
                     ),
-                }
-                source_row_sha256 = hashlib.sha256(
-                    json.dumps(
-                        run_quality_payload,
+                    "query_pack_version": collection_manifest.get(
+                        "query_pack_version",
+                        "",
+                    ),
+                    "status": region.get("status", ""),
+                    "complete": region.get("complete") is True,
+                    "started_at_utc": collection_manifest.get(
+                        "started_at_utc",
+                        "",
+                    ),
+                    "finished_at_utc": collection_manifest.get(
+                        "finished_at_utc",
+                        "",
+                    ),
+                    "deadline_utc": collection_manifest.get(
+                        "deadline_utc",
+                        "",
+                    ),
+                    "duration_seconds": None,
+                    "items_ok": int(region.get("products_ok", 0)),
+                    "items_error": 0,
+                    "components_count": 3,
+                    "queries_expected": len(query_rows),
+                    "queries_ok": int(region.get("queries_ok", 0)),
+                    "pages_max": len(query_rows) * 10,
+                    "pages_ok": int(region.get("pages_ok", 0)),
+                    "positions_max": len(query_rows) * 1000,
+                    "positions_ok": int(region.get("products_ok", 0)),
+                    "duplicate_product_positions": int(
+                        region.get(
+                            "duplicate_product_positions",
+                            0,
+                        )
+                    ),
+                    "endpoint_usage_json": json.dumps(
+                        collection_manifest.get("endpoint_usage", {}),
                         sort_keys=True,
                         separators=(",", ":"),
-                    ).encode("utf-8")
-                ).hexdigest()
+                    ),
+                    "source_manifest_sha256": collection_manifest_sha256,
+                }
+                source_row_sha256 = _regional_run_quality_sha256(
+                    run_quality_payload
+                )
                 connection.execute(
                     """
                     INSERT INTO regional_run_quality VALUES (
@@ -1337,35 +1417,10 @@ def ingest_regional_run(
                     )
                     """,
                     [
-                        run_id,
-                        _run_date(run_id),
-                        region_id,
-                        COLLECTED_REGION_PROVENANCE,
-                        collection_plan_id,
-                        collection_manifest.get("query_pack_id", ""),
-                        collection_manifest.get("query_pack_version", ""),
-                        region.get("status", ""),
-                        region.get("complete") is True,
-                        collection_manifest.get("started_at_utc", ""),
-                        collection_manifest.get("finished_at_utc", ""),
-                        collection_manifest.get("deadline_utc", ""),
-                        None,
-                        int(region.get("products_ok", 0)),
-                        0,
-                        3,
-                        len(query_rows),
-                        int(region.get("queries_ok", 0)),
-                        len(query_rows) * 10,
-                        int(region.get("pages_ok", 0)),
-                        len(query_rows) * 1000,
-                        int(region.get("products_ok", 0)),
-                        int(region.get("duplicate_product_positions", 0)),
-                        json.dumps(
-                            collection_manifest.get("endpoint_usage", {}),
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        collection_manifest_sha256,
+                        *[
+                            run_quality_payload[field]
+                            for field in REGIONAL_RUN_QUALITY_HASH_FIELDS
+                        ],
                         source_row_sha256,
                     ],
                 )

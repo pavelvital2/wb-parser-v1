@@ -13,6 +13,7 @@ from typing import Any, Mapping
 import pytest
 
 from app.common.config import load_config
+from app.common.exceptions import CriticalPipelineError
 from app.serp.collection_plan import (
     EffectiveEndpointPolicy,
     load_collection_plan_bundle,
@@ -30,6 +31,7 @@ from app.serp.collection_plan_runner import (
 from app.serp.four_region_nightly import (
     FOUR_REGION_IDS,
     FOUR_REGION_PLAN_ID,
+    PRE_CUTOVER_DOWNSTREAM_MODE,
     FourRegionInputs,
     build_four_region_inputs,
     deterministic_seller_rows,
@@ -950,6 +952,14 @@ def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
                 "sellers": 10,
             },
         },
+        now=lambda: datetime(
+            2026,
+            7,
+            26,
+            4,
+            0,
+            tzinfo=timezone.utc,
+        ),
     )
     assert state["complete"] is True
     assert [item["region_id"] for item in state["regions"]] == list(
@@ -1036,6 +1046,14 @@ def test_downstream_failure_leaves_previous_scoped_latest_unchanged(
             warehouse_ingest=lambda **_kwargs: (_ for _ in ()).throw(
                 RuntimeError("warehouse failed")
             ),
+            now=lambda: datetime(
+                2026,
+                7,
+                26,
+                4,
+                0,
+                tzinfo=timezone.utc,
+            ),
         )
     assert _read_json(latest_path) == previous
     failure = _read_json(
@@ -1046,5 +1064,138 @@ def test_downstream_failure_leaves_previous_scoped_latest_unchanged(
         / "state.json"
     )
     assert failure["complete"] is False
-    assert failure["warehouse"]["status"] == "not_run"
+    assert failure["stage"] == "warehouse"
+    assert failure["warehouse"]["status"] == "failed"
+    assert failure["sellers"] == {
+        "status": "success",
+        "items_ok": 1,
+        "items_error": 0,
+        "processed_sellers": 0,
+        "source_sha256": inputs.seller_input_sha256,
+    }
+    assert [item["region_id"] for item in failure["regions"]] == list(
+        FOUR_REGION_IDS
+    )
+    assert failure["totals"]["pages"] == 1200
+    assert failure["totals"]["positions"] == 120000
+    assert failure["totals"]["unique_products"] == 1
     assert failure["totals"]["missing_supplier_products"] == 1
+    assert failure["failure_reason"] == "RuntimeError"
+    assert "warehouse failed" not in json.dumps(failure)
+
+
+@pytest.mark.parametrize(
+    "current",
+    [
+        datetime(2026, 7, 25, 21, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 25, 21, 16, tzinfo=timezone.utc),
+    ],
+)
+def test_pre_cutover_downstream_guard_rejects_before_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    current: datetime,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    lock_calls = 0
+
+    def forbidden_locks(**_kwargs):
+        nonlocal lock_calls
+        lock_calls += 1
+        raise AssertionError("legacy window guard must run before locks")
+
+    monkeypatch.setattr(
+        "app.serp.four_region_nightly.acquire_collection_plan_locks",
+        forbidden_locks,
+    )
+    with pytest.raises(CriticalPipelineError, match="legacy nightly"):
+        run_four_region_downstream(
+            config=config,
+            plan_path=plan_path,
+            run_id=RUN_ID,
+            now=lambda: current,
+        )
+    assert lock_calls == 0
+    failure = _read_json(
+        root
+        / "state/wb_four_region_nightly"
+        / FOUR_REGION_PLAN_ID
+        / RUN_ID
+        / "state.json"
+    )
+    assert failure["stage"] == "preflight"
+    assert failure["execution_contract"]["mode"] == (
+        PRE_CUTOVER_DOWNSTREAM_MODE
+    )
+
+
+def test_launcher_preserves_authoritative_downstream_failure_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        four_region_launcher,
+        "load_config",
+        lambda _path: SimpleNamespace(project_root=tmp_path),
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "run_collection_plan",
+        lambda **_kwargs: {
+            "run_id": RUN_ID,
+            "status": "success",
+            "complete": True,
+        },
+    )
+    state_path = (
+        tmp_path
+        / "state/wb_four_region_nightly"
+        / FOUR_REGION_PLAN_ID
+        / RUN_ID
+        / "state.json"
+    )
+
+    def failed_downstream(**_kwargs):
+        state_path.parent.mkdir(parents=True)
+        _write_json(
+            state_path,
+            {
+                "status": "failed",
+                "stage": "warehouse",
+                "authoritative": True,
+            },
+        )
+        raise CriticalPipelineError("sanitized downstream failure")
+
+    monkeypatch.setattr(
+        four_region_launcher,
+        "run_four_region_downstream",
+        failed_downstream,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "write_four_region_failure_preview",
+        lambda **_kwargs: pytest.fail(
+            "launcher must not overwrite downstream state"
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_wb_four_region_nightly.py",
+            "--config",
+            "config/config.yaml",
+            "--plan-file",
+            str(tmp_path / "plan.json"),
+            "--no-publish",
+            "--resume-run-id",
+            RUN_ID,
+        ],
+    )
+    assert four_region_launcher.main() == 1
+    assert _read_json(state_path) == {
+        "status": "failed",
+        "stage": "warehouse",
+        "authoritative": True,
+    }

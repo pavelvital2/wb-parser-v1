@@ -589,6 +589,8 @@ class SellersEngine:
                 return response.status_code, None, f"http_{response.status_code}: {(response.text or '').strip()[:500]}", raw_file
             finally:
                 response.close()
+        except CriticalPipelineError:
+            raise
         except Exception as exc:
             return 0, None, f"request_failed:{exc.__class__.__name__}", ""
 
