@@ -204,6 +204,8 @@ class FakeTransport:
                 request_sent=True,
                 dest_id_sent=request.dest_id_observed,
                 http_status=498,
+                endpoint_id=request.endpoint_id,
+                attempted_endpoint_ids=(request.endpoint_id,),
             )
         if self.empty:
             products: list[Any] = []
@@ -754,6 +756,19 @@ def test_partial_http_failure_has_no_retry_and_cannot_be_complete(
     assert manifest["egress"]["constant"] is None
     assert manifest["egress"]["checks_completed"] == 1
     assert manifest["egress"]["checks_expected"] == 3
+    assert manifest["endpoint_usage"] == {
+        "primary": {"attempts": 2, "pages_ok": 1},
+        "fallback-1": {"attempts": 0, "pages_ok": 0},
+    }
+    assert manifest["regions"][0]["failed_endpoint_attempt"] == {
+        "query_id": "shevrony",
+        "page": 1,
+        "endpoint_id": "primary",
+        "attempted_endpoint_ids": ["primary"],
+        "error_code": "search_http_498",
+    }
+    assert manifest["error"]["endpoint_id"] == "primary"
+    assert manifest["error"]["attempted_endpoint_ids"] == ["primary"]
     assert manifest["regions"][0]["dest_resolution_status"] == "resolved_and_sent"
     assert manifest["regions"][0]["pages_ok"] == 1
     assert manifest["regions"][1]["status"] == "pending"
@@ -763,12 +778,24 @@ def test_partial_http_failure_has_no_retry_and_cannot_be_complete(
 
 
 @pytest.mark.parametrize(
-    ("transport", "error_match"),
+    ("transport", "error_match", "expected_error"),
     [
-        (FakeTransport(empty=True), "products_empty"),
-        (FakeTransport(product_count=99), "products_short"),
-        (FakeTransport(duplicate=True), "product_duplicate"),
-        (FakeTransport(malformed=True), "product_id_malformed"),
+        (FakeTransport(empty=True), "products_empty", "search_products_empty"),
+        (
+            FakeTransport(product_count=99),
+            "products_short",
+            "search_products_short expected=100 actual=99",
+        ),
+        (
+            FakeTransport(duplicate=True),
+            "product_duplicate",
+            "search_product_duplicate",
+        ),
+        (
+            FakeTransport(malformed=True),
+            "product_id_malformed",
+            "search_product_id_malformed",
+        ),
     ],
 )
 def test_payload_failures_are_fail_closed_without_retry(
@@ -776,6 +803,7 @@ def test_payload_failures_are_fail_closed_without_retry(
     monkeypatch: pytest.MonkeyPatch,
     transport: FakeTransport,
     error_match: str,
+    expected_error: str,
 ) -> None:
     root, config, plan_path = _project(tmp_path, monkeypatch)
     with pytest.raises(CollectionPlanRunError, match=error_match):
@@ -793,6 +821,19 @@ def test_payload_failures_are_fail_closed_without_retry(
     assert manifest["egress"]["constant"] is None
     assert manifest["egress"]["checks_completed"] == 1
     assert manifest["egress"]["checks_expected"] == 3
+    assert manifest["endpoint_usage"] == {
+        "primary": {"attempts": 1, "pages_ok": 0},
+        "fallback-1": {"attempts": 0, "pages_ok": 0},
+    }
+    assert manifest["regions"][0]["failed_endpoint_attempt"] == {
+        "query_id": "shevron",
+        "page": 1,
+        "endpoint_id": "primary",
+        "attempted_endpoint_ids": ["primary"],
+        "error_code": expected_error,
+    }
+    assert manifest["error"]["endpoint_id"] == "primary"
+    assert manifest["error"]["attempted_endpoint_ids"] == ["primary"]
 
 
 def test_equal_destinations_fail_before_search(
@@ -1009,13 +1050,16 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, responses: list[FakeResponse]) -> None:
+    def __init__(self, responses: list[FakeResponse | Exception]) -> None:
         self.responses = list(responses)
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def get(self, url: str, **kwargs):
         self.calls.append((url, kwargs))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
     def close(self) -> None:
         pass
@@ -1136,6 +1180,104 @@ def test_ordered_search_falls_back_for_production_nested_promo_anomaly() -> None
     assert result.endpoint_id == "fallback-1"
     assert result.attempted_endpoint_ids == ("primary", "fallback-1")
     assert len(session.calls) == 2
+
+
+@pytest.mark.parametrize(
+    (
+        "search_responses",
+        "expected_attempts",
+        "expected_endpoint",
+        "expected_error",
+    ),
+    [
+        (
+            [FakeResponse(status_code=498), FakeResponse(status_code=498)],
+            ["primary", "fallback-1"],
+            "fallback-1",
+            "search_http_498",
+        ),
+        (
+            [FakeResponse(status_code=403)],
+            ["primary"],
+            "primary",
+            "search_http_403",
+        ),
+        (
+            [requests.RequestException("offline network failure")],
+            ["primary"],
+            "primary",
+            "search_network_error",
+        ),
+        (
+            [FakeResponse(json_error=ValueError("invalid"))],
+            ["primary"],
+            "primary",
+            "search_invalid_json",
+        ),
+        (
+            [FakeResponse(payload={})],
+            ["primary"],
+            "primary",
+            "search_products_empty",
+        ),
+    ],
+)
+def test_failed_ordered_search_persists_sanitized_attempt_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    search_responses: list[FakeResponse | Exception],
+    expected_attempts: list[str],
+    expected_endpoint: str,
+    expected_error: str,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    session = FakeSession(
+        [
+            FakeResponse(text="203.0.113.10"),
+            FakeResponse(payload={"xinfo": "dest=-535680"}),
+            FakeResponse(payload={"xinfo": "dest=-2228364"}),
+            *search_responses,
+        ]
+    )
+    transport = _ordered_requests_transport(session)
+
+    with pytest.raises(ScopedTransportError, match=expected_error):
+        _run(config, plan_path, transport)
+
+    manifest = _read_json(
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+        / "manifest.json"
+    )
+    failed_region = manifest["regions"][0]
+    assert manifest["status"] == "failed"
+    assert manifest["complete"] is False
+    assert manifest["error"]["error_code"] == expected_error
+    assert manifest["error"]["endpoint_id"] == expected_endpoint
+    assert manifest["error"]["attempted_endpoint_ids"] == expected_attempts
+    assert failed_region["status"] == "failed"
+    assert failed_region["failed_endpoint_attempt"] == {
+        "query_id": "shevron",
+        "page": 1,
+        "endpoint_id": expected_endpoint,
+        "attempted_endpoint_ids": expected_attempts,
+        "error_code": expected_error,
+    }
+    assert manifest["endpoint_usage"] == {
+        "primary": {
+            "attempts": 1,
+            "pages_ok": 0,
+        },
+        "fallback-1": {
+            "attempts": int("fallback-1" in expected_attempts),
+            "pages_ok": 0,
+        },
+    }
+    serialized = json.dumps(manifest, ensure_ascii=False)
+    assert "example.test" not in serialized
+    assert "offline network failure" not in serialized
 
 
 @pytest.mark.parametrize(

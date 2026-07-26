@@ -148,6 +148,33 @@ def test_collection_plan_launcher_sources_runtime_and_forwards_plan(
     ]
 
 
+def test_collection_plan_launcher_rejects_guarded_pilot_before_python(
+    tmp_path: Path,
+) -> None:
+    project = _copy_launcher(tmp_path, "run_wb_collection_plan.sh")
+    capture = tmp_path / "python-started"
+    (project / "scripts/run_wb_collection_plan.py").write_text(
+        f"from pathlib import Path\nPath({str(capture)!r}).write_text('started')\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            str(project / "scripts/run_wb_collection_plan.sh"),
+            "--guarded-pilot",
+        ],
+        cwd=project,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert not capture.exists()
+    assert "run_wb_guarded_regional_pilot.sh" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 @pytest.mark.parametrize("runtime_state", ["missing", "symlink", "unreadable"])
 def test_guarded_launcher_rejects_unsafe_runtime_before_python(
     tmp_path: Path,

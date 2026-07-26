@@ -79,6 +79,8 @@ class ScopedTransportError(CollectionPlanRunError):
         http_status: int | None = None,
         retry_after_status: str | None = None,
         retry_after_seconds: int | None = None,
+        endpoint_id: str = "",
+        attempted_endpoint_ids: tuple[str, ...] = (),
     ) -> None:
         super().__init__(code)
         self.code = code
@@ -87,6 +89,8 @@ class ScopedTransportError(CollectionPlanRunError):
         self.http_status = http_status
         self.retry_after_status = retry_after_status
         self.retry_after_seconds = retry_after_seconds
+        self.endpoint_id = endpoint_id
+        self.attempted_endpoint_ids = attempted_endpoint_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -948,6 +952,8 @@ class RequestsScopedTransport:
                     "search_network_error",
                     request_sent=True,
                     dest_id_sent=request.dest_id_observed,
+                    endpoint_id=endpoint_id,
+                    attempted_endpoint_ids=tuple(attempted),
                 ) from exc
 
             if response.status_code in self.retry_http_statuses:
@@ -970,6 +976,8 @@ class RequestsScopedTransport:
                     http_status=response.status_code,
                     retry_after_status=retry_after_status,
                     retry_after_seconds=retry_after_seconds,
+                    endpoint_id=endpoint_id,
+                    attempted_endpoint_ids=tuple(attempted),
                 )
                 continue
 
@@ -979,24 +987,45 @@ class RequestsScopedTransport:
                     request_sent=True,
                     dest_id_sent=request.dest_id_observed,
                     http_status=response.status_code,
+                    endpoint_id=endpoint_id,
+                    attempted_endpoint_ids=tuple(attempted),
                 )
 
-            payload = self._response_json(
-                response,
-                code="search",
-                request_sent=True,
-                dest=request.dest_id_observed,
-            )
+            try:
+                payload = self._response_json(
+                    response,
+                    code="search",
+                    request_sent=True,
+                    dest=request.dest_id_observed,
+                )
+            except ScopedTransportError as exc:
+                raise ScopedTransportError(
+                    exc.code,
+                    request_sent=True,
+                    dest_id_sent=request.dest_id_observed,
+                    http_status=exc.http_status,
+                    endpoint_id=endpoint_id,
+                    attempted_endpoint_ids=tuple(attempted),
+                ) from exc
             try:
                 _extract_products(payload)
             except CollectionPlanRunError as exc:
                 if str(exc) != "retryable_payload_anomaly_nested_promo":
-                    raise
+                    raise ScopedTransportError(
+                        str(exc),
+                        request_sent=True,
+                        dest_id_sent=request.dest_id_observed,
+                        http_status=200,
+                        endpoint_id=endpoint_id,
+                        attempted_endpoint_ids=tuple(attempted),
+                    ) from exc
                 last_payload_anomaly = ScopedTransportError(
                     "search_payload_anomaly_nested_promo",
                     request_sent=True,
                     dest_id_sent=request.dest_id_observed,
                     http_status=200,
+                    endpoint_id=endpoint_id,
+                    attempted_endpoint_ids=tuple(attempted),
                 )
                 continue
             self.endpoint_policy = EffectiveEndpointPolicy(
@@ -1228,6 +1257,26 @@ class CollectionPlanRunner:
             raise CollectionPlanRunError(f"invalid SERP pacing value: {key}")
         if milliseconds:
             self.sleeper(milliseconds / 1000.0)
+
+    def _sanitized_endpoint_error_evidence(
+        self,
+        error: ScopedTransportError,
+    ) -> tuple[tuple[str, ...], str]:
+        allowed = set(self.transport.endpoint_policy.endpoint_ids)
+        attempts = tuple(
+            endpoint_id
+            for endpoint_id in error.attempted_endpoint_ids
+            if endpoint_id in allowed
+        )
+        if (
+            len(attempts) != len(error.attempted_endpoint_ids)
+            or len(set(attempts)) != len(attempts)
+        ):
+            attempts = ()
+        endpoint_id = error.endpoint_id if error.endpoint_id in allowed else ""
+        if endpoint_id and endpoint_id not in attempts:
+            endpoint_id = ""
+        return attempts, endpoint_id
 
     def _write(
         self,
@@ -1512,6 +1561,7 @@ class CollectionPlanRunner:
                     "status": "pending",
                     "pages_ok": 0,
                     "products_ok": 0,
+                    "failed_endpoint_attempt": None,
                 }
                 for region in bundle.enabled_regions
             ]
@@ -1577,6 +1627,21 @@ class CollectionPlanRunner:
                                     ),
                                 )
                             except ScopedTransportError as exc:
+                                (
+                                    failed_attempts,
+                                    failed_endpoint_id,
+                                ) = self._sanitized_endpoint_error_evidence(exc)
+                                for endpoint_id in failed_attempts:
+                                    endpoint_usage[endpoint_id]["attempts"] += 1
+                                region_manifest["failed_endpoint_attempt"] = {
+                                    "query_id": task.query_id,
+                                    "page": task.page,
+                                    "endpoint_id": failed_endpoint_id or None,
+                                    "attempted_endpoint_ids": list(
+                                        failed_attempts
+                                    ),
+                                    "error_code": exc.code,
+                                }
                                 if (
                                     exc.request_sent
                                     and exc.dest_id_sent
@@ -1618,20 +1683,29 @@ class CollectionPlanRunner:
                                     )
                                 for endpoint_id in attempted_endpoint_ids:
                                     endpoint_usage[endpoint_id]["attempts"] += 1
-                                endpoint_usage[result.endpoint_id]["pages_ok"] += 1
                                 region_manifest[
                                     "dest_resolution_status"
                                 ] = "resolved_and_sent"
                                 raw_path = paths.raw_page_path(task)
                                 self._write(raw_path, _json_bytes(result.payload))
-                                products = _extract_products(result.payload)
-                                rows, page_row = self._rows_for_page(
-                                    task=task,
-                                    resolution=resolved[region.region_id],
-                                    products=products,
-                                    raw_path=raw_path,
-                                    endpoint_id=result.endpoint_id,
-                                )
+                                try:
+                                    products = _extract_products(result.payload)
+                                    rows, page_row = self._rows_for_page(
+                                        task=task,
+                                        resolution=resolved[region.region_id],
+                                        products=products,
+                                        raw_path=raw_path,
+                                        endpoint_id=result.endpoint_id,
+                                    )
+                                except CollectionPlanRunError as exc:
+                                    raise ScopedTransportError(
+                                        str(exc),
+                                        request_sent=True,
+                                        dest_id_sent=result.dest_id_sent,
+                                        http_status=result.http_status,
+                                        endpoint_id=result.endpoint_id,
+                                        attempted_endpoint_ids=attempted_endpoint_ids,
+                                    ) from exc
                                 self._write(
                                     paths.checkpoint_path(task),
                                     _json_bytes(
@@ -1644,6 +1718,9 @@ class CollectionPlanRunner:
                                         )
                                     ),
                                 )
+                                endpoint_usage[result.endpoint_id][
+                                    "pages_ok"
+                                ] += 1
                                 product_rows.extend(rows)
                                 page_rows.append(page_row)
                                 region_manifest["pages_ok"] += 1
@@ -1653,6 +1730,22 @@ class CollectionPlanRunner:
                                 self._sleep_from_serp_config(
                                     "sleep_between_pages_ms"
                                 )
+                            except ScopedTransportError as exc:
+                                (
+                                    failed_attempts,
+                                    failed_endpoint_id,
+                                ) = self._sanitized_endpoint_error_evidence(exc)
+                                region_manifest["failed_endpoint_attempt"] = {
+                                    "query_id": task.query_id,
+                                    "page": task.page,
+                                    "endpoint_id": failed_endpoint_id or None,
+                                    "attempted_endpoint_ids": list(
+                                        failed_attempts
+                                    ),
+                                    "error_code": exc.code,
+                                }
+                                region_error = exc
+                                break
                             except Exception as exc:
                                 region_error = exc
                                 break
@@ -1720,6 +1813,13 @@ class CollectionPlanRunner:
                     "error_code": error_code,
                     "error_message": error_code,
                 }
+                if isinstance(exc, ScopedTransportError):
+                    (
+                        failed_attempts,
+                        failed_endpoint_id,
+                    ) = self._sanitized_endpoint_error_evidence(exc)
+                    error["endpoint_id"] = failed_endpoint_id or None
+                    error["attempted_endpoint_ids"] = list(failed_attempts)
 
             expected_regions = len(bundle.enabled_regions)
             expected_pages = (
