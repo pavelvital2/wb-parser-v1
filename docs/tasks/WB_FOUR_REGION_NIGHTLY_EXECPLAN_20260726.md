@@ -124,6 +124,25 @@ immutable files under
 Failure to persist this best-effort diagnostic must not mask the original
 pipeline error.
 
+State-to-latest publication is a verified compare-and-exchange transaction.
+The state SHA-256 is calculated from the canonical bytes encoded by the current
+writer, never from a later path read as the source of truth. The writer
+atomically replaces state only if the displaced bytes equal the lease
+precondition, then verifies the exact file through a no-follow file descriptor,
+stable inode metadata and the expected bytes. It repeats that verification
+immediately before latest exchange and after latest is durable. Latest itself
+is exchanged only if its displaced bytes match the lease precondition.
+
+If post-publication verification detects state mutation, latest is restored to
+the previous exact bytes only when the current latest still equals the bytes
+installed by this transaction. A first publication is removed through an
+atomic quarantine move under the same condition. A concurrent latest is never
+overwritten during rollback. A crash or fsync failure after durable completed
+state but before verified latest leaves a completed-but-unpublished state.
+The next approved downstream invocation may publish that same immutable state
+without rerunning sellers or warehouse; it must still reacquire all locks and
+pass deadline and state-byte verification.
+
 ### Scoped Sellers
 
 A complete four-region generation is converted deterministically into:

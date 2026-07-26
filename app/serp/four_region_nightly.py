@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import csv
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -54,6 +57,22 @@ REVIEWED_FOUR_REGION_RUNTIME_WINDOW = CollectionRuntimeWindow(
 )
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 _STATE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}")
+_ATTEMPT_STAGES = frozenset(
+    {
+        "collection",
+        "preflight",
+        "lock_acquisition",
+        "state_transition",
+        "input_build",
+        "sellers",
+        "warehouse",
+        "state_publication",
+    }
+)
+_ATTEMPT_LOCK_OWNERSHIP = frozenset({"not_acquired", "acquired"})
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,13 +167,33 @@ class DownstreamExecutionContract:
 
 @dataclass(slots=True)
 class _AuthoritativeStateLease:
+    project_root: Path
     state_path: Path
     latest_path: Path
     run_id: str
-    prior_state_sha256: str | None
-    prior_latest_sha256: str | None
+    prior_state_bytes: bytes | None
+    prior_latest_bytes: bytes | None
     active: bool = True
     state_written: bool = False
+    reconcile_only: bool = False
+    expected_state_bytes: bytes | None = None
+    expected_state_sha256: str | None = None
+    latest_write_installed: bool = False
+    latest_written_bytes: bytes | None = None
+    latest_published: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedFileSnapshot:
+    payload: bytes
+    sha256: str
+    device: int
+    inode: int
+    owner_uid: int
+    mode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -163,6 +202,13 @@ def _sha256_bytes(payload: bytes) -> str:
 
 def _sha256(path: Path) -> str:
     return _sha256_bytes(path.read_bytes())
+
+
+def _json_bytes(payload: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
+        + "\n"
+    ).encode("utf-8")
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -192,34 +238,265 @@ def _safe_project_file(root: Path, relative: str, *, suffix: str) -> Path:
     return lexical
 
 
-def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = (
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
-        + "\n"
-    ).encode("utf-8")
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _renameat2(source: Path, destination: Path, flags: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise CriticalPipelineError(
+            "atomic compare-exchange is unavailable"
+        )
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(destination),
+        flags,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            str(destination),
+        )
+
+
+def _trusted_file_snapshot(
+    path: Path,
+    *,
+    expected_bytes: bytes | None = None,
+    allow_missing: bool = False,
+) -> _TrustedFileSnapshot | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise CriticalPipelineError(
+            "authoritative publication file is missing"
+        ) from None
+    except OSError as exc:
+        raise CriticalPipelineError(
+            "authoritative publication file is unsafe"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_mode & 0o022
+        ):
+            raise CriticalPipelineError(
+                "authoritative publication file metadata is unsafe"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise CriticalPipelineError(
+            "authoritative publication path changed during verification"
+        ) from exc
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_uid",
+        "st_mode",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(
+        getattr(before, field) != getattr(after, field)
+        for field in stable_fields
+    ) or (
+        current.st_dev != after.st_dev
+        or current.st_ino != after.st_ino
+        or not stat.S_ISREG(current.st_mode)
+    ):
+        raise CriticalPipelineError(
+            "authoritative publication file changed during verification"
+        )
+    if len(payload) != after.st_size:
+        raise CriticalPipelineError(
+            "authoritative publication file size mismatch"
+        )
+    if expected_bytes is not None and payload != expected_bytes:
+        raise CriticalPipelineError(
+            "authoritative publication bytes mismatch"
+        )
+    return _TrustedFileSnapshot(
+        payload=payload,
+        sha256=_sha256_bytes(payload),
+        device=after.st_dev,
+        inode=after.st_ino,
+        owner_uid=after.st_uid,
+        mode=stat.S_IMODE(after.st_mode),
+        size=after.st_size,
+        mtime_ns=after.st_mtime_ns,
+        ctime_ns=after.st_ctime_ns,
+    )
+
+
+def _atomic_compare_exchange_bytes(
+    path: Path,
+    *,
+    expected_prior_bytes: bytes | None,
+    new_bytes: bytes,
+    on_replaced: Callable[[], None] | None = None,
+) -> None:
     temp: Path | None = None
+    exchanged = False
     try:
         with tempfile.NamedTemporaryFile(
             dir=path.parent,
             prefix=f".{path.name}.",
-            suffix=".tmp",
+            suffix=".candidate",
             delete=False,
         ) as handle:
             temp = Path(handle.name)
-            handle.write(encoded)
+            os.chmod(temp, 0o600)
+            handle.write(new_bytes)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp, path)
-        temp = None
-        directory_fd = os.open(path.parent, os.O_RDONLY)
+        if expected_prior_bytes is None:
+            try:
+                _renameat2(temp, path, _RENAME_NOREPLACE)
+            except OSError as exc:
+                if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise CriticalPipelineError(
+                        "authoritative publication compare-exchange conflict"
+                    ) from exc
+                raise
+            temp = None
+            if on_replaced is not None:
+                on_replaced()
+            _fsync_directory(path.parent)
+            return
+
+        _renameat2(temp, path, _RENAME_EXCHANGE)
+        exchanged = True
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            _trusted_file_snapshot(
+                temp,
+                expected_bytes=expected_prior_bytes,
+            )
+        except Exception as conflict:
+            displaced = _trusted_file_snapshot(temp)
+            current = _trusted_file_snapshot(
+                path,
+                expected_bytes=new_bytes,
+            )
+            if current is not None:
+                _renameat2(temp, path, _RENAME_EXCHANGE)
+                exchanged = False
+                _trusted_file_snapshot(
+                    path,
+                    expected_bytes=(
+                        displaced.payload
+                        if displaced is not None
+                        else None
+                    ),
+                )
+            raise CriticalPipelineError(
+                "authoritative publication compare-exchange conflict"
+            ) from conflict
+        if on_replaced is not None:
+            on_replaced()
+        temp.unlink()
+        temp = None
+        exchanged = False
+        _fsync_directory(path.parent)
     finally:
         if temp is not None:
-            temp.unlink(missing_ok=True)
+            if exchanged:
+                try:
+                    current = _trusted_file_snapshot(
+                        path,
+                        expected_bytes=new_bytes,
+                    )
+                    if current is not None:
+                        _renameat2(temp, path, _RENAME_EXCHANGE)
+                        exchanged = False
+                except Exception:
+                    pass
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _atomic_remove_exact(path: Path, *, expected_bytes: bytes) -> None:
+    quarantine = path.parent / (
+        f".{path.name}.{uuid.uuid4().hex}.rollback"
+    )
+    moved = False
+    try:
+        _renameat2(path, quarantine, _RENAME_NOREPLACE)
+        moved = True
+        try:
+            _trusted_file_snapshot(
+                quarantine,
+                expected_bytes=expected_bytes,
+            )
+        except Exception as conflict:
+            try:
+                _renameat2(
+                    quarantine,
+                    path,
+                    _RENAME_NOREPLACE,
+                )
+                moved = False
+            except OSError as restore_error:
+                if restore_error.errno not in {
+                    errno.EEXIST,
+                    errno.ENOTEMPTY,
+                }:
+                    raise
+            raise CriticalPipelineError(
+                "authoritative publication rollback conflict"
+            ) from conflict
+        quarantine.unlink()
+        moved = False
+        _fsync_directory(path.parent)
+    finally:
+        if moved and quarantine.exists():
+            try:
+                _renameat2(
+                    quarantine,
+                    path,
+                    _RENAME_NOREPLACE,
+                )
+                moved = False
+            except OSError:
+                pass
 
 
 def _safe_state_parent(path: Path, *, project_root: Path) -> None:
@@ -244,7 +521,14 @@ def _safe_state_parent(path: Path, *, project_root: Path) -> None:
                     "downstream state parent is not a directory"
                 )
             continue
-        current.mkdir(mode=0o700)
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            if current.is_symlink() or not current.is_dir():
+                raise CriticalPipelineError(
+                    "downstream state parent is unsafe"
+                ) from None
+            continue
         parent_fd = os.open(current.parent, os.O_RDONLY)
         try:
             os.fsync(parent_fd)
@@ -259,10 +543,7 @@ def _immutable_json(
     project_root: Path,
 ) -> None:
     _safe_state_parent(path, project_root=project_root)
-    encoded = (
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
-        + "\n"
-    ).encode("utf-8")
+    encoded = _json_bytes(payload)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     descriptor = os.open(path, flags, 0o600)
     try:
@@ -282,13 +563,8 @@ def _immutable_json(
 
 
 def _optional_regular_bytes(path: Path) -> bytes | None:
-    if not path.exists():
-        return None
-    if path.is_symlink() or not path.is_file():
-        raise CriticalPipelineError(
-            "downstream authoritative state path is unsafe"
-        )
-    return path.read_bytes()
+    snapshot = _trusted_file_snapshot(path, allow_missing=True)
+    return snapshot.payload if snapshot is not None else None
 
 
 def _begin_authoritative_state_transition(
@@ -322,6 +598,14 @@ def _begin_authoritative_state_transition(
             != FOUR_REGION_PLAN_ID
             or state_payload.get("status") not in {"failed", "success"}
             or type(state_payload.get("complete")) is not bool
+            or (
+                state_payload.get("status") == "success"
+                and state_payload.get("complete") is not True
+            )
+            or (
+                state_payload.get("status") == "failed"
+                and state_payload.get("complete") is not False
+            )
         ):
             raise CriticalPipelineError(
                 "downstream authoritative state contract mismatch"
@@ -347,7 +631,8 @@ def _begin_authoritative_state_transition(
                 project_root
             ).as_posix()
             if (
-                loaded_latest.get("state_path") != expected_state_path
+                loaded_latest.get("schema_version") != DOWNSTREAM_SCHEMA
+                or loaded_latest.get("state_path") != expected_state_path
                 or loaded_latest.get("state_sha256")
                 != _sha256_bytes(state_bytes)
             ):
@@ -358,25 +643,23 @@ def _begin_authoritative_state_transition(
                 "published downstream state is immutable"
             )
 
-    if state_payload is not None and (
+    completed_unpublished = state_payload is not None and (
         state_payload["status"] == "success"
         or state_payload["complete"] is True
-    ):
-        raise CriticalPipelineError(
-            "completed downstream state is immutable"
-        )
+    )
     return _AuthoritativeStateLease(
+        project_root=project_root,
         state_path=state_path,
         latest_path=latest_path,
         run_id=run_id,
-        prior_state_sha256=(
+        prior_state_bytes=state_bytes,
+        prior_latest_bytes=latest_bytes,
+        state_written=completed_unpublished,
+        reconcile_only=completed_unpublished,
+        expected_state_bytes=state_bytes if completed_unpublished else None,
+        expected_state_sha256=(
             _sha256_bytes(state_bytes)
-            if state_bytes is not None
-            else None
-        ),
-        prior_latest_sha256=(
-            _sha256_bytes(latest_bytes)
-            if latest_bytes is not None
+            if completed_unpublished and state_bytes is not None
             else None
         ),
     )
@@ -408,19 +691,70 @@ def _write_authoritative_state(
         raise CriticalPipelineError(
             "downstream authoritative state transition is invalid"
         )
+    encoded = _json_bytes(payload)
+    expected_sha256 = _sha256_bytes(encoded)
     current = _optional_regular_bytes(lease.state_path)
-    current_sha256 = (
-        _sha256_bytes(current)
-        if current is not None
-        else None
-    )
-    if current_sha256 != lease.prior_state_sha256:
+    if current != lease.prior_state_bytes:
         raise CriticalPipelineError(
             "downstream authoritative state changed during transition"
         )
-    _atomic_json(lease.state_path, payload)
-    lease.prior_state_sha256 = _sha256(lease.state_path)
-    lease.state_written = True
+
+    def mark_state_replaced() -> None:
+        lease.expected_state_bytes = encoded
+        lease.expected_state_sha256 = expected_sha256
+        lease.state_written = True
+
+    _atomic_compare_exchange_bytes(
+        lease.state_path,
+        expected_prior_bytes=lease.prior_state_bytes,
+        new_bytes=encoded,
+        on_replaced=mark_state_replaced,
+    )
+    verified = _trusted_file_snapshot(
+        lease.state_path,
+        expected_bytes=encoded,
+    )
+    if verified is None or verified.sha256 != expected_sha256:
+        raise CriticalPipelineError(
+            "downstream authoritative state verification failed"
+        )
+
+
+def _rollback_latest(lease: _AuthoritativeStateLease) -> None:
+    if lease.latest_written_bytes is None:
+        return
+    current = _trusted_file_snapshot(
+        lease.latest_path,
+        allow_missing=True,
+    )
+    if current is None or current.payload != lease.latest_written_bytes:
+        raise CriticalPipelineError(
+            "downstream latest rollback ownership lost"
+        )
+    if lease.prior_latest_bytes is None:
+        _atomic_remove_exact(
+            lease.latest_path,
+            expected_bytes=lease.latest_written_bytes,
+        )
+        if _trusted_file_snapshot(
+            lease.latest_path,
+            allow_missing=True,
+        ) is not None:
+            raise CriticalPipelineError(
+                "downstream latest rollback verification failed"
+            )
+    else:
+        _atomic_compare_exchange_bytes(
+            lease.latest_path,
+            expected_prior_bytes=lease.latest_written_bytes,
+            new_bytes=lease.prior_latest_bytes,
+        )
+        _trusted_file_snapshot(
+            lease.latest_path,
+            expected_bytes=lease.prior_latest_bytes,
+        )
+    lease.latest_write_installed = False
+    lease.latest_written_bytes = None
 
 
 def _write_authoritative_latest(
@@ -430,24 +764,75 @@ def _write_authoritative_latest(
     if (
         not lease.active
         or not lease.state_written
+        or lease.latest_published
+        or lease.expected_state_bytes is None
+        or lease.expected_state_sha256 is None
+        or payload.get("schema_version") != DOWNSTREAM_SCHEMA
         or payload.get("run_id") != lease.run_id
-        or payload.get("state_sha256") != lease.prior_state_sha256
+        or payload.get("state_path")
+        != lease.state_path.relative_to(lease.project_root).as_posix()
+        or payload.get("state_sha256") != lease.expected_state_sha256
     ):
         raise CriticalPipelineError(
             "downstream latest transition is invalid"
         )
-    current = _optional_regular_bytes(lease.latest_path)
-    current_sha256 = (
-        _sha256_bytes(current)
-        if current is not None
-        else None
+    encoded = _json_bytes(payload)
+    _trusted_file_snapshot(
+        lease.state_path,
+        expected_bytes=lease.expected_state_bytes,
     )
-    if current_sha256 != lease.prior_latest_sha256:
+    current = _optional_regular_bytes(lease.latest_path)
+    if current != lease.prior_latest_bytes:
         raise CriticalPipelineError(
             "downstream latest changed during transition"
         )
-    _atomic_json(lease.latest_path, payload)
-    lease.prior_latest_sha256 = _sha256(lease.latest_path)
+
+    def mark_latest_replaced() -> None:
+        lease.latest_write_installed = True
+        lease.latest_written_bytes = encoded
+
+    try:
+        _atomic_compare_exchange_bytes(
+            lease.latest_path,
+            expected_prior_bytes=lease.prior_latest_bytes,
+            new_bytes=encoded,
+            on_replaced=mark_latest_replaced,
+        )
+        state_snapshot = _trusted_file_snapshot(
+            lease.state_path,
+            expected_bytes=lease.expected_state_bytes,
+        )
+        latest_snapshot = _trusted_file_snapshot(
+            lease.latest_path,
+            expected_bytes=encoded,
+        )
+        final_state_snapshot = _trusted_file_snapshot(
+            lease.state_path,
+            expected_bytes=lease.expected_state_bytes,
+        )
+        if (
+            state_snapshot is None
+            or latest_snapshot is None
+            or final_state_snapshot is None
+            or state_snapshot.sha256 != lease.expected_state_sha256
+            or final_state_snapshot.sha256
+            != lease.expected_state_sha256
+            or latest_snapshot.sha256 != _sha256_bytes(encoded)
+        ):
+            raise CriticalPipelineError(
+                "downstream publication transaction verification failed"
+            )
+        lease.latest_published = True
+    except Exception:
+        if lease.latest_write_installed and not lease.latest_published:
+            try:
+                _rollback_latest(lease)
+            except Exception as rollback_error:
+                raise CriticalPipelineError(
+                    "downstream publication failed and latest rollback "
+                    "could not be verified"
+                ) from rollback_error
+        raise
 
 
 def _load_scoped_products(path: Path) -> list[dict[str, str]]:
@@ -718,7 +1103,11 @@ def write_four_region_failure_attempt(
     attempt_id: str | None = None,
 ) -> dict[str, Any] | None:
     try:
-        if not _STATE_ID_RE.fullmatch(run_id):
+        if (
+            not _STATE_ID_RE.fullmatch(run_id)
+            or stage not in _ATTEMPT_STAGES
+            or lock_ownership not in _ATTEMPT_LOCK_OWNERSHIP
+        ):
             return None
         created_at = now()
         if created_at.tzinfo is None:
@@ -962,6 +1351,41 @@ def _run_locked_four_region_downstream(
         )
         raise
 
+    if lease.reconcile_only:
+        stage = "state_publication"
+        try:
+            if lease.expected_state_bytes is None:
+                raise CriticalPipelineError(
+                    "completed downstream state bytes are missing"
+                )
+            completed_state = json.loads(lease.expected_state_bytes)
+            if not isinstance(completed_state, dict):
+                raise CriticalPipelineError(
+                    "completed downstream state is invalid"
+                )
+            pointer = {
+                "schema_version": DOWNSTREAM_SCHEMA,
+                "run_id": run_id,
+                "state_path": state_path.relative_to(
+                    config.project_root
+                ).as_posix(),
+                "state_sha256": lease.expected_state_sha256,
+            }
+            deadline.ensure_active()
+            _write_authoritative_latest(lease, pointer)
+            return completed_state
+        except Exception as exc:
+            write_four_region_failure_attempt(
+                config=config,
+                run_id=run_id,
+                error=exc,
+                stage=stage,
+                lock_ownership="acquired",
+            )
+            raise
+        finally:
+            lease.active = False
+
     inputs: FourRegionInputs | None = None
     seller_scope: SellersRunScope | None = None
     sellers_result: Mapping[str, Any] | None = None
@@ -1106,7 +1530,7 @@ def _run_locked_four_region_downstream(
             "state_path": state_path.relative_to(
                 config.project_root
             ).as_posix(),
-            "state_sha256": lease.prior_state_sha256,
+            "state_sha256": lease.expected_state_sha256,
         }
         _write_authoritative_latest(lease, pointer)
         return state

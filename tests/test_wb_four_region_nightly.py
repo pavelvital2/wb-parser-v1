@@ -5,6 +5,7 @@ import json
 import shutil
 import sys
 import csv
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ import pytest
 from app.common.config import load_config
 from app.common.exceptions import CriticalPipelineError
 from app.common.run_lock import acquire_advisory_lock
+from app.serp import four_region_nightly as four_region
 from app.serp.collection_plan import (
     EffectiveEndpointPolicy,
     load_collection_plan_bundle,
@@ -62,6 +64,7 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    path.chmod(0o600)
 
 
 def _downstream_state_paths(root: Path) -> tuple[Path, Path]:
@@ -1498,3 +1501,412 @@ def test_attempt_artifact_failure_does_not_mask_preflight_error(
                 tzinfo=timezone.utc,
             ),
         )
+
+
+def _publication_transaction(
+    root: Path,
+) -> tuple[
+    four_region._AuthoritativeStateLease,
+    Path,
+    Path,
+    dict[str, Any],
+    bytes,
+]:
+    state_path, latest_path = _downstream_state_paths(root)
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        latest_path,
+        {
+            "schema_version": "previous",
+            "run_id": "previous-run",
+        },
+    )
+    previous_latest = latest_path.read_bytes()
+    lease = four_region._begin_authoritative_state_transition(
+        state_path=state_path,
+        latest_path=latest_path,
+        run_id=RUN_ID,
+        project_root=root,
+    )
+    state = {
+        "schema_version": "wb_four_region_downstream_v1",
+        "run_id": RUN_ID,
+        "collection_plan_id": FOUR_REGION_PLAN_ID,
+        "status": "success",
+        "complete": True,
+        "stage": "complete",
+    }
+    four_region._write_authoritative_state(lease, state)
+    encoded_state = four_region._json_bytes(state)
+    assert state_path.read_bytes() == encoded_state
+    assert lease.expected_state_sha256 == hashlib.sha256(
+        encoded_state
+    ).hexdigest()
+    pointer = {
+        "schema_version": "wb_four_region_downstream_v1",
+        "run_id": RUN_ID,
+        "state_path": state_path.relative_to(root).as_posix(),
+        "state_sha256": lease.expected_state_sha256,
+    }
+    return lease, state_path, latest_path, pointer, previous_latest
+
+
+def test_publication_rejects_state_mutation_before_latest_replace(
+    tmp_path: Path,
+) -> None:
+    lease, state_path, latest_path, pointer, previous_latest = (
+        _publication_transaction(tmp_path)
+    )
+    state_path.write_bytes(b'{"mutated":true}\n')
+    state_path.chmod(0o600)
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="publication bytes mismatch",
+    ):
+        four_region._write_authoritative_latest(lease, pointer)
+
+    assert latest_path.read_bytes() == previous_latest
+    assert lease.latest_write_installed is False
+    assert lease.latest_published is False
+
+
+def test_publication_rolls_back_latest_after_state_postcheck_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease, state_path, latest_path, pointer, previous_latest = (
+        _publication_transaction(tmp_path)
+    )
+    original_exchange = four_region._atomic_compare_exchange_bytes
+    injected = False
+
+    def mutate_after_latest(path: Path, **kwargs) -> None:
+        nonlocal injected
+        original_exchange(path, **kwargs)
+        if path == latest_path and not injected:
+            injected = True
+            state_path.write_bytes(b'{"mutated":"after-latest"}\n')
+            state_path.chmod(0o600)
+
+    monkeypatch.setattr(
+        four_region,
+        "_atomic_compare_exchange_bytes",
+        mutate_after_latest,
+    )
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="publication bytes mismatch",
+    ):
+        four_region._write_authoritative_latest(lease, pointer)
+
+    assert injected is True
+    assert latest_path.read_bytes() == previous_latest
+    assert lease.latest_write_installed is False
+    assert lease.latest_published is False
+
+
+def test_first_publication_removes_owned_latest_after_postcheck_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path, latest_path = _downstream_state_paths(tmp_path)
+    lease = four_region._begin_authoritative_state_transition(
+        state_path=state_path,
+        latest_path=latest_path,
+        run_id=RUN_ID,
+        project_root=tmp_path,
+    )
+    state = {
+        "schema_version": "wb_four_region_downstream_v1",
+        "run_id": RUN_ID,
+        "collection_plan_id": FOUR_REGION_PLAN_ID,
+        "status": "success",
+        "complete": True,
+    }
+    four_region._write_authoritative_state(lease, state)
+    pointer = {
+        "schema_version": "wb_four_region_downstream_v1",
+        "run_id": RUN_ID,
+        "state_path": state_path.relative_to(tmp_path).as_posix(),
+        "state_sha256": lease.expected_state_sha256,
+    }
+    original_exchange = four_region._atomic_compare_exchange_bytes
+    injected = False
+
+    def mutate_after_latest(path: Path, **kwargs) -> None:
+        nonlocal injected
+        original_exchange(path, **kwargs)
+        if path == latest_path and not injected:
+            injected = True
+            state_path.write_bytes(b'{"mutated":"first-publish"}\n')
+            state_path.chmod(0o600)
+
+    monkeypatch.setattr(
+        four_region,
+        "_atomic_compare_exchange_bytes",
+        mutate_after_latest,
+    )
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="publication bytes mismatch",
+    ):
+        four_region._write_authoritative_latest(lease, pointer)
+
+    assert injected is True
+    assert not latest_path.exists()
+    assert lease.latest_write_installed is False
+    assert lease.latest_published is False
+
+
+def test_publication_compare_exchange_preserves_racing_latest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease, _state_path, latest_path, pointer, _previous_latest = (
+        _publication_transaction(tmp_path)
+    )
+    concurrent_latest = four_region._json_bytes(
+        {
+            "schema_version": "concurrent",
+            "run_id": "concurrent-run",
+        }
+    )
+    original_renameat2 = four_region._renameat2
+    injected = False
+
+    def race_before_exchange(
+        source: Path,
+        destination: Path,
+        flags: int,
+    ) -> None:
+        nonlocal injected
+        if (
+            destination == latest_path
+            and flags == four_region._RENAME_EXCHANGE
+            and not injected
+        ):
+            injected = True
+            latest_path.write_bytes(concurrent_latest)
+            latest_path.chmod(0o600)
+        original_renameat2(source, destination, flags)
+
+    monkeypatch.setattr(four_region, "_renameat2", race_before_exchange)
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="compare-exchange conflict",
+    ):
+        four_region._write_authoritative_latest(lease, pointer)
+
+    assert injected is True
+    assert latest_path.read_bytes() == concurrent_latest
+    assert lease.latest_write_installed is False
+    assert lease.latest_published is False
+
+
+def test_completed_unpublished_state_retries_without_downstream_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease, state_path, latest_path, pointer, previous_latest = (
+        _publication_transaction(tmp_path)
+    )
+    state_before = state_path.read_bytes()
+    state_inode = state_path.stat().st_ino
+    original_fsync_directory = four_region._fsync_directory
+    failed_once = False
+
+    def one_latest_fsync_failure(path: Path) -> None:
+        nonlocal failed_once
+        if path == latest_path.parent and not failed_once:
+            failed_once = True
+            raise OSError("injected directory fsync failure")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        four_region,
+        "_fsync_directory",
+        one_latest_fsync_failure,
+    )
+    with pytest.raises(OSError, match="injected directory fsync failure"):
+        four_region._write_authoritative_latest(lease, pointer)
+
+    assert latest_path.read_bytes() == previous_latest
+    assert state_path.read_bytes() == state_before
+    assert state_path.stat().st_ino == state_inode
+
+    retry = four_region._begin_authoritative_state_transition(
+        state_path=state_path,
+        latest_path=latest_path,
+        run_id=RUN_ID,
+        project_root=tmp_path,
+    )
+    assert retry.reconcile_only is True
+    assert retry.state_written is True
+    retry_pointer = {
+        **pointer,
+        "state_sha256": retry.expected_state_sha256,
+    }
+    four_region._write_authoritative_latest(retry, retry_pointer)
+
+    assert state_path.read_bytes() == state_before
+    assert state_path.stat().st_ino == state_inode
+    published = _read_json(latest_path)
+    assert published["state_sha256"] == hashlib.sha256(state_before).hexdigest()
+
+
+def test_downstream_reconciles_completed_unpublished_without_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    state_path, latest_path = _downstream_state_paths(root)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    completed = {
+        "schema_version": "wb_four_region_downstream_v1",
+        "run_id": RUN_ID,
+        "collection_plan_id": FOUR_REGION_PLAN_ID,
+        "status": "success",
+        "complete": True,
+        "stage": "complete",
+    }
+    _write_json(state_path, completed)
+    state_before = state_path.read_bytes()
+    state_inode = state_path.stat().st_ino
+
+    result = run_four_region_downstream(
+        config=config,
+        plan_path=plan_path,
+        run_id=RUN_ID,
+        sellers_factory=lambda **_kwargs: pytest.fail(
+            "reconcile must not run sellers"
+        ),
+        warehouse_ingest=lambda **_kwargs: pytest.fail(
+            "reconcile must not run warehouse"
+        ),
+        now=lambda: datetime(
+            2026,
+            7,
+            26,
+            4,
+            0,
+            tzinfo=timezone.utc,
+        ),
+    )
+
+    assert result == completed
+    assert state_path.read_bytes() == state_before
+    assert state_path.stat().st_ino == state_inode
+    latest = _read_json(latest_path)
+    assert latest["run_id"] == RUN_ID
+    assert latest["state_sha256"] == hashlib.sha256(state_before).hexdigest()
+
+
+def test_authoritative_lease_rejects_inactive_and_reused_writes(
+    tmp_path: Path,
+) -> None:
+    lease, _state_path, _latest_path, pointer, _previous_latest = (
+        _publication_transaction(tmp_path)
+    )
+    four_region._write_authoritative_latest(lease, pointer)
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="latest transition is invalid",
+    ):
+        four_region._write_authoritative_latest(lease, pointer)
+    with pytest.raises(
+        CriticalPipelineError,
+        match="state lease is not writable",
+    ):
+        four_region._write_authoritative_state(
+            lease,
+            {
+                "schema_version": "wb_four_region_downstream_v1",
+                "run_id": RUN_ID,
+                "collection_plan_id": FOUR_REGION_PLAN_ID,
+                "status": "failed",
+                "complete": False,
+            },
+        )
+    lease.active = False
+    lease.latest_published = False
+    with pytest.raises(
+        CriticalPipelineError,
+        match="latest transition is invalid",
+    ):
+        four_region._write_authoritative_latest(lease, pointer)
+
+
+def test_attempt_artifacts_use_concurrent_unique_ids_and_reject_unsafe_fields(
+    tmp_path: Path,
+) -> None:
+    config = SimpleNamespace(project_root=tmp_path)
+    created_at = datetime(2026, 7, 26, 20, 0, tzinfo=timezone.utc)
+
+    def create_attempt(_index: int) -> dict[str, Any] | None:
+        return four_region.write_four_region_failure_attempt(
+            config=config,
+            run_id=RUN_ID,
+            error=RuntimeError("sensitive-marker-must-not-persist"),
+            stage="preflight",
+            lock_ownership="not_acquired",
+            now=lambda: created_at,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(create_attempt, range(16)))
+
+    assert all(result is not None for result in results)
+    attempt_ids = {
+        str(result["attempt_id"])
+        for result in results
+        if result is not None
+    }
+    assert len(attempt_ids) == 16
+    artifacts = _attempt_artifacts(tmp_path)
+    assert len(artifacts) == 16
+    assert all(
+        "sensitive-marker" not in path.read_text(encoding="utf-8")
+        for path in artifacts
+    )
+
+    assert (
+        four_region.write_four_region_failure_attempt(
+            config=config,
+            run_id="../escape",
+            error=RuntimeError("ignored"),
+        )
+        is None
+    )
+    assert (
+        four_region.write_four_region_failure_attempt(
+            config=config,
+            run_id=RUN_ID,
+            error=RuntimeError("ignored"),
+            stage="sensitive-marker",
+        )
+        is None
+    )
+    assert (
+        four_region.write_four_region_failure_attempt(
+            config=config,
+            run_id=RUN_ID,
+            error=RuntimeError("ignored"),
+            attempt_id="../escape",
+        )
+        is None
+    )
+    assert (
+        four_region.write_four_region_failure_attempt(
+            config=config,
+            run_id=RUN_ID,
+            error=RuntimeError("ignored"),
+            lock_ownership="unknown",
+        )
+        is None
+    )
+    assert len(_attempt_artifacts(tmp_path)) == 16

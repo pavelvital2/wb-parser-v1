@@ -489,6 +489,13 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   unique immutable sanitized attempt artifacts below
   `state/wb_four_region_nightly/<plan>/attempts/<run_id>/`. Diagnostic write
   failure must not mask the original pipeline error.
+  State-to-latest publication uses exact canonical writer bytes and atomic
+  compare/exchange. It verifies state via a no-follow FD before and after latest
+  publication. On post-check failure it may restore previous latest only if
+  latest still contains this attempt's exact bytes; never overwrite a
+  concurrent latest. A completed state left unpublished by crash/fsync failure
+  is reconciled under all locks and the deadline without rerunning sellers or
+  warehouse.
   Scoped `regional_run_quality.source_row_sha256` must cover every retained
   row field except the hash itself.
   Operational contract:
