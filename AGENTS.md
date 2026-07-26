@@ -352,8 +352,13 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   Rostov-on-Don at depth 1000 (600 pages). Deep resume is explicit through
   `--resume-run-id`; one verified segment is one query in one region (at most
   10 pages), with masked/hash-only egress checks at both boundaries. Never
-  reuse an unfinished segment. Scoped latest is exposed only through the
-  atomic plan pointer under
+  reuse an unfinished segment. Resume must also match hash-only endpoint,
+  request-parameter and proxy-route provenance before any network I/O.
+  Different external IPs across verified segments/resumed processes remain
+  allowed; constant egress is required only within each segment. Scoped latest
+  publication remains `publication_pending` and incomplete until the atomic
+  dual-region pointer is durable and reconciled. Scoped latest is exposed only
+  through the atomic plan pointer under
   `state/wb_collection_plans/{plan}/latest.json`, referencing immutable
   manifests for both complete regions. It must never affect global latest,
   sellers, run reports or Warehouse.

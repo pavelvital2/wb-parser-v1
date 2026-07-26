@@ -188,17 +188,22 @@ def test_query_pack_provenance_is_idempotent_and_fails_closed_on_hash_mismatch(
 ) -> None:
     root = _copy_stage1_config(tmp_path)
     pack_path = root / PACK_RELATIVE
-    provenance_path = tmp_path / "state/provenance/query_pack_versions.json"
+    provenance_path = (
+        root
+        / "state/wb_collection_plans/provenance/query_pack_versions.json"
+    )
     first_pack = load_query_pack(pack_path)
 
     assert register_query_pack_provenance(
         provenance_path=provenance_path,
         query_pack=first_pack,
+        project_root=root,
     )
     first_bytes = provenance_path.read_bytes()
     assert not register_query_pack_provenance(
         provenance_path=provenance_path,
         query_pack=first_pack,
+        project_root=root,
     )
     assert provenance_path.read_bytes() == first_bytes
 
@@ -208,13 +213,19 @@ def test_query_pack_provenance_is_idempotent_and_fails_closed_on_hash_mismatch(
         register_query_pack_provenance(
             provenance_path=provenance_path,
             query_pack=changed_pack,
+            project_root=root,
         )
     assert provenance_path.read_bytes() == first_bytes
 
 
 def test_malformed_provenance_fails_closed_without_overwrite(tmp_path: Path) -> None:
-    pack = load_query_pack(PROJECT_ROOT / PACK_RELATIVE)
-    provenance_path = tmp_path / "query_pack_versions.json"
+    root = _copy_stage1_config(tmp_path)
+    pack = load_query_pack(root / PACK_RELATIVE)
+    provenance_path = (
+        root
+        / "state/wb_collection_plans/provenance/query_pack_versions.json"
+    )
+    provenance_path.parent.mkdir(parents=True)
     malformed = b"{not-json\n"
     provenance_path.write_bytes(malformed)
 
@@ -222,13 +233,17 @@ def test_malformed_provenance_fails_closed_without_overwrite(tmp_path: Path) -> 
         register_query_pack_provenance(
             provenance_path=provenance_path,
             query_pack=pack,
+            project_root=root,
         )
     assert provenance_path.read_bytes() == malformed
 
 
 def test_bundle_load_with_provenance_records_exact_pack_hash(tmp_path: Path) -> None:
     root = _copy_stage1_config(tmp_path)
-    provenance_path = tmp_path / "state/query_pack_versions.json"
+    provenance_path = (
+        root
+        / "state/wb_collection_plans/provenance/query_pack_versions.json"
+    )
     bundle = _load_bundle(root, provenance_path=provenance_path)
     payload = _read_json(provenance_path)
 
@@ -242,6 +257,39 @@ def test_bundle_load_with_provenance_records_exact_pack_hash(tmp_path: Path) -> 
             }
         ],
     }
+
+
+def test_provenance_rejects_symlinked_parent_and_target(tmp_path: Path) -> None:
+    root = _copy_stage1_config(tmp_path)
+    pack = load_query_pack(root / PACK_RELATIVE)
+    provenance_root = root / "state/wb_collection_plans"
+    provenance_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    provenance_parent = provenance_root / "provenance"
+    provenance_parent.symlink_to(outside, target_is_directory=True)
+    expected = provenance_parent / "query_pack_versions.json"
+
+    with pytest.raises(CollectionPlanValidationError, match="symlink"):
+        register_query_pack_provenance(
+            provenance_path=expected,
+            query_pack=pack,
+            project_root=root,
+        )
+    assert not (outside / "query_pack_versions.json").exists()
+
+    provenance_parent.unlink()
+    provenance_parent.mkdir()
+    outside_target = outside / "target.json"
+    outside_target.write_bytes(b"unchanged")
+    expected.symlink_to(outside_target)
+    with pytest.raises(CollectionPlanValidationError, match="regular non-symlink"):
+        register_query_pack_provenance(
+            provenance_path=expected,
+            query_pack=pack,
+            project_root=root,
+        )
+    assert outside_target.read_bytes() == b"unchanged"
 
 
 def test_loader_performs_zero_network_calls_and_no_implicit_writes(

@@ -162,3 +162,29 @@ def test_immutable_writer_rejects_overwrite_and_symlink_parent(
             project_root=tmp_path,
         )
     assert not (outside / "artifact.json").exists()
+
+
+def test_immutable_writer_fsyncs_each_new_parent_entry(
+    tmp_path: Path,
+) -> None:
+    target = (
+        tmp_path
+        / "state/wb_collection_plans/plan/latest_generations/run/region.json"
+    )
+    events: list[tuple[str, Path]] = []
+
+    _write_new_bytes(
+        target,
+        b"payload",
+        project_root=tmp_path,
+        event_hook=lambda event, path: events.append((event, path)),
+    )
+
+    parent_events = [
+        path for event, path in events if event == "parent_entry_fsynced"
+    ]
+    assert target.parent in parent_events
+    assert target.parent.parent in parent_events
+    assert events.index(("parent_entry_fsynced", target.parent)) < events.index(
+        ("file_fsynced", target)
+    )

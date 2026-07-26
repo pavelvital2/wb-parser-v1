@@ -135,6 +135,11 @@ def _products(seed: int, count: int = 100) -> list[dict[str, Any]]:
 
 class FakeTransport:
     request_params = {"appType": "1", "dest": "-legacy", "curr": "rub"}
+    endpoint_urls = (
+        "https://primary.example.test",
+        "https://fallback.example.test",
+    )
+    proxy_route_sha256 = hashlib.sha256(b"fake-proxy-route").hexdigest()
     endpoint_policy = EffectiveEndpointPolicy(
         selection_mode="ordered_fallbacks",
         endpoint_ids=("primary", "fallback-1"),
@@ -497,6 +502,11 @@ def test_top1000_resume_repeats_only_unfinished_query_segment(
     failed_manifest = _read_json(state_dir / "manifest.json")
     assert failed_manifest["complete"] is False
     assert failed_manifest["resume"]["verified_segments"] == 2
+    assert failed_manifest["totals"] == {
+        "regions_ok": 0,
+        "pages_ok": 20,
+        "products_ok": 2000,
+    }
     assert failed_manifest["resume"]["failed_segment"]["pages_written"] == 4
     assert failed_manifest["resume"]["failed_segment"][
         "attempted_endpoint_ids"
@@ -590,6 +600,59 @@ def test_top1000_resume_repeats_only_unfinished_query_segment(
         ref["egress"]["start"]["masked"] for ref in segment_refs
     } == {"203.0.x.x", "198.51.x.x"}
     assert resumed.egress_calls == 5
+
+
+def test_top1000_short_payload_records_attempt_without_canonical_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+
+    with pytest.raises(CollectionPlanRunError, match="search_products_short"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(product_count=99),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    manifest = _read_json(state_dir / "manifest.json")
+    discarded = manifest["resume"]["discarded_segments"]
+    assert len(discarded) == 1
+    assert discarded[0]["endpoint_usage"]["primary"] == {
+        "attempts": 1,
+        "pages_ok": 0,
+    }
+    assert manifest["endpoint_usage"]["primary"] == {
+        "attempts": 1,
+        "pages_ok": 0,
+    }
+    assert manifest["totals"] == {
+        "regions_ok": 0,
+        "pages_ok": 0,
+        "products_ok": 0,
+    }
+    assert not (
+        root
+        / "data/raw/serp_scoped"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "moscow"
+        / RUN_ID
+        / "pages/shevron/page_001.json"
+    ).exists()
 
 
 def test_top1000_multiple_resume_failures_do_not_double_count_history(
@@ -977,6 +1040,162 @@ def test_top1000_dual_region_latest_visibility_is_atomic(
         )
     assert latest_path.read_bytes() == before
     assert _read_json(latest_path)["run_id"] == "20260726_110000Z"
+    pending_manifest = _read_json(
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "20260726_120000Z"
+        / "manifest.json"
+    )
+    assert pending_manifest["status"] == "publication_pending"
+    assert pending_manifest["complete"] is False
+
+    resume_transport = FakeTransport()
+    reconciled = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=resume_transport,
+        resume_run_id="20260726_120000Z",
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+    )
+    assert reconciled["status"] == "success"
+    assert reconciled["complete"] is True
+    assert _read_json(latest_path)["run_id"] == "20260726_120000Z"
+    assert resume_transport.resolve_calls == []
+    assert resume_transport.search_calls == []
+    assert resume_transport.egress_calls == 0
+
+
+def test_top1000_resume_reconciles_crash_after_durable_latest_pointer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    latest_path = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "latest.json"
+    )
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    pointer_durable = False
+    injected = False
+
+    def fail_after_pointer(event: str, path: Path) -> None:
+        nonlocal pointer_durable, injected
+        if event == "directory_fsynced" and path == latest_path:
+            pointer_durable = True
+            return
+        if (
+            pointer_durable
+            and not injected
+            and event == "file_fsynced"
+            and path == state_dir / "manifest.json"
+        ):
+            injected = True
+            raise OSError("injected post-pointer manifest failure")
+
+    with pytest.raises(OSError, match="post-pointer"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            write_event_hook=fail_after_pointer,
+        )
+
+    pointer_before = latest_path.read_bytes()
+    assert _read_json(latest_path)["run_id"] == RUN_ID
+    pending = _read_json(state_dir / "manifest.json")
+    assert pending["status"] == "publication_pending"
+    assert pending["complete"] is False
+
+    resume_transport = FakeTransport()
+    manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=resume_transport,
+        resume_run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+    )
+    assert manifest["status"] == "success"
+    assert manifest["complete"] is True
+    assert latest_path.read_bytes() == pointer_before
+    assert resume_transport.resolve_calls == []
+    assert resume_transport.search_calls == []
+    assert resume_transport.egress_calls == 0
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["endpoint_urls", "request_params", "proxy_route"],
+)
+def test_top1000_resume_rejects_transport_fingerprint_mismatch_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=11),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+
+    transport = FakeTransport()
+    if mismatch == "endpoint_urls":
+        transport.endpoint_urls = (
+            "https://changed-primary.example.test",
+            "https://fallback.example.test",
+        )
+    elif mismatch == "request_params":
+        transport.request_params = {
+            **transport.request_params,
+            "curr": "changed",
+        }
+    else:
+        transport.proxy_route_sha256 = hashlib.sha256(
+            b"changed-proxy-route"
+        ).hexdigest()
+
+    with pytest.raises(CollectionPlanRunError, match="transport fingerprint"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=transport,
+            resume_run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    assert transport.resolve_calls == []
+    assert transport.search_calls == []
+    assert transport.egress_calls == 0
 
 
 def test_top1000_estimated_window_rejects_before_network(
@@ -1003,6 +1222,7 @@ def test_top1000_estimated_window_rejects_before_network(
         endpoint_ids=("primary",),
         pinned_endpoint_id="primary",
     )
+    single.endpoint_urls = ("https://primary.example.test",)
     double = FakeTransport()
     one_runner = CollectionPlanRunner(
         config=config,

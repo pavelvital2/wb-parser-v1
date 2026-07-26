@@ -68,7 +68,11 @@ load_collection_plan_bundle(
     region_registry_path=...,
     provenance_path=None,
 )
-register_query_pack_provenance(provenance_path=..., query_pack=...)
+register_query_pack_provenance(
+    provenance_path=...,
+    query_pack=...,
+    project_root=...,
+)
 build_effective_plan_snapshot(
     bundle,
     resolved_destinations=...,
@@ -83,7 +87,9 @@ Loading documents without `provenance_path` is read-only. Passing a provenance
 path explicitly records the immutable `(query_pack_id, version) -> exact-byte
 SHA-256` mapping. Stage 2 must call this only while holding the documented
 plan-specific lock. Reusing an identity with a different hash fails closed;
-malformed provenance is never overwritten.
+malformed provenance is never overwritten. The only accepted provenance target
+is `state/wb_collection_plans/provenance/query_pack_versions.json` below the
+project root; symlinked parents or targets fail closed.
 
 Bundle loading is restricted to the project configuration tree. The plan must
 be a regular JSON file directly under `config/wb/collection_plans`, the region
@@ -209,6 +215,12 @@ is recollected in full, limiting automatic repetition to one query (10 pages).
 Confirmed segments are validated by exact source/effective hashes, metadata
 and raw/checkpoint checksums before reuse.
 
+Deep resumable runs use effective-plan schema v2. It binds resume to
+hash-only provenance for the ordered endpoint URLs, canonical request
+parameters and configured proxy route. It does not store those values. A
+fingerprint mismatch fails before resolver, egress or search I/O. Existing
+schema-v1 snapshots for legacy depth <=500 remain valid and unchanged.
+
 Failed or discarded segment attempts remain in a cumulative sanitized history
 across every resume. `endpoint_usage` therefore reports actual HTTP attempts
 and successful page responses, including discarded work, while `totals`
@@ -216,6 +228,13 @@ reports only canonical confirmed pages. Segment IDs are deduplicated and all
 history counters, scopes and endpoint IDs are validated before resolver or
 search traffic. If the end egress differs, both checks are retained only as
 masked values and run-local hashes; that segment is never reusable.
+
+Publication is a recoverable two-phase transition. The manifest remains
+`complete=false` with `status=publication_pending` until the immutable
+per-region generation manifests and the atomic dual-region latest pointer are
+durable. Resume can reconcile that state without WB network calls. A matching
+already-durable pointer is accepted idempotently; only then is the manifest
+finalized as `success` and `complete=true`.
 
 Resume is explicit and keeps the original run identity:
 

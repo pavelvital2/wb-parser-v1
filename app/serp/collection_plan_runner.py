@@ -508,7 +508,12 @@ def acquire_collection_plan_locks(
         yield
 
 
-def _ensure_scoped_parent(path: Path, *, project_root: Path) -> None:
+def _ensure_scoped_parent(
+    path: Path,
+    *,
+    project_root: Path,
+    event_hook: WriteEventHook | None = None,
+) -> None:
     root = project_root.resolve()
     try:
         relative = path.parent.relative_to(root)
@@ -520,7 +525,22 @@ def _ensure_scoped_parent(path: Path, *, project_root: Path) -> None:
         current /= part
         if current.is_symlink():
             raise CollectionPlanRunError(f"scoped path uses symlink: {current}")
-        current.mkdir(exist_ok=True)
+        if current.exists():
+            if not current.is_dir():
+                raise CollectionPlanRunError(
+                    f"scoped parent is not a directory: {current}"
+                )
+            continue
+        parent = current.parent
+        current.mkdir()
+        for directory in (parent, current):
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        if event_hook is not None:
+            event_hook("parent_entry_fsynced", current)
 
 
 def _write_new_bytes(
@@ -530,7 +550,11 @@ def _write_new_bytes(
     project_root: Path,
     event_hook: WriteEventHook | None = None,
 ) -> None:
-    _ensure_scoped_parent(path, project_root=project_root)
+    _ensure_scoped_parent(
+        path,
+        project_root=project_root,
+        event_hook=event_hook,
+    )
     temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = -1
     try:
@@ -568,7 +592,11 @@ def _write_atomic_bytes(
     project_root: Path,
     event_hook: WriteEventHook | None = None,
 ) -> None:
-    _ensure_scoped_parent(path, project_root=project_root)
+    _ensure_scoped_parent(
+        path,
+        project_root=project_root,
+        event_hook=event_hook,
+    )
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise CollectionPlanRunError(f"atomic target must be a regular file: {path}")
     temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -613,6 +641,22 @@ def _json_bytes(payload: Mapping[str, Any]) -> bytes:
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_sha256(value: Any) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise CollectionPlanRunError(
+            "transport fingerprint input is not canonical JSON"
+        ) from exc
+    return _sha256_bytes(payload)
 
 
 def _read_regular_bytes(path: Path, *, project_root: Path) -> bytes:
@@ -1523,6 +1567,40 @@ class CollectionPlanRunner:
             + NIGHTLY_SAFETY_RESERVE_SECONDS
         )
 
+    def _transport_fingerprint(self) -> dict[str, str]:
+        endpoint_urls = getattr(self.transport, "endpoint_urls", None)
+        proxy_route_sha256 = getattr(
+            self.transport,
+            "proxy_route_sha256",
+            None,
+        )
+        if (
+            not isinstance(endpoint_urls, tuple)
+            or len(endpoint_urls)
+            != len(self.transport.endpoint_policy.endpoint_ids)
+            or any(type(url) is not str or not url for url in endpoint_urls)
+        ):
+            raise CollectionPlanRunError(
+                "transport endpoint URL provenance is unavailable"
+            )
+        if (
+            not isinstance(proxy_route_sha256, str)
+            or not _SHA256_RE.fullmatch(proxy_route_sha256)
+        ):
+            raise CollectionPlanRunError(
+                "transport proxy route provenance is unavailable"
+            )
+        fingerprint = {
+            "schema_version": "wb_transport_fingerprint_v1",
+            "ordered_endpoint_urls_sha256": _canonical_sha256(endpoint_urls),
+            "request_params_sha256": _canonical_sha256(
+                dict(self.transport.request_params)
+            ),
+            "proxy_route_sha256": proxy_route_sha256,
+        }
+        fingerprint["fingerprint_sha256"] = _canonical_sha256(fingerprint)
+        return fingerprint
+
     def _validate_discarded_segments(
         self,
         *,
@@ -2071,7 +2149,45 @@ class CollectionPlanRunner:
             "published_at_utc": _utc_iso(self.now()),
             "regions": region_refs,
         }
-        self._replace(paths.latest_path, _json_bytes(latest))
+        def pointer_matches() -> bool:
+            if not paths.latest_path.exists():
+                return False
+            try:
+                current = _json_object_from_bytes(
+                    _read_regular_bytes(
+                        paths.latest_path,
+                        project_root=paths.project_root,
+                    ),
+                    field="regional latest",
+                )
+            except CollectionPlanRunError:
+                return False
+            return (
+                current.get("schema_version") == REGIONAL_LATEST_SCHEMA_VERSION
+                and current.get("collection_plan_id")
+                == bundle.collection_plan.collection_plan_id
+                and current.get("run_id") == self.run_id
+                and current.get("effective_plan_sha256")
+                == effective_plan_sha256
+                and current.get("regions") == region_refs
+            )
+
+        if pointer_matches():
+            return {
+                "status": "reconciled",
+                "path": _relative(paths.latest_path, paths.project_root),
+                "regions": len(region_refs),
+            }
+        try:
+            self._replace(paths.latest_path, _json_bytes(latest))
+        except Exception:
+            if pointer_matches():
+                return {
+                    "status": "reconciled_after_durable_replace",
+                    "path": _relative(paths.latest_path, paths.project_root),
+                    "regions": len(region_refs),
+                }
+            raise
         return {
             "status": "published",
             "path": _relative(paths.latest_path, paths.project_root),
@@ -2246,9 +2362,11 @@ class CollectionPlanRunner:
                 * len(bundle.enabled_queries)
                 * bundle.collection_plan.quality.expected_pages_per_query
             )
+            transport_fingerprint = self._transport_fingerprint()
             register_query_pack_provenance(
                 provenance_path=paths.provenance_path,
                 query_pack=bundle.query_pack,
+                project_root=paths.project_root,
             )
 
             prior_manifest: dict[str, Any] | None = None
@@ -2273,6 +2391,10 @@ class CollectionPlanRunner:
                         )
                 if prior_manifest.get("complete") is True:
                     raise CollectionPlanRunError("completed run cannot be resumed")
+                if prior_manifest.get("transport_fingerprint") != transport_fingerprint:
+                    raise CollectionPlanRunError(
+                        "resume transport fingerprint mismatch"
+                    )
 
             snapshot: dict[str, Any] | None = None
             effective_sha256 = ""
@@ -2289,6 +2411,10 @@ class CollectionPlanRunner:
                     field="effective plan",
                 )
                 effective_sha256 = canonical_effective_plan_sha256(snapshot)
+                if snapshot.get("transport_fingerprint") != transport_fingerprint:
+                    raise CollectionPlanRunError(
+                        "resume effective transport fingerprint mismatch"
+                    )
                 if prior_manifest is None or prior_manifest.get(
                     "effective_plan_sha256"
                 ) != effective_sha256:
@@ -2338,23 +2464,30 @@ class CollectionPlanRunner:
                 )
             )
 
+            publication_reconcile_only = (
+                self.resume
+                and pending_pages == 0
+                and prior_manifest is not None
+                and prior_manifest.get("status") == "publication_pending"
+            )
             resolved_now: dict[str, ResolvedDestination] = {}
-            for region in bundle.enabled_regions:
-                dest_id = self.transport.resolve_destination(
-                    region,
-                    timeout_seconds=self.deadline.request_timeout(
-                        self.config.runtime.http_timeout_seconds
-                    ),
-                )
-                if type(dest_id) is not str or not _DEST_RE.fullmatch(dest_id):
-                    raise CollectionPlanRunError(
-                        f"resolver returned invalid dest for {region.region_id}"
+            if not publication_reconcile_only:
+                for region in bundle.enabled_regions:
+                    dest_id = self.transport.resolve_destination(
+                        region,
+                        timeout_seconds=self.deadline.request_timeout(
+                            self.config.runtime.http_timeout_seconds
+                        ),
                     )
-                resolved_now[region.region_id] = ResolvedDestination(
-                    region_id=region.region_id,
-                    dest_id_observed=dest_id,
-                    dest_resolved_at_utc=_utc_iso(self.now()),
-                )
+                    if type(dest_id) is not str or not _DEST_RE.fullmatch(dest_id):
+                        raise CollectionPlanRunError(
+                            f"resolver returned invalid dest for {region.region_id}"
+                        )
+                    resolved_now[region.region_id] = ResolvedDestination(
+                        region_id=region.region_id,
+                        dest_id_observed=dest_id,
+                        dest_resolved_at_utc=_utc_iso(self.now()),
+                    )
 
             if self.resume:
                 if snapshot is None:
@@ -2365,11 +2498,18 @@ class CollectionPlanRunner:
                     if isinstance(item, dict)
                 }
                 resolved: dict[str, ResolvedDestination] = {}
-                for region_id, current in resolved_now.items():
+                for region in bundle.enabled_regions:
+                    region_id = region.region_id
                     stored = stored_regions.get(region_id)
+                    if not isinstance(stored, dict):
+                        raise CollectionPlanRunError(
+                            f"resume destination is missing: {region_id}"
+                        )
+                    current = resolved_now.get(region_id)
                     if (
-                        not isinstance(stored, dict)
-                        or stored.get("dest_id_observed") != current.dest_id_observed
+                        current is not None
+                        and stored.get("dest_id_observed")
+                        != current.dest_id_observed
                     ):
                         raise CollectionPlanRunError(
                             f"resume destination mismatch: {region_id}"
@@ -2386,6 +2526,7 @@ class CollectionPlanRunner:
                     resolved_destinations=resolved,
                     page_size=100,
                     endpoint_policy=self.transport.endpoint_policy,
+                    transport_fingerprint=transport_fingerprint,
                 )
                 snapshot_bytes = canonical_effective_plan_bytes(snapshot)
                 effective_sha256 = canonical_effective_plan_sha256(snapshot)
@@ -2436,6 +2577,7 @@ class CollectionPlanRunner:
                     "collection_plan_sha256": bundle.collection_plan_sha256,
                     "region_registry_sha256": bundle.region_registry_sha256,
                     "effective_plan_sha256": effective_sha256,
+                    "transport_fingerprint": transport_fingerprint,
                     "effective_plan_snapshot_path": _relative(
                         paths.effective_plan_path,
                         paths.project_root,
@@ -2541,8 +2683,12 @@ class CollectionPlanRunner:
                             endpoint_id: {"attempts": 0, "pages_ok": 0}
                             for endpoint_id in endpoint_usage
                         }
+                        last_attempts: tuple[str, ...] = ()
+                        last_endpoint_id = ""
                         try:
                             for task in tasks:
+                                last_attempts = ()
+                                last_endpoint_id = ""
                                 request = self._search_request(
                                     task=task,
                                     dest_id=resolved[region.region_id].dest_id_observed,
@@ -2553,10 +2699,6 @@ class CollectionPlanRunner:
                                         self.config.runtime.http_timeout_seconds
                                     ),
                                 )
-                                if result.dest_id_sent != request.dest_id_observed:
-                                    raise CollectionPlanRunError(
-                                        "search destination evidence mismatch"
-                                    )
                                 attempts = result.attempted_endpoint_ids or (
                                     result.endpoint_id,
                                 )
@@ -2568,6 +2710,14 @@ class CollectionPlanRunner:
                                 ):
                                     raise CollectionPlanRunError(
                                         "search endpoint evidence mismatch"
+                                    )
+                                last_attempts = tuple(attempts)
+                                last_endpoint_id = result.endpoint_id
+                                for endpoint_id in attempts:
+                                    segment_usage[endpoint_id]["attempts"] += 1
+                                if result.dest_id_sent != request.dest_id_observed:
+                                    raise CollectionPlanRunError(
+                                        "search destination evidence mismatch"
                                     )
                                 pending_raw = paths.segment_pending_raw_path(
                                     segment_id, task
@@ -2581,6 +2731,7 @@ class CollectionPlanRunner:
                                     raw_path=paths.raw_page_path(task),
                                     endpoint_id=result.endpoint_id,
                                 )
+                                segment_usage[result.endpoint_id]["pages_ok"] += 1
                                 checkpoint = self._checkpoint_payload(
                                     task=task,
                                     resolution=resolved[region.region_id],
@@ -2599,9 +2750,6 @@ class CollectionPlanRunner:
                                     )
                                 )
                                 self._write(pending_checkpoint, checkpoint_bytes)
-                                for endpoint_id in attempts:
-                                    segment_usage[endpoint_id]["attempts"] += 1
-                                segment_usage[result.endpoint_id]["pages_ok"] += 1
                                 page_refs.append(
                                     {
                                         "page": task.page,
@@ -2641,7 +2789,10 @@ class CollectionPlanRunner:
                                 "segment_id": segment_id,
                                 "region_id": region.region_id,
                                 "query_id": query.query_id,
-                                "pages_written": len(page_refs),
+                                "pages_written": sum(
+                                    usage["pages_ok"]
+                                    for usage in segment_usage.values()
+                                ),
                                 "status": "incomplete_not_reusable",
                                 "egress": {
                                     "verification_status": (
@@ -2692,10 +2843,22 @@ class CollectionPlanRunner:
                                     }
                                 )
                             else:
+                                local_attempts = (
+                                    last_attempts
+                                    if not egress_changed
+                                    else ()
+                                )
+                                local_endpoint_id = (
+                                    last_endpoint_id
+                                    if local_attempts
+                                    else None
+                                )
                                 failed_segment.update(
                                     {
-                                        "endpoint_id": None,
-                                        "attempted_endpoint_ids": [],
+                                        "endpoint_id": local_endpoint_id,
+                                        "attempted_endpoint_ids": list(
+                                            local_attempts
+                                        ),
                                         "error_code": (
                                             "egress_identity_changed"
                                             if isinstance(
@@ -2837,9 +3000,6 @@ class CollectionPlanRunner:
                         page_rows=pages_all,
                         replace=self.resume,
                     )
-                    totals["regions_ok"] += 1
-                    totals["pages_ok"] += len(pages_all)
-                    totals["products_ok"] += len(products_all)
                     self._replace(
                         paths.region_state_path(region_manifest["region_id"]),
                         _json_bytes(
@@ -2850,8 +3010,25 @@ class CollectionPlanRunner:
                         ),
                     )
 
+            canonical_pages = sum(
+                int(ref["pages_count"]) for ref in segment_refs
+            )
+            verified_queries_by_region: dict[str, set[str]] = {}
+            for ref in segment_refs:
+                verified_queries_by_region.setdefault(
+                    ref["region_id"],
+                    set(),
+                ).add(ref["query_id"])
+            totals = {
+                "regions_ok": sum(
+                    len(query_ids) == len(bundle.enabled_queries)
+                    for query_ids in verified_queries_by_region.values()
+                ),
+                "pages_ok": canonical_pages,
+                "products_ok": canonical_pages * 100,
+            }
             expected_regions = len(bundle.enabled_regions)
-            complete = (
+            collection_complete = (
                 caught is None
                 and totals["regions_ok"] == expected_regions
                 and totals["pages_ok"] == planned_pages
@@ -2868,6 +3045,7 @@ class CollectionPlanRunner:
                 "collection_plan_sha256": bundle.collection_plan_sha256,
                 "region_registry_sha256": bundle.region_registry_sha256,
                 "effective_plan_sha256": effective_sha256,
+                "transport_fingerprint": transport_fingerprint,
                 "effective_plan_snapshot_path": _relative(
                     paths.effective_plan_path,
                     paths.project_root,
@@ -2882,8 +3060,12 @@ class CollectionPlanRunner:
                 ),
                 "finished_at_utc": _utc_iso(self.now()),
                 "deadline_utc": _utc_iso(self.deadline.deadline_utc),
-                "status": "success" if complete else "failed",
-                "complete": complete,
+                "status": (
+                    "publication_pending"
+                    if collection_complete
+                    else "failed"
+                ),
+                "complete": False,
                 "totals": totals,
                 "endpoint_usage": endpoint_usage,
                 "regions": manifest_regions,
@@ -2905,12 +3087,18 @@ class CollectionPlanRunner:
                         ).replace("\n", " ")[:100],
                     }
                 ),
-                "regional_latest": {"status": "not_published"},
+                "regional_latest": {
+                    "status": (
+                        "publication_pending"
+                        if collection_complete
+                        else "not_published"
+                    )
+                },
             }
             self._replace(paths.manifest_path, _json_bytes(manifest), final_manifest=True)
             if caught is not None:
                 raise caught
-            if not complete:
+            if not collection_complete:
                 raise CollectionPlanRunError("collection plan run is incomplete")
             try:
                 manifest["regional_latest"] = self._publish_regional_latest(
@@ -2920,11 +3108,11 @@ class CollectionPlanRunner:
                     region_manifests=manifest_regions,
                 )
             except Exception as exc:
-                manifest["status"] = "failed"
+                manifest["status"] = "publication_pending"
                 manifest["complete"] = False
                 manifest["error"] = {
                     "error_class": exc.__class__.__name__,
-                    "error_code": "regional_latest_publish_failed",
+                    "error_code": "regional_latest_publication_pending",
                 }
                 self._replace(
                     paths.manifest_path,
@@ -2932,6 +3120,9 @@ class CollectionPlanRunner:
                     final_manifest=True,
                 )
                 raise
+            manifest["status"] = "success"
+            manifest["complete"] = True
+            manifest["error"] = None
             self._replace(paths.manifest_path, _json_bytes(manifest), final_manifest=True)
             return manifest
 
@@ -2979,6 +3170,7 @@ class CollectionPlanRunner:
             register_query_pack_provenance(
                 provenance_path=paths.provenance_path,
                 query_pack=bundle.query_pack,
+                project_root=paths.project_root,
             )
             egress_checks_expected = len(bundle.enabled_regions) + 1
             egress_checks_completed = 0
