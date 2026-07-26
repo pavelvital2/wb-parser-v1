@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import shutil
@@ -279,6 +280,16 @@ def _state_dir(root: Path) -> Path:
     )
 
 
+def _pilot_source_paths(root: Path, plan_path: Path) -> dict[str, Path]:
+    plan = _read_json(plan_path)
+    return {
+        "config_file": root / "config/config.yaml",
+        "collection_plan": plan_path,
+        "region_registry": root / "config/wb/regions.json",
+        "query_pack": root / str(plan["query_pack_file"]),
+    }
+
+
 def test_primary_probe_success_runs_exact_a_b_a_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -299,6 +310,7 @@ def test_primary_probe_success_runs_exact_a_b_a_contract(
     control = _read_json(state_dir / "control/moscow_repeat.json")
     comparison = _read_json(state_dir / "comparison.json")
     snapshot = _read_json(state_dir / "effective_plan.json")
+    protected = _read_json(state_dir / "protected_evidence.json")
 
     assert manifest["complete"] is True
     assert manifest["totals"] == {
@@ -331,6 +343,17 @@ def test_primary_probe_success_runs_exact_a_b_a_contract(
     assert control["jaccard"] == 1.0
     assert comparison["status"] == "eligible"
     assert len(comparison["queries"]) == 3
+    protected_by_path = {row["path"]: row for row in protected["entries"]}
+    source_paths = _pilot_source_paths(root, plan_path)
+    for name, source_path in source_paths.items():
+        relative = source_path.relative_to(root).as_posix()
+        evidence = protected_by_path[relative]
+        assert evidence["status"] == "unchanged"
+        assert evidence["after_sha256"] == hashlib.sha256(
+            source_path.read_bytes()
+        ).hexdigest()
+        if name != "config_file":
+            assert manifest[f"{name}_sha256"] == evidence["after_sha256"]
     assert len(transport.search_calls) == 7
     assert transport.events == [
         "egress:1",
@@ -450,6 +473,49 @@ def test_both_endpoint_probes_fail_without_regional_search(
     assert endpoint["status"] == "failed"
     assert endpoint["pinned_endpoint_id"] is None
     assert manifest["complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("suitable", "http_status"),
+    [
+        (1, 200),
+        ("yes", 200),
+        (True, True),
+    ],
+)
+def test_malformed_truthy_probe_never_pins_or_starts_regional_search(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suitable: Any,
+    http_status: Any,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    transport = PilotFakeTransport(
+        probe_results={
+            endpoint_id: EndpointProbeResult(
+                endpoint_id=endpoint_id,
+                suitable=suitable,
+                http_status=http_status,
+                error_code=None,
+            )
+            for endpoint_id in ("primary", "fallback-1")
+        }
+    )
+
+    with pytest.raises(EndpointPreflightFailed):
+        _run(config, plan_path, transport, root=root)
+
+    endpoint = _read_json(_state_dir(root) / "endpoint_preflight.json")
+    assert transport.probe_calls == ["primary", "fallback-1"]
+    assert transport.pin_calls == []
+    assert transport.search_calls == []
+    assert endpoint["status"] == "failed"
+    assert endpoint["pinned_endpoint_id"] is None
+    assert all(
+        attempt["outcome"] == "unusable"
+        and attempt["error_code"] == "endpoint_probe_unsuitable"
+        for attempt in endpoint["attempts"]
+    )
 
 
 def test_budget_exceed_fails_before_the_disallowed_search_http(
@@ -644,6 +710,141 @@ def test_protected_mismatch_fails_and_unchanged_run_records_hashes_only(
     )
     assert changed_row["status"] == "changed"
     assert _read_json(_state_dir(changed_root) / "manifest.json")["complete"] is False
+
+
+@pytest.mark.parametrize(
+    "source_name",
+    [
+        "config_file",
+        "collection_plan",
+        "region_registry",
+        "query_pack",
+    ],
+)
+def test_each_pilot_source_change_fails_and_suppresses_comparison(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_name: str,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    source_path = _pilot_source_paths(root, plan_path)[source_name]
+
+    def mutate_source(call_number: int) -> None:
+        if call_number == 1:
+            source_path.write_bytes(source_path.read_bytes() + b"\n")
+
+    with pytest.raises(CollectionPlanRunError, match="protected state changed"):
+        _run(
+            config,
+            plan_path,
+            PilotFakeTransport(on_search=mutate_source),
+            root=root,
+        )
+
+    state_dir = _state_dir(root)
+    evidence = _read_json(state_dir / "protected_evidence.json")
+    relative = source_path.relative_to(root).as_posix()
+    source_row = next(
+        row for row in evidence["entries"] if row["path"] == relative
+    )
+    comparison = _read_json(state_dir / "comparison.json")
+    manifest = _read_json(state_dir / "manifest.json")
+    assert evidence["status"] == "changed"
+    assert source_row["status"] == "changed"
+    assert source_row["before_sha256"] != source_row["after_sha256"]
+    assert comparison["status"] == "failed"
+    assert comparison["reason"] == "protected_state_changed"
+    assert comparison["queries"] == []
+    assert manifest["complete"] is False
+    assert manifest["status"] == "failed"
+    assert manifest["query_pack_sha256"] is None
+    assert manifest["collection_plan_sha256"] is None
+    assert manifest["region_registry_sha256"] is None
+
+
+@pytest.mark.parametrize(
+    "replacement_kind",
+    ["missing", "symlink", "non_regular"],
+)
+def test_pilot_source_replacement_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    source_path = _pilot_source_paths(root, plan_path)["query_pack"]
+    replacement_target = root / "config/config.yaml"
+
+    def replace_source(call_number: int) -> None:
+        if call_number != 1:
+            return
+        source_path.unlink()
+        if replacement_kind == "symlink":
+            source_path.symlink_to(replacement_target)
+        elif replacement_kind == "non_regular":
+            source_path.mkdir()
+
+    with pytest.raises(CollectionPlanRunError, match="protected state changed"):
+        _run(
+            config,
+            plan_path,
+            PilotFakeTransport(on_search=replace_source),
+            root=root,
+        )
+
+    state_dir = _state_dir(root)
+    evidence = _read_json(state_dir / "protected_evidence.json")
+    relative = source_path.relative_to(root).as_posix()
+    source_row = next(
+        row for row in evidence["entries"] if row["path"] == relative
+    )
+    expected_status = {
+        "missing": "missing",
+        "symlink": "unsafe_symlink",
+        "non_regular": "not_regular_file",
+    }[replacement_kind]
+    assert source_row["after_status"] == expected_status
+    assert source_row["status"] == "changed"
+    assert _read_json(state_dir / "comparison.json")["queries"] == []
+    manifest = _read_json(state_dir / "manifest.json")
+    assert manifest["complete"] is False
+    assert manifest["query_pack_sha256"] is None
+
+
+@pytest.mark.parametrize(
+    ("source_name", "invalid_kind"),
+    [
+        ("config_file", "external"),
+        ("collection_plan", "symlink"),
+        ("region_registry", "non_regular"),
+        ("query_pack", "symlink"),
+    ],
+)
+def test_pilot_source_paths_fail_closed_before_capture_or_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_name: str,
+    invalid_kind: str,
+) -> None:
+    root, _config, plan_path = _project(tmp_path, monkeypatch)
+    source_paths = _pilot_source_paths(root, plan_path)
+    if invalid_kind == "external":
+        invalid_path = tmp_path / "outside-source.json"
+        invalid_path.write_text("{}\n", encoding="utf-8")
+    elif invalid_kind == "symlink":
+        invalid_path = root / f"{source_name}-source-link.json"
+        invalid_path.symlink_to(source_paths[source_name])
+    else:
+        invalid_path = root / f"{source_name}-source-directory"
+        invalid_path.mkdir()
+    source_paths[source_name] = invalid_path
+    auditor = ProtectedStateAuditor(
+        project_root=root,
+        crontab_reader=lambda: b"test-crontab\n",
+    )
+
+    with pytest.raises(CollectionPlanRunError, match="protected pilot source path"):
+        auditor.bind_source_paths(**source_paths)
 
 
 def test_guarded_pilot_never_opens_protected_paths_for_write(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,6 +70,12 @@ PROTECTED_RELATIVE_PATHS = (
     "data/marts/sellers/latest/seller_query_product_bridge.csv",
     "data/warehouse/wb/wb.duckdb",
     "data/warehouse/wb/manifests/latest.json",
+)
+PILOT_SOURCE_NAMES = (
+    "config_file",
+    "collection_plan",
+    "region_registry",
+    "query_pack",
 )
 
 
@@ -171,22 +179,122 @@ class ProtectedStateAuditor:
     ) -> None:
         self.project_root = project_root.resolve()
         self.crontab_reader = crontab_reader
+        self._source_relative_paths: dict[str, str] | None = None
+
+    def bind_source_paths(
+        self,
+        *,
+        config_file: Path,
+        collection_plan: Path,
+        region_registry: Path,
+        query_pack: Path,
+    ) -> Mapping[str, str]:
+        if self._source_relative_paths is not None:
+            raise CollectionPlanRunError(
+                "protected pilot source paths are already bound"
+            )
+        candidates = {
+            "config_file": config_file,
+            "collection_plan": collection_plan,
+            "region_registry": region_registry,
+            "query_pack": query_pack,
+        }
+        if set(candidates) != set(PILOT_SOURCE_NAMES):
+            raise CollectionPlanRunError("protected pilot source set is invalid")
+
+        relative_paths: dict[str, str] = {}
+        for name, source_path in candidates.items():
+            if not source_path.is_absolute():
+                raise CollectionPlanRunError(
+                    f"protected pilot source path is not absolute: {name}"
+                )
+            lexical_path = Path(os.path.abspath(source_path))
+            try:
+                relative_path = lexical_path.relative_to(self.project_root)
+            except ValueError as exc:
+                raise CollectionPlanRunError(
+                    f"protected pilot source path is outside project root: {name}"
+                ) from exc
+
+            current = self.project_root
+            for part in relative_path.parts:
+                current /= part
+                if current.is_symlink():
+                    raise CollectionPlanRunError(
+                        f"protected pilot source path uses a symlink: {name}"
+                    )
+            try:
+                mode = lexical_path.stat(follow_symlinks=False).st_mode
+            except OSError as exc:
+                raise CollectionPlanRunError(
+                    f"protected pilot source path is unavailable: {name}"
+                ) from exc
+            if not stat.S_ISREG(mode):
+                raise CollectionPlanRunError(
+                    f"protected pilot source path is not a regular file: {name}"
+                )
+            try:
+                resolved_path = lexical_path.resolve(strict=True)
+            except OSError as exc:
+                raise CollectionPlanRunError(
+                    f"protected pilot source path is unavailable: {name}"
+                ) from exc
+            if resolved_path != lexical_path:
+                raise CollectionPlanRunError(
+                    f"protected pilot source path is non-canonical: {name}"
+                )
+            relative_paths[name] = relative_path.as_posix()
+
+        if len(set(relative_paths.values())) != len(relative_paths):
+            raise CollectionPlanRunError("protected pilot source paths overlap")
+        self._source_relative_paths = relative_paths
+        return dict(relative_paths)
+
+    @property
+    def source_relative_paths(self) -> Mapping[str, str]:
+        if self._source_relative_paths is None:
+            raise CollectionPlanRunError("protected pilot source paths are not bound")
+        return dict(self._source_relative_paths)
 
     def capture(self) -> ProtectedSnapshot:
         entries: dict[str, tuple[str, str | None]] = {}
-        for relative in PROTECTED_RELATIVE_PATHS:
+        source_paths = self.source_relative_paths
+        source_relative_set = set(source_paths.values())
+        protected_paths = tuple(
+            dict.fromkeys((*PROTECTED_RELATIVE_PATHS, *source_paths.values()))
+        )
+        for relative in protected_paths:
             path = self.project_root / relative
-            if path.is_symlink():
+            has_symlink_component = False
+            if relative in source_relative_set:
+                current = self.project_root
+                for part in Path(relative).parts:
+                    current /= part
+                    if current.is_symlink():
+                        has_symlink_component = True
+                        break
+            if has_symlink_component or path.is_symlink():
                 entries[relative] = ("unsafe_symlink", None)
-            elif not path.exists():
-                entries[relative] = ("missing", None)
-            elif not path.is_file():
-                entries[relative] = ("not_regular_file", None)
             else:
-                entries[relative] = (
-                    "present",
-                    hashlib.sha256(path.read_bytes()).hexdigest(),
-                )
+                try:
+                    mode = path.stat(follow_symlinks=False).st_mode
+                except FileNotFoundError:
+                    entries[relative] = ("missing", None)
+                except OSError:
+                    entries[relative] = ("unreadable", None)
+                else:
+                    if not stat.S_ISREG(mode):
+                        entries[relative] = ("not_regular_file", None)
+                    else:
+                        try:
+                            source_bytes = path.read_bytes()
+                        except OSError:
+                            entries[relative] = ("unreadable", None)
+                        else:
+                            entries[relative] = (
+                                "present",
+                                hashlib.sha256(source_bytes).hexdigest(),
+                            )
         crontab = self.crontab_reader()
         entries["user_crontab"] = (
             ("missing", None)
@@ -194,6 +302,20 @@ class ProtectedStateAuditor:
             else ("present", hashlib.sha256(crontab).hexdigest())
         )
         return ProtectedSnapshot(entries=entries)
+
+    def source_hashes(self, snapshot: ProtectedSnapshot) -> dict[str, str]:
+        hashes: dict[str, str] = {}
+        for name, relative in self.source_relative_paths.items():
+            status, source_hash = snapshot.entries.get(
+                relative,
+                ("missing", None),
+            )
+            if status != "present" or source_hash is None:
+                raise CollectionPlanRunError(
+                    f"protected pilot source is not present: {name}"
+                )
+            hashes[name] = source_hash
+        return hashes
 
     @staticmethod
     def compare(
@@ -450,8 +572,10 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 )
             )
             suitable = (
-                result.suitable
-                and http_status == 200
+                type(result.suitable) is bool
+                and result.suitable is True
+                and type(result.http_status) is int
+                and result.http_status == 200
                 and error_code is None
             )
             if not suitable and error_code is None:
@@ -737,12 +861,33 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 raise CollectionPlanRunError(
                     f"immutable scoped run state already exists: {paths.state_run_dir}"
                 )
+            self.protected_auditor.bind_source_paths(
+                config_file=self.config.config_file,
+                collection_plan=bundle.collection_plan.source_path,
+                region_registry=bundle.region_registry.source_path,
+                query_pack=bundle.query_pack.source_path,
+            )
+            protected_before = self.protected_auditor.capture()
+            before_source_hashes = self.protected_auditor.source_hashes(
+                protected_before
+            )
+            expected_source_hashes = {
+                "collection_plan": bundle.collection_plan_sha256,
+                "region_registry": bundle.region_registry_sha256,
+                "query_pack": bundle.query_pack_sha256,
+            }
+            if any(
+                before_source_hashes[name] != source_hash
+                for name, source_hash in expected_source_hashes.items()
+            ):
+                raise CollectionPlanRunError(
+                    "protected pilot source hash changed before network"
+                )
             register_query_pack_provenance(
                 provenance_path=paths.provenance_path,
                 query_pack=bundle.query_pack,
             )
 
-            protected_before = self.protected_auditor.capture()
             egress = PilotEgressEvidence()
             endpoint_evidence: dict[str, Any] = {
                 "schema_version": ENDPOINT_EVIDENCE_SCHEMA_VERSION,
@@ -853,6 +998,21 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 protected_before,
                 protected_after,
             )
+            confirmed_source_hashes: dict[str, str] | None = None
+            try:
+                after_source_hashes = self.protected_auditor.source_hashes(
+                    protected_after
+                )
+            except CollectionPlanRunError:
+                after_source_hashes = {}
+            if (
+                protected_evidence["status"] == "unchanged"
+                and all(
+                    after_source_hashes.get(name) == source_hash
+                    for name, source_hash in expected_source_hashes.items()
+                )
+            ):
+                confirmed_source_hashes = after_source_hashes
             self._write(
                 paths.state_run_dir / "protected_evidence.json",
                 _json_bytes(protected_evidence),
@@ -901,6 +1061,7 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 and egress.completed == egress.expected
                 and endpoint_evidence["status"] == "success"
                 and snapshot_sha256 is not None
+                and confirmed_source_hashes is not None
             )
             error: dict[str, Any] | None = None
             if caught is not None:
@@ -920,9 +1081,21 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
                 "collection_plan_id": bundle.collection_plan.collection_plan_id,
                 "query_pack_id": bundle.query_pack.query_pack_id,
                 "query_pack_version": bundle.query_pack.version,
-                "query_pack_sha256": bundle.query_pack_sha256,
-                "collection_plan_sha256": bundle.collection_plan_sha256,
-                "region_registry_sha256": bundle.region_registry_sha256,
+                "query_pack_sha256": (
+                    confirmed_source_hashes["query_pack"]
+                    if confirmed_source_hashes is not None
+                    else None
+                ),
+                "collection_plan_sha256": (
+                    confirmed_source_hashes["collection_plan"]
+                    if confirmed_source_hashes is not None
+                    else None
+                ),
+                "region_registry_sha256": (
+                    confirmed_source_hashes["region_registry"]
+                    if confirmed_source_hashes is not None
+                    else None
+                ),
                 "effective_plan_sha256": snapshot_sha256,
                 "effective_plan_snapshot_path": (
                     _relative(paths.effective_plan_path, paths.project_root)

@@ -211,8 +211,9 @@ enable commit followed by a disable commit.
 While holding the existing daily, pipeline, warehouse-refresh and plan locks,
 the guarded runner performs this fixed sequence:
 
-1. hash the protected file set and user crontab without persisting their
-   contents;
+1. validate and fix the exact config, collection-plan, region-registry and
+   query-pack source paths, then hash those sources together with the protected
+   production file set and user crontab without persisting their contents;
 2. check neutral egress and resolve Moscow and Rostov-on-Don destinations;
 3. probe the primary endpoint and at most one fallback, then pin the first
    usable endpoint;
@@ -221,8 +222,10 @@ the guarded runner performs this fixed sequence:
    check egress, repeat the first Moscow query, then perform the final egress
    check;
 6. write endpoint, request-budget, repeat-control and comparison evidence;
-7. re-hash protected state, fail on any mismatch, and retain all locks through
-   final manifest fsync.
+7. re-hash the same fixed source and production path set, fail on any missing,
+   changed, symlinked or non-regular source, and retain all locks through final
+   manifest fsync. A successful manifest takes its three source SHA-256 values
+   from this confirmed after-snapshot rather than only from initial loading.
 
 The WB request budget is fail-closed and counts attempts before transport I/O:
 `geo<=2`, `endpoint_probe<=2`, `regional_search=6`, `repeat_search=1`,
@@ -251,3 +254,6 @@ Endpoint evidence contains only endpoint IDs, outcome, HTTP status and safe
 error codes. Protected evidence contains only relative paths, presence status
 and SHA-256 values. Neither contract stores endpoint URLs, URL queries, full
 egress IP, cookies, headers, proxy values, credentials or crontab contents.
+An endpoint is usable only when the transport returns the literal boolean
+`suitable=true`, an integer (not boolean) HTTP status `200`, and no error code;
+other truthy or malformed values fail closed.
