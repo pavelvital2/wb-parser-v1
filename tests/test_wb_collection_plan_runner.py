@@ -216,20 +216,34 @@ class FakeTransport:
                 "shevrony": 2_000,
                 "shevron-na-lipuchke": 3_000,
             }[request.task.query_id]
-            products = _products(region_offset + query_offset, self.product_count)
+            page_offset = (request.task.page - 1) * 100
+            products = _products(
+                region_offset + query_offset + page_offset,
+                self.product_count,
+            )
             if self.duplicate and len(products) > 1:
                 products[1]["id"] = products[0]["id"]
         return ScopedSearchResult(
             payload={"products": products},
             endpoint_id=request.endpoint_id,
             dest_id_sent=request.dest_id_observed,
+            attempted_endpoint_ids=(request.endpoint_id,),
         )
+
+    def search_ordered(
+        self,
+        request: ScopedSearchRequest,
+        *,
+        timeout_seconds: float,
+    ) -> ScopedSearchResult:
+        return self.search(request, timeout_seconds=timeout_seconds)
 
     def close(self) -> None:
         self.closed = True
 
 
 def _run(config, plan_path: Path, transport: FakeTransport, **kwargs):
+    kwargs.setdefault("sleeper", lambda _seconds: None)
     return run_collection_plan(
         config=config,
         plan_path=plan_path,
@@ -289,6 +303,10 @@ def test_successful_runner_writes_only_scoped_outputs_and_provenance(
     assert manifest["egress"]["constant"] is True
     assert manifest["egress"]["checks_completed"] == 3
     assert manifest["egress"]["checks_expected"] == 3
+    assert manifest["endpoint_usage"] == {
+        "primary": {"attempts": 6, "pages_ok": 6},
+        "fallback-1": {"attempts": 0, "pages_ok": 0},
+    }
     assert "203.0.113.10" not in json.dumps(manifest)
 
     assert transport.resolve_calls == ["moscow", "rostov-on-don"]
@@ -344,6 +362,7 @@ def test_successful_runner_writes_only_scoped_outputs_and_provenance(
         assert len(rows) == 300
         assert {row["region_id"] for row in rows} == {region_id}
         assert {row["collection_scope"] for row in rows} == {"regional"}
+        assert {row["endpoint_id"] for row in rows} == {"primary"}
 
     moscow_checkpoint = _read_json(
         state_dir / "checkpoints/moscow/shevron/page_001.json"
@@ -354,6 +373,8 @@ def test_successful_runner_writes_only_scoped_outputs_and_provenance(
     assert moscow_checkpoint["checkpoint_key"] != rostov_checkpoint["checkpoint_key"]
     assert "|moscow|shevron|1" in moscow_checkpoint["checkpoint_key"]
     assert "|rostov-on-don|shevron|1" in rostov_checkpoint["checkpoint_key"]
+    assert moscow_checkpoint["endpoint_id"] == "primary"
+    assert moscow_checkpoint["attempted_endpoint_ids"] == ["primary"]
 
     assert not (root / "data/raw/serp/latest").exists()
     assert not (root / "data/staging/serp/latest").exists()
@@ -368,6 +389,95 @@ def test_successful_runner_writes_only_scoped_outputs_and_provenance(
     assert "cookie" not in serialized.lower()
     assert "authorization" not in serialized.lower()
     assert "proxy_url" not in serialized.lower()
+
+
+def test_runner_honors_plan_depth_with_distinct_page_identity_and_positions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 200
+    plan["quality"]["expected_pages_per_query"] = 2
+    _write_json(plan_path, plan)
+    transport = FakeTransport()
+
+    manifest = _run(config, plan_path, transport)
+
+    assert manifest["complete"] is True
+    assert manifest["totals"] == {
+        "regions_ok": 2,
+        "pages_ok": 12,
+        "products_ok": 1200,
+    }
+    assert len(transport.search_calls) == 12
+    assert [
+        (request.task.query_id, request.task.page)
+        for request in transport.search_calls[:6]
+    ] == [
+        ("shevron", 1),
+        ("shevron", 2),
+        ("shevrony", 1),
+        ("shevrony", 2),
+        ("shevron-na-lipuchke", 1),
+        ("shevron-na-lipuchke", 2),
+    ]
+
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    assert (
+        state_dir / "checkpoints/moscow/shevron/page_002.json"
+    ).exists()
+    mart_path = (
+        root
+        / "data/marts/serp_scoped"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "moscow"
+        / RUN_ID
+        / "products_daily.csv"
+    )
+    with mart_path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    shevron_rows = [row for row in rows if row["query_id"] == "shevron"]
+    assert len(shevron_rows) == 200
+    assert [int(row["absolute_position"]) for row in shevron_rows] == list(
+        range(1, 201)
+    )
+    assert {row["raw_file"] for row in shevron_rows} == {
+        (
+            "data/raw/serp_scoped/"
+            "shevron-moscow-rostov-top100-pilot-v1/"
+            f"moscow/{RUN_ID}/pages/shevron/page_001.json"
+        ),
+        (
+            "data/raw/serp_scoped/"
+            "shevron-moscow-rostov-top100-pilot-v1/"
+            f"moscow/{RUN_ID}/pages/shevron/page_002.json"
+        ),
+    }
+
+
+def test_runner_uses_production_serp_pacing_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    config.raw["serp"]["sleep_between_pages_ms"] = 4500
+    config.raw["serp"]["sleep_between_queries_ms"] = 12000
+    sleeps: list[float] = []
+
+    _run(
+        config,
+        plan_path,
+        FakeTransport(),
+        sleeper=sleeps.append,
+    )
+
+    assert sleeps == [4.5, 12.0] * 6
 
 
 def test_protected_global_files_are_unchanged(
@@ -922,6 +1032,110 @@ def _requests_transport(session: FakeSession) -> RequestsScopedTransport:
         egress_check_url="https://ip.example.test",
         egress_session=session,  # type: ignore[arg-type]
     )
+
+
+def _ordered_requests_transport(session: FakeSession) -> RequestsScopedTransport:
+    return RequestsScopedTransport(
+        session=session,  # type: ignore[arg-type]
+        request_params={"appType": "1"},
+        endpoint_urls=(
+            "https://primary.example.test",
+            "https://fallback.example.test",
+        ),
+        timeout_seconds=45,
+        referer_base="https://www.wildberries.ru/search?query=",
+        resolver_url="https://geo.example.test",
+        egress_check_url="https://ip.example.test",
+        egress_session=session,  # type: ignore[arg-type]
+    )
+
+
+def _scoped_search_request(endpoint_id: str = "primary") -> ScopedSearchRequest:
+    task = type("Task", (), {"query": "шеврон"})()
+    return ScopedSearchRequest(
+        task=task,  # type: ignore[arg-type]
+        dest_id_observed="-535680",
+        endpoint_id=endpoint_id,
+        params={"query": "шеврон", "page": "1", "dest": "-535680"},
+    )
+
+
+def test_ordered_search_uses_production_endpoint_order_and_promotes_success() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(status_code=498),
+            FakeResponse(payload={"products": _products(1_000)}),
+            FakeResponse(payload={"products": _products(2_000)}),
+        ]
+    )
+    transport = _ordered_requests_transport(session)
+
+    first = transport.search_ordered(
+        _scoped_search_request("primary"),
+        timeout_seconds=10,
+    )
+    second = transport.search_ordered(
+        _scoped_search_request(transport.endpoint_policy.pinned_endpoint_id),
+        timeout_seconds=10,
+    )
+
+    assert first.endpoint_id == "fallback-1"
+    assert first.attempted_endpoint_ids == ("primary", "fallback-1")
+    assert transport.endpoint_policy.pinned_endpoint_id == "fallback-1"
+    assert second.endpoint_id == "fallback-1"
+    assert second.attempted_endpoint_ids == ("fallback-1",)
+    assert [url for url, _kwargs in session.calls] == [
+        "https://primary.example.test",
+        "https://fallback.example.test",
+        "https://fallback.example.test",
+    ]
+    assert all(
+        kwargs["params"]["dest"] == "-535680"
+        for _url, kwargs in session.calls
+    )
+
+
+def test_ordered_search_does_not_fallback_for_non_retryable_http() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(status_code=403),
+            FakeResponse(payload={"products": _products(1_000)}),
+        ]
+    )
+    transport = _ordered_requests_transport(session)
+
+    with pytest.raises(ScopedTransportError, match="search_http_403"):
+        transport.search_ordered(
+            _scoped_search_request("primary"),
+            timeout_seconds=10,
+        )
+
+    assert [url for url, _kwargs in session.calls] == [
+        "https://primary.example.test"
+    ]
+
+
+def test_ordered_search_falls_back_for_production_nested_promo_anomaly() -> None:
+    promo_products = [
+        {**product, "log": {"promotion": 1}}
+        for product in _products(1_000)
+    ]
+    session = FakeSession(
+        [
+            FakeResponse(payload={"data": {"products": promo_products}}),
+            FakeResponse(payload={"products": _products(2_000)}),
+        ]
+    )
+    transport = _ordered_requests_transport(session)
+
+    result = transport.search_ordered(
+        _scoped_search_request("primary"),
+        timeout_seconds=10,
+    )
+
+    assert result.endpoint_id == "fallback-1"
+    assert result.attempted_endpoint_ids == ("primary", "fallback-1")
+    assert len(session.calls) == 2
 
 
 @pytest.mark.parametrize(

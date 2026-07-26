@@ -348,7 +348,7 @@ def test_bundle_rejects_symlinked_query_pack(tmp_path: Path) -> None:
     ("mutator", "error_match"),
     [
         (
-            lambda root: _mutate_plan(root, "depth", 200),
+            lambda root: _mutate_plan(root, "depth", 150),
             "depth must be one of",
         ),
         (
@@ -552,9 +552,39 @@ def test_effective_plan_hash_is_canonical_and_secret_free(tmp_path: Path) -> Non
         canonical_effective_plan_sha256(invalid_quality)
 
     changed = copy.deepcopy(snapshot)
-    changed["depth"] = 200
+    changed["depth"] = 150
     with pytest.raises(CollectionPlanValidationError, match="depth must be one of"):
         canonical_effective_plan_sha256(changed)
+
+
+@pytest.mark.parametrize("depth", [100, 200, 300, 400, 500])
+def test_collection_plan_accepts_page_aligned_depths(
+    tmp_path: Path,
+    depth: int,
+) -> None:
+    root = _copy_stage1_config(tmp_path)
+    plan_path = root / PLAN_RELATIVE
+    plan = _read_json(plan_path)
+    plan["depth"] = depth
+    plan["quality"]["expected_pages_per_query"] = depth // 100
+    _write_json(plan_path, plan)
+
+    loaded = load_collection_plan(plan_path)
+
+    assert loaded.depth == depth
+    assert loaded.quality.expected_pages_per_query == depth // 100
+
+
+def test_collection_plan_rejects_depth_page_count_mismatch(tmp_path: Path) -> None:
+    root = _copy_stage1_config(tmp_path)
+    plan_path = root / PLAN_RELATIVE
+    plan = _read_json(plan_path)
+    plan["depth"] = 300
+    plan["quality"]["expected_pages_per_query"] = 2
+    _write_json(plan_path, plan)
+
+    with pytest.raises(CollectionPlanValidationError, match="depth/page_size"):
+        load_collection_plan(plan_path)
 
 
 @pytest.mark.parametrize(

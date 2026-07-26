@@ -100,6 +100,54 @@ def test_guarded_launcher_sources_runtime_before_python(
     assert payload["argv"][-2:] == ["--no-publish", "--guarded-pilot"]
 
 
+def test_collection_plan_launcher_sources_runtime_and_forwards_plan(
+    tmp_path: Path,
+) -> None:
+    project = _copy_launcher(tmp_path, "run_wb_collection_plan.sh")
+    capture = tmp_path / "capture.json"
+    scripts = project / "scripts"
+    (scripts / "run_wb_collection_plan.py").write_text(
+        "import json, os, sys\n"
+        "payload = {\n"
+        "  'runtime_loaded': os.getenv('PARSER_WB_RUNTIME_ENV_LOADED'),\n"
+        "  'runtime_sha256_present': len(os.getenv('PARSER_WB_RUNTIME_ENV_SHA256', '')) == 64,\n"
+        "  'proxy_present': bool(os.getenv('PARSER_WB_PROXY_URL')),\n"
+        "  'argv': sys.argv[1:],\n"
+        "}\n"
+        f"open({str(capture)!r}, 'w', encoding='utf-8').write(json.dumps(payload))\n",
+        encoding="utf-8",
+    )
+    _write_runtime_env(project)
+
+    result = subprocess.run(
+        [
+            str(scripts / "run_wb_collection_plan.sh"),
+            "--config",
+            "config/config.yaml",
+            "--plan-file",
+            "config/wb/collection_plans/test.json",
+            "--no-publish",
+        ],
+        cwd=project,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(capture.read_text(encoding="utf-8"))
+    assert payload["runtime_loaded"] == "1"
+    assert payload["runtime_sha256_present"] is True
+    assert payload["proxy_present"] is True
+    assert payload["argv"] == [
+        "--config",
+        "config/config.yaml",
+        "--plan-file",
+        "config/wb/collection_plans/test.json",
+        "--no-publish",
+    ]
+
+
 @pytest.mark.parametrize("runtime_state", ["missing", "symlink", "unreadable"])
 def test_guarded_launcher_rejects_unsafe_runtime_before_python(
     tmp_path: Path,
@@ -209,6 +257,7 @@ def test_all_marketplace_wrappers_use_required_runtime_loader() -> None:
         "run_wb_persistent_session.sh",
         "run_wb_persistent_watchdog.sh",
         "run_wb_guarded_regional_pilot.sh",
+        "run_wb_collection_plan.sh",
         "run_wb_live_component.sh",
         "run_wb_access_tool.sh",
     )

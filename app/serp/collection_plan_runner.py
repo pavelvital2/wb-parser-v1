@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import time as time_module
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
@@ -130,6 +131,7 @@ class ScopedSearchResult:
     endpoint_id: str
     dest_id_sent: str
     http_status: int = 200
+    attempted_endpoint_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +171,13 @@ class ScopedTransport(Protocol):
     ) -> str: ...
 
     def search(
+        self,
+        request: ScopedSearchRequest,
+        *,
+        timeout_seconds: float,
+    ) -> ScopedSearchResult: ...
+
+    def search_ordered(
         self,
         request: ScopedSearchRequest,
         *,
@@ -506,6 +515,7 @@ class RequestsScopedTransport:
         resolver_url: str = GEO_RESOLVER_URL,
         egress_check_url: str = EGRESS_CHECK_URL,
         egress_session: requests.Session | None = None,
+        retry_http_statuses: frozenset[int] | None = None,
     ) -> None:
         if not endpoint_urls:
             raise CollectionPlanRunError("SERP endpoint list is empty")
@@ -518,6 +528,9 @@ class RequestsScopedTransport:
         self.resolver_url = resolver_url
         self.egress_check_url = egress_check_url
         self.egress_session = egress_session or session
+        self.retry_http_statuses = retry_http_statuses or frozenset(
+            {429, 498, 500, 502, 503, 504}
+        )
         self.proxy_route_sha256 = getattr(
             session,
             "_wb_marketplace_proxy_sha256",
@@ -606,6 +619,16 @@ class RequestsScopedTransport:
             ),
             request_headers=headers,
             egress_session=session,
+            retry_http_statuses=frozenset(
+                int(value)
+                for value in (
+                    serp.get("retry_http_statuses")
+                    or [429, 498, 500, 502, 503, 504]
+                )
+                if not isinstance(value, bool)
+                and isinstance(value, (int, str))
+                and str(value).isdigit()
+            ),
         )
 
     @staticmethod
@@ -879,6 +902,124 @@ class RequestsScopedTransport:
             endpoint_id=request.endpoint_id,
             dest_id_sent=request.dest_id_observed,
             http_status=200,
+            attempted_endpoint_ids=(request.endpoint_id,),
+        )
+
+    def search_ordered(
+        self,
+        request: ScopedSearchRequest,
+        *,
+        timeout_seconds: float,
+    ) -> ScopedSearchResult:
+        if self._endpoint_pin_finalized:
+            raise ScopedTransportError("ordered_search_after_endpoint_pin")
+        if request.endpoint_id not in self.endpoint_policy.endpoint_ids:
+            raise ScopedTransportError("search_endpoint_unknown")
+
+        active_index = self.endpoint_policy.endpoint_ids.index(request.endpoint_id)
+        ordered_ids = (
+            request.endpoint_id,
+            *(
+                endpoint_id
+                for index, endpoint_id in enumerate(self.endpoint_policy.endpoint_ids)
+                if index != active_index
+            ),
+        )
+        attempted: list[str] = []
+        last_rate_limited: ScopedTransportError | None = None
+        last_payload_anomaly: ScopedTransportError | None = None
+
+        for endpoint_id in ordered_ids:
+            endpoint_url = self._endpoint_url(endpoint_id)
+            attempted.append(endpoint_id)
+            try:
+                headers = dict(self.request_headers)
+                headers["referer"] = (
+                    f"{self.referer_base}{quote(request.task.query)}"
+                )
+                response = self.session.get(
+                    endpoint_url,
+                    params=dict(request.params),
+                    headers=headers,
+                    timeout=min(self.timeout_seconds, timeout_seconds),
+                )
+            except requests.RequestException as exc:
+                raise ScopedTransportError(
+                    "search_network_error",
+                    request_sent=True,
+                    dest_id_sent=request.dest_id_observed,
+                ) from exc
+
+            if response.status_code in self.retry_http_statuses:
+                retry_after_status: str | None = None
+                retry_after_seconds: int | None = None
+                if response.status_code in {429, 498}:
+                    response_headers = getattr(response, "headers", {})
+                    raw_retry_after = (
+                        response_headers.get("Retry-After")
+                        if isinstance(response_headers, Mapping)
+                        else None
+                    )
+                    retry_after_status, retry_after_seconds = (
+                        parse_retry_after_delta(raw_retry_after)
+                    )
+                last_rate_limited = ScopedTransportError(
+                    f"search_http_{response.status_code}",
+                    request_sent=True,
+                    dest_id_sent=request.dest_id_observed,
+                    http_status=response.status_code,
+                    retry_after_status=retry_after_status,
+                    retry_after_seconds=retry_after_seconds,
+                )
+                continue
+
+            if response.status_code != 200:
+                raise ScopedTransportError(
+                    f"search_http_{response.status_code}",
+                    request_sent=True,
+                    dest_id_sent=request.dest_id_observed,
+                    http_status=response.status_code,
+                )
+
+            payload = self._response_json(
+                response,
+                code="search",
+                request_sent=True,
+                dest=request.dest_id_observed,
+            )
+            try:
+                _extract_products(payload)
+            except CollectionPlanRunError as exc:
+                if str(exc) != "retryable_payload_anomaly_nested_promo":
+                    raise
+                last_payload_anomaly = ScopedTransportError(
+                    "search_payload_anomaly_nested_promo",
+                    request_sent=True,
+                    dest_id_sent=request.dest_id_observed,
+                    http_status=200,
+                )
+                continue
+            self.endpoint_policy = EffectiveEndpointPolicy(
+                selection_mode=self.endpoint_policy.selection_mode,
+                endpoint_ids=self.endpoint_policy.endpoint_ids,
+                pinned_endpoint_id=endpoint_id,
+            )
+            return ScopedSearchResult(
+                payload=payload,
+                endpoint_id=endpoint_id,
+                dest_id_sent=request.dest_id_observed,
+                http_status=200,
+                attempted_endpoint_ids=tuple(attempted),
+            )
+
+        if last_payload_anomaly is not None:
+            raise last_payload_anomaly
+        if last_rate_limited is not None:
+            raise last_rate_limited
+        raise ScopedTransportError(
+            "search_no_endpoint_attempted",
+            request_sent=False,
+            dest_id_sent=request.dest_id_observed,
         )
 
     def close(self) -> None:
@@ -919,6 +1060,7 @@ PRODUCT_FIELDS = (
     "page",
     "page_size",
     "depth",
+    "endpoint_id",
     "position_on_page",
     "absolute_position",
     "nmId",
@@ -967,6 +1109,12 @@ def _extract_products(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
         raise CollectionPlanRunError("search_products_empty")
     if any(not isinstance(product, dict) for product in products):
         raise CollectionPlanRunError("search_product_malformed")
+    if payload.get("products") is None and all(
+        isinstance(product.get("log"), dict)
+        and product["log"].get("promotion") == 1
+        for product in products
+    ):
+        raise CollectionPlanRunError("retryable_payload_anomaly_nested_promo")
     return products
 
 
@@ -999,6 +1147,7 @@ class CollectionPlanRunner:
         lock_event_hook: LockEventHook | None = None,
         write_event_hook: WriteEventHook | None = None,
         egress_hash_salt: bytes | None = None,
+        sleeper: Callable[[float], None] = time_module.sleep,
     ) -> None:
         self.config = config
         self.plan_path = plan_path
@@ -1012,6 +1161,7 @@ class CollectionPlanRunner:
         self.lock_event_hook = lock_event_hook
         self.write_event_hook = write_event_hook
         self.egress_hash_salt = egress_hash_salt or secrets.token_bytes(32)
+        self.sleeper = sleeper
 
     def _load_bundle(self) -> CollectionPlanBundle:
         return load_collection_plan_bundle(
@@ -1043,8 +1193,14 @@ class CollectionPlanRunner:
             raise CollectionPlanRunError("collection plan sellers must be disabled")
         if plan.proxy_rotation_mode != "disabled":
             raise CollectionPlanRunError("collection plan rotation must be disabled")
-        if plan.depth != 100:
-            raise CollectionPlanRunError("Stage 2 accepts depth=100 only")
+        expected_pages = plan.depth // 100
+        if (
+            plan.depth % 100 != 0
+            or plan.quality.expected_pages_per_query != expected_pages
+        ):
+            raise CollectionPlanRunError(
+                "collection plan depth must map to complete 100-item pages"
+            )
 
     def _check_egress(self, expected: str | None = None) -> str:
         value = self.transport.egress_identity(
@@ -1061,6 +1217,17 @@ class CollectionPlanRunner:
                 "egress identity changed during scoped run"
             )
         return normalized
+
+    def _sleep_from_serp_config(self, key: str) -> None:
+        raw_value = self.config.raw.get("serp", {}).get(key, 0)
+        try:
+            milliseconds = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise CollectionPlanRunError(f"invalid SERP pacing value: {key}") from exc
+        if milliseconds < 0:
+            raise CollectionPlanRunError(f"invalid SERP pacing value: {key}")
+        if milliseconds:
+            self.sleeper(milliseconds / 1000.0)
 
     def _write(
         self,
@@ -1092,6 +1259,7 @@ class CollectionPlanRunner:
         bundle: CollectionPlanBundle,
         query_id: str,
         region_id: str,
+        page: int = 1,
     ) -> ScopedTask:
         query = next(item for item in bundle.enabled_queries if item.query_id == query_id)
         region = next(item for item in bundle.enabled_regions if item.region_id == region_id)
@@ -1105,7 +1273,7 @@ class CollectionPlanRunner:
             query_group=query.category_id,
             region_id=region.region_id,
             region_name=region.region_name,
-            page=1,
+            page=page,
             page_size=100,
             depth=bundle.collection_plan.depth,
         )
@@ -1176,8 +1344,9 @@ class CollectionPlanRunner:
                     "page": task.page,
                     "page_size": task.page_size,
                     "depth": task.depth,
+                    "endpoint_id": endpoint_id,
                     "position_on_page": index,
-                    "absolute_position": index,
+                    "absolute_position": ((task.page - 1) * task.page_size) + index,
                     "nmId": product_id,
                     "product_name": product.get("name") or "",
                     "brand": product.get("brand") or "",
@@ -1247,6 +1416,8 @@ class CollectionPlanRunner:
         task: ScopedTask,
         resolution: ResolvedDestination,
         raw_path: Path,
+        endpoint_id: str = "",
+        attempted_endpoint_ids: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         return {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -1259,6 +1430,8 @@ class CollectionPlanRunner:
             "page": task.page,
             "dest_id_observed": resolution.dest_id_observed,
             "dest_resolution_status": "resolved_and_sent",
+            "endpoint_id": endpoint_id,
+            "attempted_endpoint_ids": list(attempted_endpoint_ids),
             "raw_file": _relative(raw_path, self.config.project_root),
         }
 
@@ -1343,6 +1516,10 @@ class CollectionPlanRunner:
                 for region in bundle.enabled_regions
             ]
             totals = {"regions_ok": 0, "pages_ok": 0, "products_ok": 0}
+            endpoint_usage = {
+                endpoint_id: {"attempts": 0, "pages_ok": 0}
+                for endpoint_id in self.transport.endpoint_policy.endpoint_ids
+            }
             error: dict[str, Any] | None = None
             caught: Exception | None = None
 
@@ -1376,78 +1553,114 @@ class CollectionPlanRunner:
                     page_rows: list[dict[str, Any]] = []
                     region_error: Exception | None = None
                     for query in bundle.enabled_queries:
-                        task = self._task(
-                            bundle=bundle,
-                            query_id=query.query_id,
-                            region_id=region.region_id,
-                        )
-                        request = self._search_request(
-                            task=task,
-                            dest_id=resolved[region.region_id].dest_id_observed,
-                        )
-                        self.deadline.ensure_active()
-                        try:
-                            result = self.transport.search(
-                                request,
-                                timeout_seconds=self.deadline.request_timeout(
-                                    self.config.runtime.http_timeout_seconds
-                                ),
+                        for page in range(
+                            1,
+                            bundle.collection_plan.quality.expected_pages_per_query
+                            + 1,
+                        ):
+                            task = self._task(
+                                bundle=bundle,
+                                query_id=query.query_id,
+                                region_id=region.region_id,
+                                page=page,
                             )
-                        except ScopedTransportError as exc:
-                            if (
-                                exc.request_sent
-                                and exc.dest_id_sent
-                                == resolved[region.region_id].dest_id_observed
-                            ):
+                            request = self._search_request(
+                                task=task,
+                                dest_id=resolved[region.region_id].dest_id_observed,
+                            )
+                            self.deadline.ensure_active()
+                            try:
+                                result = self.transport.search_ordered(
+                                    request,
+                                    timeout_seconds=self.deadline.request_timeout(
+                                        self.config.runtime.http_timeout_seconds
+                                    ),
+                                )
+                            except ScopedTransportError as exc:
+                                if (
+                                    exc.request_sent
+                                    and exc.dest_id_sent
+                                    == resolved[region.region_id].dest_id_observed
+                                ):
+                                    region_manifest[
+                                        "dest_resolution_status"
+                                    ] = "resolved_and_sent"
+                                region_error = exc
+                                break
+                            try:
+                                if result.dest_id_sent != request.dest_id_observed:
+                                    raise CollectionPlanRunError(
+                                        "search destination evidence mismatch"
+                                    )
+                                if (
+                                    result.endpoint_id
+                                    not in self.transport.endpoint_policy.endpoint_ids
+                                ):
+                                    raise CollectionPlanRunError(
+                                        "search endpoint evidence mismatch"
+                                    )
+                                attempted_endpoint_ids = (
+                                    result.attempted_endpoint_ids
+                                    or (result.endpoint_id,)
+                                )
+                                if (
+                                    result.endpoint_id not in attempted_endpoint_ids
+                                    or len(set(attempted_endpoint_ids))
+                                    != len(attempted_endpoint_ids)
+                                    or any(
+                                        endpoint_id
+                                        not in self.transport.endpoint_policy.endpoint_ids
+                                        for endpoint_id in attempted_endpoint_ids
+                                    )
+                                ):
+                                    raise CollectionPlanRunError(
+                                        "search endpoint attempt evidence mismatch"
+                                    )
+                                for endpoint_id in attempted_endpoint_ids:
+                                    endpoint_usage[endpoint_id]["attempts"] += 1
+                                endpoint_usage[result.endpoint_id]["pages_ok"] += 1
                                 region_manifest[
                                     "dest_resolution_status"
                                 ] = "resolved_and_sent"
-                            region_error = exc
-                            break
-                        try:
-                            if result.dest_id_sent != request.dest_id_observed:
-                                raise CollectionPlanRunError(
-                                    "search destination evidence mismatch"
+                                raw_path = paths.raw_page_path(task)
+                                self._write(raw_path, _json_bytes(result.payload))
+                                products = _extract_products(result.payload)
+                                rows, page_row = self._rows_for_page(
+                                    task=task,
+                                    resolution=resolved[region.region_id],
+                                    products=products,
+                                    raw_path=raw_path,
+                                    endpoint_id=result.endpoint_id,
                                 )
-                            if (
-                                result.endpoint_id
-                                != self.transport.endpoint_policy.pinned_endpoint_id
-                            ):
-                                raise CollectionPlanRunError(
-                                    "search endpoint evidence mismatch"
+                                self._write(
+                                    paths.checkpoint_path(task),
+                                    _json_bytes(
+                                        self._checkpoint_payload(
+                                            task=task,
+                                            resolution=resolved[region.region_id],
+                                            raw_path=raw_path,
+                                            endpoint_id=result.endpoint_id,
+                                            attempted_endpoint_ids=attempted_endpoint_ids,
+                                        )
+                                    ),
                                 )
-                            region_manifest[
-                                "dest_resolution_status"
-                            ] = "resolved_and_sent"
-                            raw_path = paths.raw_page_path(task)
-                            self._write(raw_path, _json_bytes(result.payload))
-                            products = _extract_products(result.payload)
-                            rows, page_row = self._rows_for_page(
-                                task=task,
-                                resolution=resolved[region.region_id],
-                                products=products,
-                                raw_path=raw_path,
-                                endpoint_id=result.endpoint_id,
-                            )
-                            self._write(
-                                paths.checkpoint_path(task),
-                                _json_bytes(
-                                    self._checkpoint_payload(
-                                        task=task,
-                                        resolution=resolved[region.region_id],
-                                        raw_path=raw_path,
-                                    )
-                                ),
-                            )
-                            product_rows.extend(rows)
-                            page_rows.append(page_row)
-                            region_manifest["pages_ok"] += 1
-                            region_manifest["products_ok"] += len(rows)
-                            totals["pages_ok"] += 1
-                            totals["products_ok"] += len(rows)
-                        except Exception as exc:
-                            region_error = exc
+                                product_rows.extend(rows)
+                                page_rows.append(page_row)
+                                region_manifest["pages_ok"] += 1
+                                region_manifest["products_ok"] += len(rows)
+                                totals["pages_ok"] += 1
+                                totals["products_ok"] += len(rows)
+                                self._sleep_from_serp_config(
+                                    "sleep_between_pages_ms"
+                                )
+                            except Exception as exc:
+                                region_error = exc
+                                break
+                        if region_error is not None:
                             break
+                        self._sleep_from_serp_config(
+                            "sleep_between_queries_ms"
+                        )
 
                     outputs = self._write_scope_outputs(
                         paths=paths,
@@ -1470,7 +1683,10 @@ class CollectionPlanRunner:
                         )
                         raise region_error
 
-                    expected_pages = len(bundle.enabled_queries)
+                    expected_pages = (
+                        len(bundle.enabled_queries)
+                        * bundle.collection_plan.quality.expected_pages_per_query
+                    )
                     region_manifest["complete"] = (
                         region_manifest["pages_ok"] == expected_pages
                         and region_manifest["products_ok"] == expected_pages * 100
@@ -1506,7 +1722,11 @@ class CollectionPlanRunner:
                 }
 
             expected_regions = len(bundle.enabled_regions)
-            expected_pages = expected_regions * len(bundle.enabled_queries)
+            expected_pages = (
+                expected_regions
+                * len(bundle.enabled_queries)
+                * bundle.collection_plan.quality.expected_pages_per_query
+            )
             complete = (
                 caught is None
                 and totals["regions_ok"] == expected_regions
@@ -1554,6 +1774,7 @@ class CollectionPlanRunner:
                 "status": "success" if complete else "failed",
                 "complete": complete,
                 "totals": totals,
+                "endpoint_usage": endpoint_usage,
                 "regions": manifest_regions,
                 "error": error,
             }
@@ -1580,6 +1801,7 @@ def run_collection_plan(
     lock_event_hook: LockEventHook | None = None,
     write_event_hook: WriteEventHook | None = None,
     egress_hash_salt: bytes | None = None,
+    sleeper: Callable[[float], None] = time_module.sleep,
 ) -> dict[str, Any]:
     owned_transport = False
     active_transport = transport
@@ -1606,6 +1828,7 @@ def run_collection_plan(
             lock_event_hook=lock_event_hook,
             write_event_hook=write_event_hook,
             egress_hash_salt=egress_hash_salt,
+            sleeper=sleeper,
         ).run()
     finally:
         if owned_transport:

@@ -339,6 +339,13 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   keep the existing direct route for the local rotation control endpoint, then
   recreate an explicitly proxied session for later WB traffic. See
   `docs/WB_PROXY_ONLY_RUNBOOK.md`. Never print proxy values or credentials.
+- Isolated regional SERP runs must use
+  `scripts/run_wb_collection_plan.sh --config ... --plan-file ... --no-publish`.
+  The launcher loads the required runtime before Python starts. Query pack,
+  region set and depth come only from the reviewed collection plan; outputs
+  remain under `serp_scoped` and never publish global latest, sellers input,
+  run-report latest or Warehouse. Tracked regional plans and regions remain
+  disabled until a separate owner-approved enable change.
 - Keep `validation.max_error_ratio.serp` at `0.05` for production-like runs.
   Partial SERP above this threshold must not publish `latest` outputs or
   downstream seller exports.

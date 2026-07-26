@@ -1,7 +1,7 @@
 # WB query packs and regions
 
-Status: Stage 3.2 guarded pilot implementation; live execution requires a new
-owner approval
+Status: isolated regional SERP implementation; tracked plans and regions are
+disabled, and live execution requires a separate owner approval
 
 ## Scope
 
@@ -15,9 +15,11 @@ loaders for future scoped WB collection:
 - fail-closed query-pack provenance;
 - a canonical, secret-free effective-plan snapshot contract for Stage 2.
 
-Stage 1 itself did not add runtime behavior. Stage 2 adds an explicit isolated
-runner and scoped storage contract, but does not enable the tracked pilot or
-change the nightly pipeline.
+Stage 1 itself did not add runtime behavior. The isolated runner adds practical
+query-pack, region and depth selection with scoped storage, but does not enable
+the tracked plan or change the nightly pipeline. The guarded A-B-A pilot remains
+a separate diagnostic mode and is not required for ordinary regional
+collection.
 
 ## Tracked configuration
 
@@ -37,7 +39,7 @@ the approved research document. Both entries are disabled. Their `dest_id` and
 resolution fields are null/unresolved because the observed WB destination
 values are dated evidence, not stable configuration.
 
-The pilot plan is also disabled and fixes these non-runtime policies:
+The tracked plan is also disabled and fixes these non-runtime policies:
 
 - three explicit query IDs;
 - Moscow and Rostov-on-Don;
@@ -112,8 +114,8 @@ no trailing newline
 
 `build_effective_plan_snapshot()` is pure and returns an in-memory object. It
 requires an enabled plan, enabled selected queries/categories/regions, exact
-source hashes, a 100-item page size, stable non-secret endpoint IDs with one
-pinned endpoint, and resolver values with
+source hashes, a 100-item page size, stable non-secret endpoint IDs in their
+initial configured order, and resolver values with
 `dest_resolution_status=resolved_not_sent`. The schema has an exact key
 allowlist and has no fields for cookies, request headers, credentials, tokens,
 proxy URLs or full egress IPs.
@@ -127,20 +129,22 @@ closed.
 Stage 1 does not call this function for the committed disabled pilot plan and
 does not create an effective-plan runtime file.
 
-## Stage 2 isolated runner
+## Isolated regional runner
 
-The opt-in command is:
+The audited Linux launcher is:
 
-```text
-python main.py --config config/config.yaml collection-plan \
+```bash
+scripts/run_wb_collection_plan.sh \
+  --config config/config.yaml \
   --plan-file config/wb/collection_plans/{collection_plan_id}.json \
   --no-publish
 ```
 
-The equivalent dedicated launcher is
-`scripts/run_wb_collection_plan.py`. The command fails closed for a disabled
-plan. The committed pilot remains disabled, so neither command performs live
-HTTP unless a later owner-approved change enables an eligible plan.
+The shell launcher loads ignored `config/runtime.env` before Python/config
+loading and then calls `scripts/run_wb_collection_plan.py`. The shared
+proxy-required guard still fails closed before a session can be constructed.
+The command rejects a disabled plan, so the committed plan cannot perform live
+HTTP.
 
 The runner:
 
@@ -152,8 +156,18 @@ The runner:
   proxy route and requests session, using secret-free per-request headers, and
   stores only a masked value plus an experiment-local salted hash;
 - sends the exact resolved value as the search `dest`;
-- performs one request per task against one pinned endpoint, without retry,
-  fallback switching or proxy rotation;
+- derives pages from the plan depth: supported depth is `100`, `200`, `300`,
+  `400` or `500`, with exactly 100 products required per page;
+- uses the production-configured primary/fallback endpoint list in the same
+  active-first order as `SerpEngine`; retryable production statuses may advance
+  once through the remaining configured endpoints for that page, while a
+  successful endpoint becomes first for the next page;
+- uses the production `sleep_between_pages_ms` and
+  `sleep_between_queries_ms` values between scoped requests;
+- does not use the production retry loop, deferred retry, proxy rotation or
+  endpoint selection from historical run evidence;
+- records the successful `endpoint_id` in product rows, page indexes and
+  checkpoints, plus sanitized endpoint attempt counts in the run manifest;
 - records `resolved_and_sent` only as client-side request lifecycle evidence;
 - never claims that the search server applied the destination;
 - refuses to start within five minutes of the 23:45 MSK preflight cutoff.
@@ -168,6 +182,13 @@ state/wb_collection_plans/{plan}/{run_id}/
 There is no scoped `latest` in Stage 2. The runner never writes global SERP
 latest, seller exports, global run-report latest or warehouse data.
 
+The selected region or region set, query IDs and depth come only from the
+versioned collection plan. The query text comes only from its versioned query
+pack. The destination is resolved for the selected `region_id` under held
+locks, then the exact resolved value is sent on every corresponding search
+request. This is resolver-and-request provenance, not proof that WB applied the
+destination server-side.
+
 ## Validation
 
 Loaders reject:
@@ -181,7 +202,8 @@ Loaders reject:
 - enabled plans referencing disabled packs, queries, categories or regions;
 - external, non-canonical or symlinked bundle source paths;
 - unsafe query-pack paths;
-- unsupported depth or unsafe publication/sellers/rotation modes;
+- depth outside `100..500` in 100-item increments, a mismatched expected page
+  count, or unsafe publication/sellers/rotation modes;
 - non-null destination observations in tracked Stage 1 region config;
 - unsafe destination IDs, non-UTC/non-RFC-3339 timestamps and duplicate
   resolved destinations;
@@ -189,8 +211,8 @@ Loaders reject:
 
 ## Stop gate
 
-The tracked plan and regions remain disabled. Stage 3.2 code/test work does not
-authorize another resolver/search smoke or pilot. Scoped publication, warehouse
+The tracked plan and regions remain disabled. This implementation does not
+authorize a resolver/search run or guarded pilot. Scoped publication, warehouse
 migration, Parser Data API changes and scheduling remain unapproved.
 
 ## Stage 3 guarded pilot

@@ -19,7 +19,8 @@ COLLECTION_PLAN_SCHEMA_VERSION = "wb_collection_plan_v1"
 EFFECTIVE_PLAN_SCHEMA_VERSION = "wb_effective_collection_plan_v1"
 PROVENANCE_SCHEMA_VERSION = "wb_query_pack_provenance_v1"
 
-SUPPORTED_DEPTHS = frozenset({100})
+PAGE_SIZE = 100
+SUPPORTED_DEPTHS = frozenset(range(PAGE_SIZE, 501, PAGE_SIZE))
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -693,9 +694,9 @@ def load_collection_plan(path: Path | str) -> CollectionPlan:
         raise CollectionPlanValidationError(
             "collection_plan.quality.expected_queries_per_region must match query_ids count"
         )
-    if quality.expected_pages_per_query != 1:
+    if quality.expected_pages_per_query != depth // PAGE_SIZE:
         raise CollectionPlanValidationError(
-            "collection_plan.quality.expected_pages_per_query must be 1 in Stage 1"
+            "collection_plan.quality.expected_pages_per_query must match depth/page_size"
         )
     if quality.max_page_errors != 0:
         raise CollectionPlanValidationError(

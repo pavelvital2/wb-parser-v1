@@ -154,6 +154,24 @@ docs/WB_PROXY_ONLY_RUNBOOK.md
 Use it before changing WB proxy/cookie/header runtime, interpreting `429`/`498`,
 or processing a new browser Copy-as-cURL export.
 
+## Isolated WB Regional SERP (Linux VPS)
+
+Versioned query packs, the region registry and collection plans are documented
+in `docs/WB_QUERY_PACKS_REGIONS.md`. A reviewed enabled plan is run only through:
+
+```bash
+scripts/run_wb_collection_plan.sh \
+  --config config/config.yaml \
+  --plan-file config/wb/collection_plans/PLAN.json \
+  --no-publish
+```
+
+The launcher loads the required proxy-only runtime. Regional results stay under
+`data/{raw,staging,marts}/serp_scoped/{plan}/{region}/{run_id}` and never update
+global latest, seller input, run-report latest or Warehouse. Tracked regional
+plans and regions remain disabled until a separate owner-approved enable
+change.
+
 Retention cleanup:
 ```powershell
 py main.py --config config/config.yaml cleanup

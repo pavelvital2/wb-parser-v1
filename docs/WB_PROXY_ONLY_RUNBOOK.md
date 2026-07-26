@@ -37,6 +37,7 @@ scripts/run_wb_persistent_session.sh
 scripts/run_wb_persistent_watchdog.sh
 scripts/run_wb_live_component.sh {suggest|serp|sellers|daily|monthly} ...
 scripts/run_wb_access_tool.sh {smoke|ensure|refresh|renew} ...
+scripts/run_wb_collection_plan.sh --config ... --plan-file ... --no-publish
 scripts/run_wb_guarded_regional_pilot.sh
 ```
 
@@ -74,9 +75,10 @@ first marketplace request.
 | Cookie browser refresh | access/renewal/preflight wrappers | Playwright browser/context | shared browser route before launch |
 | Persistent WB browser | persistent wrapper/watchdog | Playwright persistent context | shared browser route before launch |
 | Persistent egress evidence | persistent wrapper/watchdog | `requests.Session` | shared proxied session |
-| Regional geo resolver | guarded pilot launcher | one `requests.Session` | Stage 3.2 contour preflight and shared guard |
+| Regional geo resolver | collection-plan or guarded pilot launcher | one `requests.Session` | required runtime loader and shared guard |
+| Regional scoped SERP | collection-plan launcher | same `requests.Session` | production endpoint order/params/headers through shared guard |
 | Regional probe/search/repeat | guarded pilot launcher | same `requests.Session` | Stage 3.2 contour preflight and shared guard |
-| Regional neutral egress | guarded pilot launcher | same `requests.Session` | same proxy route/session as regional requests |
+| Regional neutral egress | collection-plan or guarded pilot launcher | same `requests.Session` | same proxy route/session as regional requests |
 
 The watchdog's tmux/process checks are local. Any keeper/browser repair it
 starts inherits the required runtime provenance and still passes the component
