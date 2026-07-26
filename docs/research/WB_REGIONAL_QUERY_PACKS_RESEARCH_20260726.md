@@ -116,9 +116,18 @@ region, destination, query pack, collection plan or publication scope.
   refresh. It retries SERP once after a one-hour cooldown.
 - `scripts/notify_products_sellers_daily.py` counts queries from
   `exports/queries.txt` and reads only global latest files.
+- The nightly wrapper holds
+  `state/locks/products_sellers_daily.flock` for its complete lifecycle. The
+  warehouse wrapper takes `state/locks/wb_warehouse_refresh.flock`; a
+  standalone refresh then probes the daily lock non-blockingly and exits if it
+  is occupied, while the nightly wrapper explicitly allows its child refresh.
 
 An additional plan must therefore have a separate launcher/report scope and
 must not reuse the nightly notifier as if it were the legacy collection.
+Checking these locks without acquiring them would have a time-of-check to
+time-of-use race. A regional launcher must acquire every shared exclusion lock
+non-blockingly before its first HTTP request and retain them through final
+scoped writes.
 
 ### 3.5 Warehouse
 
@@ -239,7 +248,7 @@ containing only `appType`, `curr`, `dest`, and `spp`:
 | Rostov-on-Don | `-2228364` |
 
 These are dated observations. They must not be treated as stable configuration
-until repeated verification and owner approval.
+until repeated resolution checks and owner approval.
 
 ### 6.3 Search results
 
@@ -310,6 +319,13 @@ A collection plan should reference one exact pack version and define:
 - endpoint policy and rotation policy;
 - compatibility mode.
 
+Every run manifest must bind execution to exact source bytes with
+`query_pack_sha256`, `collection_plan_sha256`, and
+`region_registry_sha256`. It must also reference an immutable, secret-free
+snapshot of the effective resolved plan and record that snapshot's SHA-256.
+Reusing one `query_pack_id + version` with different content is a provenance
+violation and must fail closed before collection.
+
 The current 30-line `exports/queries.txt` must remain the implicit
 `legacy-nightly` plan until an explicitly approved migration. Query packs must
 not silently replace, regenerate or reorder it.
@@ -332,6 +348,20 @@ Regional outputs must use a separate component namespace such as
 `serp_scoped`; current global `serp/latest`, sellers input, run-report latest
 and warehouse globs remain untouched.
 
+Destination metadata must distinguish resolution from server application.
+`dest_resolution_status` may state that a valid resolver response was obtained
+and that its exact value was sent in the search request; it must not claim that
+the modern search server applied that value because the successful response did
+not echo it.
+
+The runner must also replace lock pre-checks with held exclusion. The
+documented regional acquisition order is daily, pipeline, warehouse-refresh,
+then plan-specific lock, all non-blocking. All acquired locks remain held
+through destination/search HTTP and scoped-write finalization. The current
+standalone warehouse refresh takes its own lock first but only probes the daily
+lock non-blockingly and exits immediately when busy, so it does not wait in the
+reverse order.
+
 The first implementation must be manual and no-publish. Only after the
 3-query, 2-region pilot passes should the owner decide whether to authorize
 scoped latest, warehouse migration, API exposure or scheduling.
@@ -341,7 +371,8 @@ scoped latest, warehouse migration, API exposure or scheduling.
 1. Is `get-geo-info` acceptable as an operational dependency despite being
    undocumented?
 2. Should destination values be resolved for every run, or cached with a short
-   verification TTL? Current evidence is insufficient to choose a stable TTL.
+   resolution-cache TTL? Current evidence is insufficient to choose a stable
+   TTL.
 3. Can WB return a response-side destination proof for successful modern
    search responses? Recent payloads omit `params`.
 4. What level of Moscow A-B-A repeatability is required before regional
