@@ -39,6 +39,16 @@ MAX_POSITIONS = 120000
 DOWNSTREAM_SCHEMA = "wb_four_region_downstream_v1"
 BRIDGE_FIELDS = list(PRODUCT_FIELDS)
 PRE_CUTOVER_DOWNSTREAM_MODE = "pre_cutover_legacy_nightly_protected_v1"
+LEGACY_NIGHTLY_START_MSK = "00:15"
+REVIEWED_FOUR_REGION_RUNTIME_WINDOW = CollectionRuntimeWindow(
+    mode="bounded_resumable",
+    scheduled_start_msk="00:15",
+    new_run_start_grace_seconds=1800,
+    max_invocation_runtime_seconds=21600,
+    absolute_cutoff_msk="23:00",
+    minimum_resume_window_seconds=1800,
+    finalization_reserve_seconds=60,
+)
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
@@ -60,23 +70,21 @@ class FourRegionInputs:
 @dataclass(frozen=True, slots=True)
 class DownstreamExecutionContract:
     mode: str
-    protected_start_msk: str
+    legacy_nightly_start_msk: str
     protected_duration_seconds: int
     minimum_clearance_seconds: int
 
     @classmethod
-    def pre_cutover(
-        cls,
-        runtime_window: CollectionRuntimeWindow,
-    ) -> "DownstreamExecutionContract":
+    def pre_cutover(cls) -> "DownstreamExecutionContract":
         return cls(
             mode=PRE_CUTOVER_DOWNSTREAM_MODE,
-            protected_start_msk=runtime_window.scheduled_start_msk,
+            legacy_nightly_start_msk=LEGACY_NIGHTLY_START_MSK,
             protected_duration_seconds=(
-                runtime_window.max_invocation_runtime_seconds
+                REVIEWED_FOUR_REGION_RUNTIME_WINDOW
+                .max_invocation_runtime_seconds
             ),
             minimum_clearance_seconds=(
-                runtime_window.minimum_resume_window_seconds
+                REVIEWED_FOUR_REGION_RUNTIME_WINDOW.minimum_resume_window_seconds
             ),
         )
 
@@ -92,7 +100,7 @@ class DownstreamExecutionContract:
         try:
             hour, minute = (
                 int(part)
-                for part in self.protected_start_msk.split(":", 1)
+                for part in self.legacy_nightly_start_msk.split(":", 1)
             )
             protected_time = time(hour, minute)
         except (TypeError, ValueError) as exc:
@@ -127,7 +135,8 @@ class DownstreamExecutionContract:
     def evidence(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
-            "protected_start_msk": self.protected_start_msk,
+            "legacy_nightly_start_msk": self.legacy_nightly_start_msk,
+            "legacy_boundary_source": "pre_cutover_contract_v1",
             "protected_duration_seconds": self.protected_duration_seconds,
             "minimum_clearance_seconds": self.minimum_clearance_seconds,
         }
@@ -213,6 +222,10 @@ def validate_four_region_bundle(bundle: CollectionPlanBundle) -> None:
         raise CriticalPipelineError("four-region query/depth contract mismatch")
     if plan.runtime_window is None:
         raise CriticalPipelineError("four-region bounded runtime contract is missing")
+    if plan.runtime_window != REVIEWED_FOUR_REGION_RUNTIME_WINDOW:
+        raise CriticalPipelineError(
+            "four-region reviewed runtime contract mismatch"
+        )
 
 
 def deterministic_seller_rows(
@@ -664,7 +677,7 @@ def run_four_region_downstream(
     seller_scope: SellersRunScope | None = None
     sellers_result: Mapping[str, Any] | None = None
     warehouse_result: Mapping[str, Any] | None = None
-    execution_contract: DownstreamExecutionContract | None = None
+    execution_contract = DownstreamExecutionContract.pre_cutover()
     stage = "preflight"
     try:
         bundle = load_collection_plan_bundle(
@@ -678,9 +691,6 @@ def run_four_region_downstream(
             raise CriticalPipelineError(
                 "four-region runtime window is missing"
             )
-        execution_contract = DownstreamExecutionContract.pre_cutover(
-            runtime_window
-        )
         if execution_mode != execution_contract.mode:
             raise CriticalPipelineError(
                 "downstream execution mode is not approved"
@@ -836,14 +846,7 @@ def run_four_region_downstream(
             "status": "failed",
             "complete": False,
             "stage": stage,
-            "execution_contract": (
-                execution_contract.evidence()
-                if execution_contract is not None
-                else {
-                    "mode": execution_mode,
-                    "status": "not_validated",
-                }
-            ),
+            "execution_contract": execution_contract.evidence(),
             "finished_at_utc": datetime.now(UTC)
             .replace(microsecond=0)
             .isoformat(),

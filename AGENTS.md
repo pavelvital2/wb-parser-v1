@@ -479,6 +479,9 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   `pre_cutover_legacy_nightly_protected_v1` mode. It must reject protected or
   insufficient-clearance starts before acquiring any shared lock; changing
   this mode belongs to a separately reviewed supervisor/cutover change.
+  Its versioned legacy boundary is fixed at `00:15` MSK and must never be
+  derived from mutable collection-plan runtime fields. The v2 plan runtime
+  window must exact-match its reviewed contract; any drift fails before locks.
   Downstream is the authoritative failure-state writer after it starts; the
   launcher may write a collection preview only before that boundary.
   Scoped `regional_run_quality.source_row_sha256` must cover every retained

@@ -99,11 +99,19 @@ whose downstream window expires is continued with an explicit
 Before final cutover, downstream additionally runs under the explicit
 `pre_cutover_legacy_nightly_protected_v1` execution contract. Before taking
 any shared lock it rejects starts during the protected interval beginning at
-the plan's 00:15 MSK boundary and rejects starts with less than the plan's
-minimum resume window before the next 00:15 boundary. The protected interval
-uses the reviewed maximum invocation duration from the plan. The final
-supervisor/cutover must replace this mode in a separate reviewed change; it
-must not silently bypass the guard.
+the versioned legacy boundary `00:15` MSK and rejects starts with less than
+1800 seconds before the next legacy boundary. This boundary is independent of
+collection-plan fields and is recorded as
+`legacy_nightly_start_msk=00:15` with
+`legacy_boundary_source=pre_cutover_contract_v1`.
+
+The v2 four-region plan is separately required to match the complete reviewed
+runtime contract exactly: `bounded_resumable`, `00:15`, 1800-second new-run
+grace, 21600-second invocation cap, `23:00` cutoff, 1800-second resume window
+and 60-second finalization reserve. Valid but unreviewed runtime drift fails
+before shared lock acquisition. The final supervisor/cutover must replace the
+pre-cutover mode in a separate reviewed change; it must not silently bypass
+the guard.
 
 ### Scoped Sellers
 

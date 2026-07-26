@@ -31,7 +31,10 @@ from app.serp.collection_plan_runner import (
 from app.serp.four_region_nightly import (
     FOUR_REGION_IDS,
     FOUR_REGION_PLAN_ID,
+    LEGACY_NIGHTLY_START_MSK,
     PRE_CUTOVER_DOWNSTREAM_MODE,
+    REVIEWED_FOUR_REGION_RUNTIME_WINDOW,
+    DownstreamExecutionContract,
     FourRegionInputs,
     build_four_region_inputs,
     deterministic_seller_rows,
@@ -420,7 +423,10 @@ def test_tracked_four_region_plan_is_exact_and_disabled() -> None:
     )
     assert bundle.collection_plan.depth == 1000
     assert bundle.collection_plan.quality.expected_pages_per_query == 10
-    assert bundle.collection_plan.runtime_window is not None
+    assert (
+        bundle.collection_plan.runtime_window
+        == REVIEWED_FOUR_REGION_RUNTIME_WINDOW
+    )
     registry = {region.region_id: region for region in bundle.region_registry.regions}
     assert all(registry[region_id].enabled is False for region_id in FOUR_REGION_IDS)
 
@@ -1127,6 +1133,71 @@ def test_pre_cutover_downstream_guard_rejects_before_lock(
     assert failure["execution_contract"]["mode"] == (
         PRE_CUTOVER_DOWNSTREAM_MODE
     )
+    assert failure["execution_contract"]["legacy_nightly_start_msk"] == (
+        LEGACY_NIGHTLY_START_MSK
+    )
+
+
+def test_pre_cutover_runtime_drift_rejected_before_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["runtime_window"]["scheduled_start_msk"] = "01:00"
+    _write_json(plan_path, plan)
+    lock_calls = 0
+
+    def forbidden_locks(**_kwargs):
+        nonlocal lock_calls
+        lock_calls += 1
+        raise AssertionError("runtime contract must be checked before locks")
+
+    monkeypatch.setattr(
+        "app.serp.four_region_nightly.acquire_collection_plan_locks",
+        forbidden_locks,
+    )
+    with pytest.raises(
+        CriticalPipelineError,
+        match="reviewed runtime contract mismatch",
+    ):
+        run_four_region_downstream(
+            config=config,
+            plan_path=plan_path,
+            run_id=RUN_ID,
+            now=lambda: datetime(
+                2026,
+                7,
+                25,
+                21,
+                5,
+                tzinfo=timezone.utc,
+            ),
+        )
+    assert lock_calls == 0
+    failure = _read_json(
+        root
+        / "state/wb_four_region_nightly"
+        / FOUR_REGION_PLAN_ID
+        / RUN_ID
+        / "state.json"
+    )
+    assert failure["stage"] == "preflight"
+    assert failure["execution_contract"] == {
+        "mode": PRE_CUTOVER_DOWNSTREAM_MODE,
+        "legacy_nightly_start_msk": "00:15",
+        "legacy_boundary_source": "pre_cutover_contract_v1",
+        "protected_duration_seconds": 21600,
+        "minimum_clearance_seconds": 1800,
+    }
+
+
+def test_pre_cutover_contract_allows_after_protected_window() -> None:
+    contract = DownstreamExecutionContract.pre_cutover()
+    contract.ensure_start_allowed(
+        datetime(2026, 7, 26, 4, 0, tzinfo=timezone.utc)
+    )
+    assert contract.evidence()["legacy_nightly_start_msk"] == "00:15"
 
 
 def test_launcher_preserves_authoritative_downstream_failure_state(
