@@ -1,0 +1,27 @@
+{
+  "schema_version": "wb_collection_plan_v1",
+  "collection_plan_id": "shevron-moscow-rostov-top100-pilot-v1",
+  "enabled": false,
+  "query_pack_file": "config/wb/query_packs/shevron-core/2026-07-26.1.json",
+  "query_ids": [
+    "shevron",
+    "shevrony",
+    "shevron-na-lipuchke"
+  ],
+  "region_set": [
+    "moscow",
+    "rostov-on-don"
+  ],
+  "depth": 100,
+  "schedule_id": "manual-pilot",
+  "publication_mode": "none",
+  "sellers_mode": "disabled",
+  "proxy_rotation_mode": "disabled",
+  "quality": {
+    "expected_queries_per_region": 3,
+    "expected_pages_per_query": 1,
+    "max_page_errors": 0,
+    "require_constant_egress": true,
+    "require_distinct_destinations": true
+  }
+}

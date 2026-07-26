@@ -1,0 +1,31 @@
+{
+  "schema_version": "wb_region_registry_v1",
+  "regions": [
+    {
+      "region_id": "moscow",
+      "region_name": "Москва",
+      "enabled": false,
+      "resolver": "wb_geo_xinfo",
+      "latitude": "55.6255780",
+      "longitude": "37.6063916",
+      "address_label": "Москва, Россия",
+      "dest_id": null,
+      "dest_resolved_at_utc": null,
+      "dest_resolution_source": null,
+      "dest_resolution_status": "unresolved"
+    },
+    {
+      "region_id": "rostov-on-don",
+      "region_name": "Ростов-на-Дону",
+      "enabled": false,
+      "resolver": "wb_geo_xinfo",
+      "latitude": "47.2222596",
+      "longitude": "39.7198736",
+      "address_label": "Ростов-на-Дону, Россия",
+      "dest_id": null,
+      "dest_resolved_at_utc": null,
+      "dest_resolution_source": null,
+      "dest_resolution_status": "unresolved"
+    }
+  ]
+}

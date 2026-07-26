@@ -1,0 +1,195 @@
+{
+  "schema_version": "wb_query_pack_v1",
+  "query_pack_id": "shevron-core",
+  "version": "2026-07-26.1",
+  "enabled": true,
+  "categories": [
+    {
+      "category_id": "shevrons",
+      "name": "Шевроны",
+      "enabled": true
+    }
+  ],
+  "queries": [
+    {
+      "query_id": "shevron-na-lipuchke",
+      "category_id": "shevrons",
+      "text": "шеврон на липучке",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron",
+      "category_id": "shevrons",
+      "text": "шеврон",
+      "enabled": true
+    },
+    {
+      "query_id": "shevrony",
+      "category_id": "shevrons",
+      "text": "шевроны",
+      "enabled": true
+    },
+    {
+      "query_id": "shevrony-na-lipuchke",
+      "category_id": "shevrons",
+      "text": "шевроны на липучке",
+      "enabled": true
+    },
+    {
+      "query_id": "shevrony-na-lipuchke-voennye",
+      "category_id": "shevrons",
+      "text": "шевроны на липучке военные",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-na-lipuchke-voennye",
+      "category_id": "shevrons",
+      "text": "шеврон на липучке военные",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-na-kepku",
+      "category_id": "shevrons",
+      "text": "шеврон на кепку",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-na-lipuchke-prikoly",
+      "category_id": "shevrons",
+      "text": "шеврон на липучке приколы",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-rossiya",
+      "category_id": "shevrons",
+      "text": "шеврон россия",
+      "enabled": true
+    },
+    {
+      "query_id": "shevrony-mvd",
+      "category_id": "shevrons",
+      "text": "шевроны мвд",
+      "enabled": true
+    },
+    {
+      "query_id": "shevrony-rosgvardiya",
+      "category_id": "shevrons",
+      "text": "шевроны росгвардия",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-na-zakaz",
+      "category_id": "shevrons",
+      "text": "шеврон на заказ",
+      "enabled": true
+    },
+    {
+      "query_id": "shevrony-na-lipuchke-prikolnye",
+      "category_id": "shevrons",
+      "text": "шевроны на липучке прикольные",
+      "enabled": true
+    },
+    {
+      "query_id": "imennoy-shevron",
+      "category_id": "shevrons",
+      "text": "именной шеврон",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-fsb",
+      "category_id": "shevrons",
+      "text": "шеврон фсб",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-na-lipuchke-imennoy",
+      "category_id": "shevrons",
+      "text": "шеврон на липучке именной",
+      "enabled": true
+    },
+    {
+      "query_id": "polo-mvd-zhenskaya-s-shevronami",
+      "category_id": "shevrons",
+      "text": "поло мвд женская с шевронами",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-rosgvardiya",
+      "category_id": "shevrons",
+      "text": "шеврон росгвардия",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-imennoy",
+      "category_id": "shevrons",
+      "text": "шеврон именной",
+      "enabled": true
+    },
+    {
+      "query_id": "shevrony-fsin",
+      "category_id": "shevrons",
+      "text": "шевроны фсин",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-na-lipuchke-rossiya",
+      "category_id": "shevrons",
+      "text": "шеврон на липучке россия",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-na-kepku-na-lipuchke",
+      "category_id": "shevrons",
+      "text": "шеврон на кепку на липучке",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-vagner",
+      "category_id": "shevrons",
+      "text": "шеврон вагнер",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-bpla",
+      "category_id": "shevrons",
+      "text": "шеврон бпла",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-na-lipuchke-na-kepku",
+      "category_id": "shevrons",
+      "text": "шеврон на липучке на кепку",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-mog",
+      "category_id": "shevrons",
+      "text": "шеврон мог",
+      "enabled": true
+    },
+    {
+      "query_id": "kepka-s-lipuchkoy-pod-shevron",
+      "category_id": "shevrons",
+      "text": "кепка с липучкой под шеврон",
+      "enabled": true
+    },
+    {
+      "query_id": "shevrony-vks",
+      "category_id": "shevrons",
+      "text": "шевроны вкс",
+      "enabled": true
+    },
+    {
+      "query_id": "kepka-s-shevronom",
+      "category_id": "shevrons",
+      "text": "кепка с шевроном",
+      "enabled": true
+    },
+    {
+      "query_id": "shevron-vdv",
+      "category_id": "shevrons",
+      "text": "шеврон вдв",
+      "enabled": true
+    }
+  ]
+}
