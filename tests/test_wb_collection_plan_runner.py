@@ -8,7 +8,7 @@ import shutil
 import socket
 import sys
 from contextlib import ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -24,11 +24,13 @@ from app.serp.collection_plan import (
     EffectiveEndpointPolicy,
     canonical_effective_plan_sha256,
     exact_file_sha256,
+    load_collection_plan_bundle,
 )
 from app.serp.collection_plan_runner import (
     CollectionPlanRunner,
     CollectionPlanRunError,
     DeadlineGuard,
+    EgressIdentityChangedError,
     RequestsScopedTransport,
     ScopedPaths,
     ScopedSearchRequest,
@@ -133,6 +135,11 @@ def _products(seed: int, count: int = 100) -> list[dict[str, Any]]:
 
 class FakeTransport:
     request_params = {"appType": "1", "dest": "-legacy", "curr": "rub"}
+    endpoint_urls = (
+        "https://primary.example.test",
+        "https://fallback.example.test",
+    )
+    proxy_route_sha256 = hashlib.sha256(b"fake-proxy-route").hexdigest()
     endpoint_policy = EffectiveEndpointPolicy(
         selection_mode="ordered_fallbacks",
         endpoint_ids=("primary", "fallback-1"),
@@ -424,7 +431,6 @@ def test_runner_honors_plan_depth_with_distinct_page_identity_and_positions(
         ("shevron-na-lipuchke", 1),
         ("shevron-na-lipuchke", 2),
     ]
-
     state_dir = (
         root
         / "state/wb_collection_plans"
@@ -462,6 +468,940 @@ def test_runner_honors_plan_depth_with_distinct_page_identity_and_positions(
         ),
     }
 
+
+def test_top1000_resume_repeats_only_unfinished_query_segment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+
+    first = FakeTransport(failure_call=25, failure_code="search_http_498")
+    with pytest.raises(ScopedTransportError, match="search_http_498"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=first,
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            egress_hash_salt=b"resume-test",
+        )
+
+    assert len(first.search_calls) == 25
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    failed_manifest = _read_json(state_dir / "manifest.json")
+    assert failed_manifest["complete"] is False
+    assert failed_manifest["resume"]["verified_segments"] == 2
+    assert failed_manifest["totals"] == {
+        "regions_ok": 0,
+        "pages_ok": 20,
+        "products_ok": 2000,
+    }
+    assert failed_manifest["resume"]["failed_segment"]["pages_written"] == 4
+    assert failed_manifest["resume"]["failed_segment"][
+        "attempted_endpoint_ids"
+    ] == ["primary"]
+    assert failed_manifest["resume"]["failed_segment"]["egress"][
+        "verification_status"
+    ] == "unverified"
+    assert failed_manifest["resume"]["failed_segment"]["egress"]["end"] is None
+    assert not (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "latest.json"
+    ).exists()
+
+    resumed = FakeTransport(egress_values=["198.51.100.20"] * 8)
+    manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=resumed,
+        resume_run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+        egress_hash_salt=b"resume-test",
+    )
+
+    assert manifest["complete"] is True
+    assert len(resumed.search_calls) == 40
+    assert [
+        (call.task.region_id, call.task.query_id, call.task.page)
+        for call in resumed.search_calls[:10]
+    ] == [
+        ("moscow", "shevron-na-lipuchke", page)
+        for page in range(1, 11)
+    ]
+    assert manifest["totals"] == {
+        "regions_ok": 2,
+        "pages_ok": 60,
+        "products_ok": 6000,
+    }
+    assert manifest["resume"]["verified_segments"] == 6
+    assert manifest["resume"]["maximum_repeated_pages"] == 10
+    assert len(manifest["resume"]["discarded_segments"]) == 1
+    assert manifest["endpoint_usage"]["primary"] == {
+        "attempts": 65,
+        "pages_ok": 64,
+    }
+
+    mart_path = (
+        root
+        / "data/marts/serp_scoped"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "moscow"
+        / RUN_ID
+        / "products_daily.csv"
+    )
+    rows = list(csv.DictReader(mart_path.open(encoding="utf-8")))
+    identities = {
+        (
+            row["region_id"],
+            row["query_id"],
+            row["page"],
+            row["absolute_position"],
+        )
+        for row in rows
+    }
+    assert len(rows) == 3000
+    assert len(identities) == len(rows)
+    latest = _read_json(
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "latest.json"
+    )
+    assert latest["run_id"] == RUN_ID
+    assert [item["region_id"] for item in latest["regions"]] == [
+        "moscow",
+        "rostov-on-don",
+    ]
+    segment_refs = manifest["resume"]["segments"]
+    assert len(segment_refs) == 6
+    assert all(
+        ref["egress"]["verification_status"] == "verified_constant"
+        and ref["egress"]["constant"] is True
+        and "start" in ref["egress"]
+        and "end" in ref["egress"]
+        for ref in segment_refs
+    )
+    assert {
+        ref["egress"]["start"]["masked"] for ref in segment_refs
+    } == {"203.0.x.x", "198.51.x.x"}
+    assert resumed.egress_calls == 5
+
+
+def test_top1000_short_payload_records_attempt_without_canonical_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+
+    with pytest.raises(CollectionPlanRunError, match="search_products_short"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(product_count=99),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    manifest = _read_json(state_dir / "manifest.json")
+    discarded = manifest["resume"]["discarded_segments"]
+    assert len(discarded) == 1
+    assert discarded[0]["endpoint_usage"]["primary"] == {
+        "attempts": 1,
+        "pages_ok": 0,
+    }
+    assert manifest["endpoint_usage"]["primary"] == {
+        "attempts": 1,
+        "pages_ok": 0,
+    }
+    assert manifest["totals"] == {
+        "regions_ok": 0,
+        "pages_ok": 0,
+        "products_ok": 0,
+    }
+    assert not (
+        root
+        / "data/raw/serp_scoped"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "moscow"
+        / RUN_ID
+        / "pages/shevron/page_001.json"
+    ).exists()
+
+
+def test_top1000_multiple_resume_failures_do_not_double_count_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=25),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=5),
+            resume_run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=FakeTransport(),
+        resume_run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+    )
+
+    discarded = manifest["resume"]["discarded_segments"]
+    assert len(discarded) == 2
+    assert len({item["segment_id"] for item in discarded}) == 2
+    assert manifest["endpoint_usage"]["primary"] == {
+        "attempts": 70,
+        "pages_ok": 68,
+    }
+    assert manifest["totals"]["pages_ok"] == 60
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "negative_counter",
+        "boolean_counter",
+        "unknown_endpoint",
+        "unknown_scope",
+        "duplicate_segment_id",
+    ],
+)
+def test_top1000_resume_rejects_invalid_discarded_history_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=1),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+
+    manifest_path = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+        / "manifest.json"
+    )
+    manifest = _read_json(manifest_path)
+    history = manifest["resume"]["discarded_segments"]
+    if corruption == "negative_counter":
+        history[0]["endpoint_usage"]["primary"]["attempts"] = -1
+    elif corruption == "boolean_counter":
+        history[0]["endpoint_usage"]["primary"]["attempts"] = True
+    elif corruption == "unknown_endpoint":
+        history[0]["endpoint_usage"]["unknown"] = {
+            "attempts": 0,
+            "pages_ok": 0,
+        }
+    elif corruption == "unknown_scope":
+        history[0]["region_id"] = "unknown-region"
+    elif corruption == "duplicate_segment_id":
+        history.append(dict(history[0]))
+    _write_json(manifest_path, manifest)
+
+    transport = FakeTransport()
+    with pytest.raises(CollectionPlanRunError, match="discarded segment"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=transport,
+            resume_run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    assert transport.resolve_calls == []
+    assert transport.search_calls == []
+    assert transport.egress_calls == 0
+
+
+def test_top1000_changed_end_egress_is_honest_and_segment_is_repeated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+
+    first = FakeTransport(
+        egress_values=["203.0.113.10", "198.51.100.20"],
+    )
+    with pytest.raises(EgressIdentityChangedError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=first,
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            egress_hash_salt=b"changed-egress",
+        )
+    assert len(first.search_calls) == 10
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    failed = _read_json(state_dir / "manifest.json")
+    evidence = failed["resume"]["discarded_segments"][0]["egress"]
+    assert evidence["verification_status"] == "changed"
+    assert evidence["constant"] is False
+    assert evidence["checks_completed"] == 2
+    assert evidence["start"]["masked"] == "203.0.x.x"
+    assert evidence["end"]["masked"] == "198.51.x.x"
+    assert evidence["start"]["ephemeral_sha256"] != evidence["end"][
+        "ephemeral_sha256"
+    ]
+    assert failed["resume"]["segments"] == []
+    assert not (
+        root
+        / "data/raw/serp_scoped"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "moscow"
+        / RUN_ID
+        / "pages/shevron/page_001.json"
+    ).exists()
+    assert not (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "latest.json"
+    ).exists()
+
+    resumed = FakeTransport(egress_values=["192.0.2.30"] * 8)
+    manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=resumed,
+        resume_run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+        egress_hash_salt=b"changed-egress",
+    )
+    assert len(resumed.search_calls) == 60
+    assert manifest["complete"] is True
+    assert manifest["totals"]["pages_ok"] == 60
+    assert len(manifest["resume"]["discarded_segments"]) == 1
+
+
+def test_top1000_resume_rejects_corrupt_confirmed_raw_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=11),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+
+    raw_path = (
+        root
+        / "data/raw/serp_scoped"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "moscow"
+        / RUN_ID
+        / "pages/shevron/page_001.json"
+    )
+    raw_path.write_bytes(raw_path.read_bytes() + b"\n")
+    transport = FakeTransport()
+    with pytest.raises(CollectionPlanRunError, match="canonical raw conflicts"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=transport,
+            resume_run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    assert transport.resolve_calls == []
+    assert transport.search_calls == []
+    assert transport.egress_calls == 0
+
+
+def test_top1000_resume_rejects_checkpoint_metadata_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=11),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    checkpoint_path = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+        / "checkpoints/moscow/shevron/page_001.json"
+    )
+    checkpoint = _read_json(checkpoint_path)
+    checkpoint["page"] = 9
+    _write_json(checkpoint_path, checkpoint)
+    transport = FakeTransport()
+    with pytest.raises(CollectionPlanRunError, match="canonical checkpoint conflicts"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=transport,
+            resume_run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    assert transport.resolve_calls == []
+    assert transport.search_calls == []
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "unknown_scope",
+        "mismatched_page",
+        "mismatched_path",
+        "negative_endpoint_counter",
+        "boolean_endpoint_counter",
+        "changed_end_hash",
+        "changed_end_masked",
+        "full_ip_masked",
+        "manifest_ref_mismatch",
+    ],
+)
+def test_top1000_resume_rejects_tampered_verified_segment_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=11),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            egress_hash_salt=b"segment-integrity",
+        )
+
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    manifest_path = state_dir / "manifest.json"
+    manifest = _read_json(manifest_path)
+    reference = manifest["resume"]["segments"][0]
+    segment_path = root / reference["path"]
+    segment = _read_json(segment_path)
+    canonical_raw = (
+        root
+        / "data/raw/serp_scoped"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "moscow"
+        / RUN_ID
+        / "pages/shevron/page_001.json"
+    )
+    canonical_checkpoint = (
+        state_dir / "checkpoints/moscow/shevron/page_001.json"
+    )
+    checkpoint_before = canonical_checkpoint.read_bytes()
+    canonical_raw.unlink()
+    outside = tmp_path / "outside-sentinel.json"
+    outside.write_bytes(b"outside-unchanged")
+
+    if corruption == "unknown_scope":
+        segment["region_id"] = "unknown-region"
+    elif corruption == "mismatched_page":
+        segment["pages"][0]["page"] = 2
+    elif corruption == "mismatched_path":
+        segment["pages"][0]["canonical_raw_path"] = "../outside-sentinel.json"
+    elif corruption == "negative_endpoint_counter":
+        segment["endpoint_usage"]["primary"]["attempts"] = -1
+    elif corruption == "boolean_endpoint_counter":
+        segment["endpoint_usage"]["primary"]["pages_ok"] = True
+    elif corruption == "changed_end_hash":
+        segment["egress"]["end"]["ephemeral_sha256"] = hashlib.sha256(
+            b"different-egress"
+        ).hexdigest()
+    elif corruption == "changed_end_masked":
+        segment["egress"]["end"]["masked"] = "198.51.x.x"
+    elif corruption == "full_ip_masked":
+        segment["egress"]["end"]["masked"] = "198.51.100.20"
+    elif corruption == "manifest_ref_mismatch":
+        reference["region_id"] = "rostov-on-don"
+
+    if corruption != "manifest_ref_mismatch":
+        _write_json(segment_path, segment)
+        reference.update(
+            {
+                "region_id": segment["region_id"],
+                "query_id": segment["query_id"],
+                "sha256": hashlib.sha256(segment_path.read_bytes()).hexdigest(),
+                "egress": json.loads(json.dumps(segment["egress"])),
+                "pages_count": len(segment["pages"]),
+            }
+        )
+    _write_json(manifest_path, manifest)
+
+    transport = FakeTransport()
+    with pytest.raises(CollectionPlanRunError, match="segment"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=transport,
+            resume_run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            egress_hash_salt=b"segment-integrity",
+        )
+    assert transport.resolve_calls == []
+    assert transport.search_calls == []
+    assert transport.egress_calls == 0
+    assert not canonical_raw.exists()
+    assert canonical_checkpoint.read_bytes() == checkpoint_before
+    assert outside.read_bytes() == b"outside-unchanged"
+
+
+def test_top1000_failed_run_leaves_previous_dual_region_latest_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    first_run_id = "20260726_110000Z"
+    second_run_id = "20260726_120000Z"
+
+    first_manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=FakeTransport(),
+        run_id=first_run_id,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+    )
+    assert first_manifest["complete"] is True
+    latest_path = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "latest.json"
+    )
+    before = latest_path.read_bytes()
+
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=35),
+            run_id=second_run_id,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+
+    assert latest_path.read_bytes() == before
+    assert _read_json(latest_path)["run_id"] == first_run_id
+    failed = _read_json(
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / second_run_id
+        / "manifest.json"
+    )
+    assert failed["complete"] is False
+    assert failed["regional_latest"]["status"] == "not_published"
+
+
+def test_top1000_dual_region_latest_visibility_is_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=FakeTransport(),
+        run_id="20260726_110000Z",
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+    )
+    latest_path = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "latest.json"
+    )
+    before = latest_path.read_bytes()
+
+    def fail_second_region_latest(event: str, path: Path) -> None:
+        if (
+            event == "file_fsynced"
+            and "latest_generations" in path.parts
+            and path.name == "rostov-on-don.json"
+        ):
+            raise OSError("injected latest publication failure")
+
+    with pytest.raises(OSError, match="injected latest"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(),
+            run_id="20260726_120000Z",
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            write_event_hook=fail_second_region_latest,
+        )
+    assert latest_path.read_bytes() == before
+    assert _read_json(latest_path)["run_id"] == "20260726_110000Z"
+    pending_manifest = _read_json(
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "20260726_120000Z"
+        / "manifest.json"
+    )
+    assert pending_manifest["status"] == "publication_pending"
+    assert pending_manifest["complete"] is False
+
+    resume_transport = FakeTransport()
+    reconciled = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=resume_transport,
+        resume_run_id="20260726_120000Z",
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+    )
+    assert reconciled["status"] == "success"
+    assert reconciled["complete"] is True
+    assert _read_json(latest_path)["run_id"] == "20260726_120000Z"
+    assert resume_transport.resolve_calls == []
+    assert resume_transport.search_calls == []
+    assert resume_transport.egress_calls == 0
+
+
+def test_top1000_resume_reconciles_crash_after_durable_latest_pointer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    latest_path = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "latest.json"
+    )
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    pointer_durable = False
+    injected = False
+
+    def fail_after_pointer(event: str, path: Path) -> None:
+        nonlocal pointer_durable, injected
+        if event == "directory_fsynced" and path == latest_path:
+            pointer_durable = True
+            return
+        if (
+            pointer_durable
+            and not injected
+            and event == "file_fsynced"
+            and path == state_dir / "manifest.json"
+        ):
+            injected = True
+            raise OSError("injected post-pointer manifest failure")
+
+    with pytest.raises(OSError, match="post-pointer"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            write_event_hook=fail_after_pointer,
+        )
+
+    pointer_before = latest_path.read_bytes()
+    assert _read_json(latest_path)["run_id"] == RUN_ID
+    pending = _read_json(state_dir / "manifest.json")
+    assert pending["status"] == "publication_pending"
+    assert pending["complete"] is False
+
+    resume_transport = FakeTransport()
+    manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=resume_transport,
+        resume_run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+    )
+    assert manifest["status"] == "success"
+    assert manifest["complete"] is True
+    assert latest_path.read_bytes() == pointer_before
+    assert resume_transport.resolve_calls == []
+    assert resume_transport.search_calls == []
+    assert resume_transport.egress_calls == 0
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["endpoint_urls", "request_params", "proxy_route"],
+)
+def test_top1000_resume_rejects_transport_fingerprint_mismatch_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=11),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+
+    transport = FakeTransport()
+    if mismatch == "endpoint_urls":
+        transport.endpoint_urls = (
+            "https://changed-primary.example.test",
+            "https://fallback.example.test",
+        )
+    elif mismatch == "request_params":
+        transport.request_params = {
+            **transport.request_params,
+            "curr": "changed",
+        }
+    else:
+        transport.proxy_route_sha256 = hashlib.sha256(
+            b"changed-proxy-route"
+        ).hexdigest()
+
+    with pytest.raises(CollectionPlanRunError, match="transport fingerprint"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=transport,
+            resume_run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    assert transport.resolve_calls == []
+    assert transport.search_calls == []
+    assert transport.egress_calls == 0
+
+
+def test_top1000_estimated_window_rejects_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, _plan_path = _project(tmp_path, monkeypatch)
+    plan_path = (
+        root
+        / "config/wb/collection_plans/"
+        "shevron-moscow-rostov-top1000-v1.json"
+    )
+    plan = _read_json(plan_path)
+    plan["enabled"] = True
+    _write_json(plan_path, plan)
+    bundle = load_collection_plan_bundle(
+        project_root=root,
+        plan_path=plan_path,
+        region_registry_path=root / REGIONS_RELATIVE,
+    )
+    single = FakeTransport()
+    single.endpoint_policy = EffectiveEndpointPolicy(
+        selection_mode="ordered_fallbacks",
+        endpoint_ids=("primary",),
+        pinned_endpoint_id="primary",
+    )
+    single.endpoint_urls = ("https://primary.example.test",)
+    double = FakeTransport()
+    one_runner = CollectionPlanRunner(
+        config=config,
+        plan_path=plan_path,
+        transport=single,
+        no_publish=True,
+        run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+    )
+    two_runner = CollectionPlanRunner(
+        config=config,
+        plan_path=plan_path,
+        transport=double,
+        no_publish=True,
+        run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+    )
+    planned_pages = 600
+    one_estimate = one_runner._estimated_remaining_seconds(
+        bundle=bundle,
+        pending_pages=planned_pages,
+    )
+    two_estimate = two_runner._estimated_remaining_seconds(
+        bundle=bundle,
+        pending_pages=planned_pages,
+    )
+    assert two_estimate - one_estimate == pytest.approx(
+        planned_pages * config.runtime.http_timeout_seconds
+    )
+    latest_safe_finish = datetime(
+        2026,
+        7,
+        26,
+        21,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    )
+    gate_now = latest_safe_finish - timedelta(
+        seconds=(one_estimate + two_estimate) / 2
+    )
+    DeadlineGuard.for_current_day(
+        now=lambda: gate_now
+    ).ensure_estimated_window(one_estimate)
+    with pytest.raises(CollectionPlanRunError, match="overlaps nightly 00:15"):
+        DeadlineGuard.for_current_day(
+            now=lambda: gate_now
+        ).ensure_estimated_window(two_estimate)
+
+    with pytest.raises(CollectionPlanRunError, match="overlaps nightly 00:15"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=double,
+            run_id=RUN_ID,
+            now=lambda: gate_now,
+            sleeper=lambda _seconds: None,
+        )
+    assert double.resolve_calls == []
+    assert double.search_calls == []
+    assert double.egress_calls == 0
 
 def test_runner_uses_production_serp_pacing_values(
     tmp_path: Path,
@@ -1027,6 +1967,38 @@ def test_dedicated_launcher_handles_lock_contention_without_traceback(
     captured = capsys.readouterr()
     assert "collection plan lock is busy" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_dedicated_launcher_forwards_explicit_resume_run_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_wb_collection_plan.py",
+            "--config",
+            str(config.config_file),
+            "--plan-file",
+            str(plan_path),
+            "--no-publish",
+            "--resume-run-id",
+            RUN_ID,
+        ],
+    )
+    monkeypatch.setattr(dedicated_launcher, "load_config", lambda _path: config)
+
+    def fake_run(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"run_id": RUN_ID, "status": "success", "complete": True}
+
+    monkeypatch.setattr(dedicated_launcher, "run_collection_plan", fake_run)
+    assert dedicated_launcher.main() == 0
+    assert captured["resume_run_id"] == RUN_ID
+    assert captured["no_publish"] is True
 
 
 class FakeResponse:

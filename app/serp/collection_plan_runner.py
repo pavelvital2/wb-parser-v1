@@ -42,20 +42,34 @@ from app.serp.collection_plan import (
 
 
 MANIFEST_SCHEMA_VERSION = "wb_collection_plan_manifest_v1"
+RESUMABLE_MANIFEST_SCHEMA_VERSION = "wb_collection_plan_manifest_v2"
 REGION_STATE_SCHEMA_VERSION = "wb_collection_plan_region_v1"
 CHECKPOINT_SCHEMA_VERSION = "wb_collection_plan_checkpoint_v1"
+RESUMABLE_CHECKPOINT_SCHEMA_VERSION = "wb_collection_plan_checkpoint_v2"
+SEGMENT_SCHEMA_VERSION = "wb_collection_plan_segment_v1"
+REGIONAL_LATEST_SCHEMA_VERSION = "wb_regional_latest_v1"
+REGIONAL_LATEST_REGION_SCHEMA_VERSION = "wb_regional_latest_region_v1"
 COLLECTION_SCOPE = "regional"
 GEO_RESOLVER_URL = "https://user-geo-data.wildberries.ru/get-geo-info"
 EGRESS_CHECK_URL = "https://api.ipify.org"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 NIGHTLY_PREFLIGHT_CUTOFF = time(23, 45)
+NIGHTLY_COLLECTION_START = time(0, 15)
 MINIMUM_START_WINDOW_SECONDS = 300
 FINALIZATION_RESERVE_SECONDS = 5
+NIGHTLY_SAFETY_RESERVE_SECONDS = 900
+ESTIMATED_REQUEST_OVERHEAD_SECONDS = 1.0
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _RUN_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}Z$")
 _DEST_RE = re.compile(r"^[+-]?[0-9]{1,16}$")
 _PRODUCT_ID_RE = re.compile(r"^[1-9][0-9]{0,19}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MASKED_IPV4_RE = re.compile(
+    r"^(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\."
+    r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.x\.x$"
+)
+_MASKED_IPV6_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{4}::x$")
 
 LockEventHook = Callable[[str, str, Path], None]
 WriteEventHook = Callable[[str, Path], None]
@@ -270,6 +284,56 @@ class ScopedPaths:
         return self.state_run_dir / "manifest.json"
 
     @property
+    def segment_dir(self) -> Path:
+        return self.state_run_dir / "segments"
+
+    def segment_path(self, segment_id: str) -> Path:
+        return self.segment_dir / f"{_safe_id(segment_id, field='segment_id')}.json"
+
+    def segment_pending_raw_path(self, segment_id: str, task: ScopedTask) -> Path:
+        return (
+            self.layer_region_run_dir("raw", task.region_id)
+            / "pending_segments"
+            / _safe_id(segment_id, field="segment_id")
+            / task.query_id
+            / f"page_{task.page:03d}.json"
+        )
+
+    def segment_pending_checkpoint_path(
+        self,
+        segment_id: str,
+        task: ScopedTask,
+    ) -> Path:
+        return (
+            self.state_run_dir
+            / "pending_segments"
+            / _safe_id(segment_id, field="segment_id")
+            / task.region_id
+            / task.query_id
+            / f"page_{task.page:03d}.json"
+        )
+
+    @property
+    def plan_state_dir(self) -> Path:
+        return (
+            self.project_root
+            / "state/wb_collection_plans"
+            / self.collection_plan_id
+        )
+
+    @property
+    def latest_path(self) -> Path:
+        return self.plan_state_dir / "latest.json"
+
+    def latest_region_manifest_path(self, region_id: str) -> Path:
+        return (
+            self.plan_state_dir
+            / "latest_generations"
+            / self.run_id
+            / f"{_safe_id(region_id, field='region_id')}.json"
+        )
+
+    @property
     def provenance_path(self) -> Path:
         return (
             self.project_root
@@ -364,6 +428,23 @@ class DeadlineGuard:
         available = self.remaining_seconds() - FINALIZATION_RESERVE_SECONDS
         return max(0.1, min(float(configured_timeout), available))
 
+    def ensure_estimated_window(self, estimated_seconds: float) -> None:
+        if estimated_seconds < 0:
+            raise CollectionPlanRunError("estimated runtime must not be negative")
+        current = self.now().astimezone(MOSCOW_TZ)
+        nightly = datetime.combine(
+            current.date(),
+            NIGHTLY_COLLECTION_START,
+            tzinfo=MOSCOW_TZ,
+        )
+        if nightly <= current:
+            nightly += timedelta(days=1)
+        latest_finish = nightly - timedelta(seconds=NIGHTLY_SAFETY_RESERVE_SECONDS)
+        if current + timedelta(seconds=estimated_seconds) > latest_finish:
+            raise CollectionPlanRunError(
+                "estimated collection window overlaps nightly 00:15 MSK"
+            )
+
 
 @contextmanager
 def acquire_collection_plan_locks(
@@ -432,7 +513,12 @@ def acquire_collection_plan_locks(
         yield
 
 
-def _ensure_scoped_parent(path: Path, *, project_root: Path) -> None:
+def _ensure_scoped_parent(
+    path: Path,
+    *,
+    project_root: Path,
+    event_hook: WriteEventHook | None = None,
+) -> None:
     root = project_root.resolve()
     try:
         relative = path.parent.relative_to(root)
@@ -444,7 +530,22 @@ def _ensure_scoped_parent(path: Path, *, project_root: Path) -> None:
         current /= part
         if current.is_symlink():
             raise CollectionPlanRunError(f"scoped path uses symlink: {current}")
-        current.mkdir(exist_ok=True)
+        if current.exists():
+            if not current.is_dir():
+                raise CollectionPlanRunError(
+                    f"scoped parent is not a directory: {current}"
+                )
+            continue
+        parent = current.parent
+        current.mkdir()
+        for directory in (parent, current):
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        if event_hook is not None:
+            event_hook("parent_entry_fsynced", current)
 
 
 def _write_new_bytes(
@@ -454,7 +555,11 @@ def _write_new_bytes(
     project_root: Path,
     event_hook: WriteEventHook | None = None,
 ) -> None:
-    _ensure_scoped_parent(path, project_root=project_root)
+    _ensure_scoped_parent(
+        path,
+        project_root=project_root,
+        event_hook=event_hook,
+    )
     temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = -1
     try:
@@ -485,6 +590,47 @@ def _write_new_bytes(
         temp_path.unlink(missing_ok=True)
 
 
+def _write_atomic_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    project_root: Path,
+    event_hook: WriteEventHook | None = None,
+) -> None:
+    _ensure_scoped_parent(
+        path,
+        project_root=project_root,
+        event_hook=event_hook,
+    )
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise CollectionPlanRunError(f"atomic target must be a regular file: {path}")
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = -1
+    try:
+        fd = os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+        if event_hook is not None:
+            event_hook("file_fsynced", path)
+        os.close(fd)
+        fd = -1
+        os.replace(temp_path, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        if event_hook is not None:
+            event_hook("directory_fsynced", path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temp_path.unlink(missing_ok=True)
+
+
 def _json_bytes(payload: Mapping[str, Any]) -> bytes:
     return (
         json.dumps(
@@ -496,6 +642,61 @@ def _json_bytes(payload: Mapping[str, Any]) -> bytes:
         )
         + "\n"
     ).encode("utf-8")
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_sha256(value: Any) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise CollectionPlanRunError(
+            "transport fingerprint input is not canonical JSON"
+        ) from exc
+    return _sha256_bytes(payload)
+
+
+def _read_regular_bytes(path: Path, *, project_root: Path) -> bytes:
+    root = project_root.resolve()
+    candidate = Path(os.path.abspath(path))
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise CollectionPlanRunError(f"scoped read escapes project root: {path}") from exc
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise CollectionPlanRunError(f"scoped read uses symlink: {current}")
+    if not candidate.is_file():
+        raise CollectionPlanRunError(f"scoped artifact is not a regular file: {path}")
+    return candidate.read_bytes()
+
+
+def _json_object_from_bytes(payload: bytes, *, field: str) -> dict[str, Any]:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise CollectionPlanRunError(f"{field} contains duplicate key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(payload.decode("utf-8"), object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CollectionPlanRunError(f"{field} is invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise CollectionPlanRunError(f"{field} must be a JSON object")
+    return value
 
 
 def _csv_bytes(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> bytes:
@@ -1172,6 +1373,7 @@ class CollectionPlanRunner:
         transport: ScopedTransport,
         no_publish: bool,
         run_id: str | None = None,
+        resume_run_id: str | None = None,
         now: Callable[[], datetime] = _default_now,
         lock_event_hook: LockEventHook | None = None,
         write_event_hook: WriteEventHook | None = None,
@@ -1184,7 +1386,14 @@ class CollectionPlanRunner:
         self.no_publish = no_publish
         self.now = now
         started = now()
-        self.run_id = _safe_run_id(run_id or _default_run_id(started))
+        if run_id is not None and resume_run_id is not None:
+            raise CollectionPlanRunError(
+                "run_id and resume_run_id are mutually exclusive"
+            )
+        self.resume = resume_run_id is not None
+        self.run_id = _safe_run_id(
+            resume_run_id or run_id or _default_run_id(started)
+        )
         self.started_at_utc = _utc_iso(started)
         self.deadline = DeadlineGuard.for_current_day(now=now)
         self.lock_event_hook = lock_event_hook
@@ -1301,6 +1510,300 @@ class CollectionPlanRunner:
             project_root=self.config.project_root,
             event_hook=self.write_event_hook,
         )
+
+    def _replace(
+        self,
+        path: Path,
+        payload: bytes,
+        *,
+        final_manifest: bool = False,
+    ) -> None:
+        if final_manifest:
+            if self.deadline.remaining_seconds() <= FINALIZATION_RESERVE_SECONDS:
+                raise CollectionPlanRunError(
+                    "collection plan deadline reserve reached before final manifest"
+                )
+        else:
+            self.deadline.ensure_active()
+        _write_atomic_bytes(
+            path,
+            payload,
+            project_root=self.config.project_root,
+            event_hook=self.write_event_hook,
+        )
+
+    def _write_or_verify(self, path: Path, payload: bytes) -> None:
+        if path.exists():
+            existing = _read_regular_bytes(
+                path,
+                project_root=self.config.project_root,
+            )
+            if existing != payload:
+                raise CollectionPlanRunError(
+                    f"immutable artifact content mismatch: {path}"
+                )
+            return
+        self._write(path, payload)
+
+    def _estimated_remaining_seconds(
+        self,
+        *,
+        bundle: CollectionPlanBundle,
+        pending_pages: int,
+    ) -> float:
+        serp = self.config.raw.get("serp", {})
+        page_sleep = max(0.0, float(serp.get("sleep_between_pages_ms", 0))) / 1000.0
+        query_sleep = max(0.0, float(serp.get("sleep_between_queries_ms", 0))) / 1000.0
+        endpoint_count = len(self.transport.endpoint_policy.endpoint_ids)
+        if endpoint_count < 1:
+            raise CollectionPlanRunError("endpoint policy must not be empty")
+        request_seconds = (
+            float(self.config.runtime.http_timeout_seconds) * endpoint_count
+            + page_sleep
+            + ESTIMATED_REQUEST_OVERHEAD_SECONDS
+        )
+        pending_queries = min(
+            len(bundle.enabled_queries) * len(bundle.enabled_regions),
+            pending_pages,
+        )
+        return (
+            pending_pages * request_seconds
+            + pending_queries * query_sleep
+            + NIGHTLY_SAFETY_RESERVE_SECONDS
+        )
+
+    def _transport_fingerprint(self) -> dict[str, str]:
+        endpoint_urls = getattr(self.transport, "endpoint_urls", None)
+        proxy_route_sha256 = getattr(
+            self.transport,
+            "proxy_route_sha256",
+            None,
+        )
+        if (
+            not isinstance(endpoint_urls, tuple)
+            or len(endpoint_urls)
+            != len(self.transport.endpoint_policy.endpoint_ids)
+            or any(type(url) is not str or not url for url in endpoint_urls)
+        ):
+            raise CollectionPlanRunError(
+                "transport endpoint URL provenance is unavailable"
+            )
+        if (
+            not isinstance(proxy_route_sha256, str)
+            or not _SHA256_RE.fullmatch(proxy_route_sha256)
+        ):
+            raise CollectionPlanRunError(
+                "transport proxy route provenance is unavailable"
+            )
+        fingerprint = {
+            "schema_version": "wb_transport_fingerprint_v1",
+            "ordered_endpoint_urls_sha256": _canonical_sha256(endpoint_urls),
+            "request_params_sha256": _canonical_sha256(
+                dict(self.transport.request_params)
+            ),
+            "proxy_route_sha256": proxy_route_sha256,
+        }
+        fingerprint["fingerprint_sha256"] = _canonical_sha256(fingerprint)
+        return fingerprint
+
+    def _validate_discarded_segments(
+        self,
+        *,
+        value: Any,
+        bundle: CollectionPlanBundle,
+        verified_segment_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            raise CollectionPlanRunError("discarded segment history must be a list")
+        endpoint_ids = self.transport.endpoint_policy.endpoint_ids
+        allowed_endpoints = set(endpoint_ids)
+        allowed_regions = {region.region_id for region in bundle.enabled_regions}
+        allowed_queries = {query.query_id for query in bundle.enabled_queries}
+        seen_ids = set(verified_segment_ids)
+        normalized: list[dict[str, Any]] = []
+
+        def validate_egress_item(item: Any, *, field: str) -> dict[str, str]:
+            if not isinstance(item, dict) or set(item) != {
+                "source",
+                "masked",
+                "ephemeral_sha256",
+            }:
+                raise CollectionPlanRunError(f"{field} is invalid")
+            source = item.get("source")
+            masked = item.get("masked")
+            digest = item.get("ephemeral_sha256")
+            if (
+                source not in {"segment_start_check", "previous_segment_end", "segment_end_check"}
+                or not isinstance(masked, str)
+                or len(masked) > 64
+                or "x" not in masked
+                or any(character in masked for character in "\r\n")
+                or not isinstance(digest, str)
+                or not _SHA256_RE.fullmatch(digest)
+            ):
+                raise CollectionPlanRunError(f"{field} is invalid")
+            return {
+                "source": source,
+                "masked": masked,
+                "ephemeral_sha256": digest,
+            }
+
+        for item in value:
+            if not isinstance(item, dict):
+                raise CollectionPlanRunError("discarded segment entry is invalid")
+            segment_id = item.get("segment_id")
+            region_id = item.get("region_id")
+            query_id = item.get("query_id")
+            pages_written = item.get("pages_written")
+            if (
+                not isinstance(segment_id, str)
+                or not _ID_RE.fullmatch(segment_id)
+                or segment_id in seen_ids
+            ):
+                raise CollectionPlanRunError(
+                    "discarded segment identity is invalid or duplicated"
+                )
+            if region_id not in allowed_regions or query_id not in allowed_queries:
+                raise CollectionPlanRunError("discarded segment scope is invalid")
+            if item.get("status") != "incomplete_not_reusable":
+                raise CollectionPlanRunError("discarded segment status is invalid")
+            if (
+                type(pages_written) is not int
+                or not 0
+                <= pages_written
+                <= bundle.collection_plan.quality.expected_pages_per_query
+            ):
+                raise CollectionPlanRunError(
+                    "discarded segment pages_written is invalid"
+                )
+            usage = item.get("endpoint_usage")
+            if not isinstance(usage, dict) or set(usage) != allowed_endpoints:
+                raise CollectionPlanRunError(
+                    "discarded segment endpoint usage is invalid"
+                )
+            normalized_usage: dict[str, dict[str, int]] = {}
+            for endpoint_id in endpoint_ids:
+                counters = usage.get(endpoint_id)
+                if not isinstance(counters, dict) or set(counters) != {
+                    "attempts",
+                    "pages_ok",
+                }:
+                    raise CollectionPlanRunError(
+                        "discarded segment endpoint counters are invalid"
+                    )
+                attempts = counters.get("attempts")
+                pages_ok = counters.get("pages_ok")
+                if (
+                    type(attempts) is not int
+                    or type(pages_ok) is not int
+                    or attempts < 0
+                    or pages_ok < 0
+                    or pages_ok > attempts
+                ):
+                    raise CollectionPlanRunError(
+                        "discarded segment endpoint counters are invalid"
+                    )
+                normalized_usage[endpoint_id] = {
+                    "attempts": attempts,
+                    "pages_ok": pages_ok,
+                }
+            if sum(
+                counters["pages_ok"] for counters in normalized_usage.values()
+            ) != pages_written:
+                raise CollectionPlanRunError(
+                    "discarded segment pages do not match endpoint counters"
+                )
+
+            attempted = item.get("attempted_endpoint_ids", [])
+            endpoint_id = item.get("endpoint_id")
+            if (
+                not isinstance(attempted, list)
+                or any(type(entry) is not str for entry in attempted)
+                or len(set(attempted)) != len(attempted)
+                or any(entry not in allowed_endpoints for entry in attempted)
+                or endpoint_id is not None
+                and endpoint_id not in allowed_endpoints
+                or endpoint_id is not None
+                and endpoint_id not in attempted
+            ):
+                raise CollectionPlanRunError(
+                    "discarded segment endpoint evidence is invalid"
+                )
+            error_code = item.get("error_code")
+            if (
+                not isinstance(error_code, str)
+                or not 1 <= len(error_code) <= 100
+                or any(character in error_code for character in "\r\n")
+            ):
+                raise CollectionPlanRunError(
+                    "discarded segment error code is invalid"
+                )
+            egress = item.get("egress")
+            if not isinstance(egress, dict):
+                raise CollectionPlanRunError(
+                    "discarded segment egress evidence is invalid"
+                )
+            verification_status = egress.get("verification_status")
+            constant = egress.get("constant")
+            checks_completed = egress.get("checks_completed")
+            checks_expected = egress.get("checks_expected")
+            start = validate_egress_item(
+                egress.get("start"),
+                field="discarded segment egress start",
+            )
+            end_value = egress.get("end")
+            if verification_status == "unverified":
+                if (
+                    constant is not None
+                    or checks_completed != 1
+                    or checks_expected != 2
+                    or end_value is not None
+                ):
+                    raise CollectionPlanRunError(
+                        "discarded unverified egress evidence is invalid"
+                    )
+                end = None
+            elif verification_status == "changed":
+                if (
+                    constant is not False
+                    or checks_completed != 2
+                    or checks_expected != 2
+                ):
+                    raise CollectionPlanRunError(
+                        "discarded changed egress evidence is invalid"
+                    )
+                end = validate_egress_item(
+                    end_value,
+                    field="discarded segment egress end",
+                )
+            else:
+                raise CollectionPlanRunError(
+                    "discarded segment egress status is invalid"
+                )
+
+            seen_ids.add(segment_id)
+            normalized.append(
+                {
+                    "segment_id": segment_id,
+                    "region_id": region_id,
+                    "query_id": query_id,
+                    "pages_written": pages_written,
+                    "status": "incomplete_not_reusable",
+                    "endpoint_id": endpoint_id,
+                    "attempted_endpoint_ids": list(attempted),
+                    "error_code": error_code,
+                    "endpoint_usage": normalized_usage,
+                    "egress": {
+                        "verification_status": verification_status,
+                        "constant": constant,
+                        "checks_completed": checks_completed,
+                        "checks_expected": checks_expected,
+                        "start": start,
+                        "end": end,
+                    },
+                }
+            )
+        return normalized
 
     def _task(
         self,
@@ -1429,8 +1932,9 @@ class CollectionPlanRunner:
         region_id: str,
         product_rows: list[dict[str, Any]],
         page_rows: list[dict[str, Any]],
-    ) -> dict[str, str]:
-        outputs: dict[str, str] = {}
+        replace: bool = False,
+    ) -> dict[str, Any]:
+        outputs: dict[str, Any] = {}
         if product_rows:
             raw_products = paths.layer_region_run_dir("raw", region_id) / "products_raw.csv"
             staging_products = (
@@ -1444,10 +1948,12 @@ class CollectionPlanRunner:
                 paths.layer_region_run_dir("raw", region_id) / "pages_raw_index.csv"
             )
             product_bytes = _csv_bytes(product_rows, PRODUCT_FIELDS)
-            self._write(raw_products, product_bytes)
-            self._write(staging_products, product_bytes)
-            self._write(mart_products, product_bytes)
-            self._write(pages_index, _csv_bytes(page_rows, PAGE_FIELDS))
+            pages_bytes = _csv_bytes(page_rows, PAGE_FIELDS)
+            writer = self._replace if replace else self._write
+            writer(raw_products, product_bytes)
+            writer(staging_products, product_bytes)
+            writer(mart_products, product_bytes)
+            writer(pages_index, pages_bytes)
             outputs = {
                 "raw_products_path": _relative(raw_products, paths.project_root),
                 "staging_products_path": _relative(
@@ -1456,6 +1962,10 @@ class CollectionPlanRunner:
                 ),
                 "mart_products_path": _relative(mart_products, paths.project_root),
                 "pages_index_path": _relative(pages_index, paths.project_root),
+                "products_sha256": _sha256_bytes(product_bytes),
+                "pages_index_sha256": _sha256_bytes(pages_bytes),
+                "products_count": len(product_rows),
+                "pages_count": len(page_rows),
             }
         return outputs
 
@@ -1467,8 +1977,12 @@ class CollectionPlanRunner:
         raw_path: Path,
         endpoint_id: str = "",
         attempted_endpoint_ids: tuple[str, ...] = (),
+        raw_sha256: str | None = None,
+        effective_plan_sha256: str | None = None,
+        bundle: CollectionPlanBundle | None = None,
+        segment_id: str | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_key": task.checkpoint_key,
             "collection_plan_id": task.collection_plan_id,
@@ -1483,6 +1997,1415 @@ class CollectionPlanRunner:
             "attempted_endpoint_ids": list(attempted_endpoint_ids),
             "raw_file": _relative(raw_path, self.config.project_root),
         }
+        resumable_values = (
+            raw_sha256,
+            effective_plan_sha256,
+            bundle,
+            segment_id,
+        )
+        if any(value is not None for value in resumable_values):
+            if any(value is None for value in resumable_values):
+                raise CollectionPlanRunError(
+                    "resumable checkpoint provenance is incomplete"
+                )
+            assert bundle is not None
+            payload.update(
+                {
+                    "schema_version": RESUMABLE_CHECKPOINT_SCHEMA_VERSION,
+                    "query": task.query,
+                    "page_size": task.page_size,
+                    "depth": task.depth,
+                    "raw_sha256": raw_sha256,
+                    "products_count": task.page_size,
+                    "query_pack_sha256": bundle.query_pack_sha256,
+                    "collection_plan_sha256": bundle.collection_plan_sha256,
+                    "region_registry_sha256": bundle.region_registry_sha256,
+                    "effective_plan_sha256": effective_plan_sha256,
+                    "segment_id": segment_id,
+                }
+            )
+        return payload
+
+    def _load_reusable_page(
+        self,
+        *,
+        paths: ScopedPaths,
+        task: ScopedTask,
+        resolution: ResolvedDestination,
+        bundle: CollectionPlanBundle,
+        effective_plan_sha256: str,
+        verified_segment_ids: set[str],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], str] | None:
+        checkpoint_path = paths.checkpoint_path(task)
+        raw_path = paths.raw_page_path(task)
+        if not checkpoint_path.exists() and not raw_path.exists():
+            return None
+        if not checkpoint_path.exists() or not raw_path.exists():
+            raise CollectionPlanRunError(
+                f"resume artifact pair incomplete: {task.checkpoint_key}"
+            )
+        checkpoint = _json_object_from_bytes(
+            _read_regular_bytes(
+                checkpoint_path,
+                project_root=self.config.project_root,
+            ),
+            field="checkpoint",
+        )
+        expected = {
+            "schema_version": RESUMABLE_CHECKPOINT_SCHEMA_VERSION,
+            "checkpoint_key": task.checkpoint_key,
+            "collection_plan_id": task.collection_plan_id,
+            "query_pack_id": task.query_pack_id,
+            "query_pack_version": task.query_pack_version,
+            "query_id": task.query_id,
+            "query": task.query,
+            "region_id": task.region_id,
+            "page": task.page,
+            "page_size": task.page_size,
+            "depth": task.depth,
+            "dest_id_observed": resolution.dest_id_observed,
+            "dest_resolution_status": "resolved_and_sent",
+            "raw_file": _relative(raw_path, self.config.project_root),
+            "products_count": task.page_size,
+            "query_pack_sha256": bundle.query_pack_sha256,
+            "collection_plan_sha256": bundle.collection_plan_sha256,
+            "region_registry_sha256": bundle.region_registry_sha256,
+            "effective_plan_sha256": effective_plan_sha256,
+        }
+        for key, value in expected.items():
+            if checkpoint.get(key) != value or type(checkpoint.get(key)) is not type(value):
+                raise CollectionPlanRunError(
+                    f"resume checkpoint metadata mismatch: {task.checkpoint_key}:{key}"
+                )
+        segment_id = checkpoint.get("segment_id")
+        if not isinstance(segment_id, str) or segment_id not in verified_segment_ids:
+            raise CollectionPlanRunError(
+                f"resume checkpoint segment is not verified: {task.checkpoint_key}"
+            )
+        endpoint_id = checkpoint.get("endpoint_id")
+        attempts = checkpoint.get("attempted_endpoint_ids")
+        allowed = self.transport.endpoint_policy.endpoint_ids
+        if (
+            not isinstance(endpoint_id, str)
+            or endpoint_id not in allowed
+            or not isinstance(attempts, list)
+            or not attempts
+            or any(type(item) is not str or item not in allowed for item in attempts)
+            or len(set(attempts)) != len(attempts)
+            or endpoint_id not in attempts
+        ):
+            raise CollectionPlanRunError(
+                f"resume checkpoint endpoint evidence mismatch: {task.checkpoint_key}"
+            )
+        raw_bytes = _read_regular_bytes(raw_path, project_root=self.config.project_root)
+        if checkpoint.get("raw_sha256") != _sha256_bytes(raw_bytes):
+            raise CollectionPlanRunError(
+                f"resume raw checksum mismatch: {task.checkpoint_key}"
+            )
+        payload = _json_object_from_bytes(raw_bytes, field="raw page")
+        rows, page_row = self._rows_for_page(
+            task=task,
+            resolution=resolution,
+            products=_extract_products(payload),
+            raw_path=raw_path,
+            endpoint_id=endpoint_id,
+        )
+        return rows, page_row, segment_id
+
+    def _publish_regional_latest(
+        self,
+        *,
+        paths: ScopedPaths,
+        bundle: CollectionPlanBundle,
+        effective_plan_sha256: str,
+        region_manifests: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        region_refs: list[dict[str, Any]] = []
+        for region in region_manifests:
+            if region.get("status") != "success" or region.get("complete") is not True:
+                raise CollectionPlanRunError("regional latest requires all regions complete")
+            payload = {
+                "schema_version": REGIONAL_LATEST_REGION_SCHEMA_VERSION,
+                "collection_plan_id": bundle.collection_plan.collection_plan_id,
+                "run_id": self.run_id,
+                "region_id": region["region_id"],
+                "effective_plan_sha256": effective_plan_sha256,
+                "pages_count": region["pages_ok"],
+                "products_count": region["products_ok"],
+                "outputs": region["outputs"],
+            }
+            payload_bytes = _json_bytes(payload)
+            target = paths.latest_region_manifest_path(region["region_id"])
+            self._write_or_verify(target, payload_bytes)
+            region_refs.append(
+                {
+                    "region_id": region["region_id"],
+                    "manifest_path": _relative(target, paths.project_root),
+                    "manifest_sha256": _sha256_bytes(payload_bytes),
+                    "pages_count": region["pages_ok"],
+                    "products_count": region["products_ok"],
+                }
+            )
+        latest = {
+            "schema_version": REGIONAL_LATEST_SCHEMA_VERSION,
+            "collection_plan_id": bundle.collection_plan.collection_plan_id,
+            "run_id": self.run_id,
+            "effective_plan_sha256": effective_plan_sha256,
+            "published_at_utc": _utc_iso(self.now()),
+            "regions": region_refs,
+        }
+        def pointer_matches() -> bool:
+            if not paths.latest_path.exists():
+                return False
+            try:
+                current = _json_object_from_bytes(
+                    _read_regular_bytes(
+                        paths.latest_path,
+                        project_root=paths.project_root,
+                    ),
+                    field="regional latest",
+                )
+            except CollectionPlanRunError:
+                return False
+            return (
+                current.get("schema_version") == REGIONAL_LATEST_SCHEMA_VERSION
+                and current.get("collection_plan_id")
+                == bundle.collection_plan.collection_plan_id
+                and current.get("run_id") == self.run_id
+                and current.get("effective_plan_sha256")
+                == effective_plan_sha256
+                and current.get("regions") == region_refs
+            )
+
+        if pointer_matches():
+            return {
+                "status": "reconciled",
+                "path": _relative(paths.latest_path, paths.project_root),
+                "regions": len(region_refs),
+            }
+        try:
+            self._replace(paths.latest_path, _json_bytes(latest))
+        except Exception:
+            if pointer_matches():
+                return {
+                    "status": "reconciled_after_durable_replace",
+                    "path": _relative(paths.latest_path, paths.project_root),
+                    "regions": len(region_refs),
+                }
+            raise
+        return {
+            "status": "published",
+            "path": _relative(paths.latest_path, paths.project_root),
+            "regions": len(region_refs),
+        }
+
+    def _verified_segments(
+        self,
+        *,
+        paths: ScopedPaths,
+        bundle: CollectionPlanBundle,
+        effective_plan_sha256: str,
+        expected_refs: tuple[Mapping[str, Any], ...],
+    ) -> tuple[list[dict[str, Any]], set[str]]:
+        records: list[dict[str, Any]] = []
+        verified_ids: set[str] = set()
+        scopes: set[tuple[str, str]] = set()
+        validated_segments: list[dict[str, Any]] = []
+        if not expected_refs:
+            return records, verified_ids
+        allowed_regions = {region.region_id for region in bundle.enabled_regions}
+        allowed_queries = {query.query_id for query in bundle.enabled_queries}
+        endpoint_ids = self.transport.endpoint_policy.endpoint_ids
+        allowed_endpoints = set(endpoint_ids)
+        expected_pages = (
+            bundle.collection_plan.quality.expected_pages_per_query
+        )
+
+        def validate_egress_item(
+            value: Any,
+            *,
+            field: str,
+            allowed_sources: set[str],
+        ) -> dict[str, str]:
+            if not isinstance(value, dict) or set(value) != {
+                "source",
+                "masked",
+                "ephemeral_sha256",
+            }:
+                raise CollectionPlanRunError(
+                    f"verified segment {field} is invalid"
+                )
+            source = value.get("source")
+            masked = value.get("masked")
+            digest = value.get("ephemeral_sha256")
+            if (
+                source not in allowed_sources
+                or type(masked) is not str
+                or not (
+                    _MASKED_IPV4_RE.fullmatch(masked)
+                    or _MASKED_IPV6_RE.fullmatch(masked)
+                )
+                or type(digest) is not str
+                or not _SHA256_RE.fullmatch(digest)
+            ):
+                raise CollectionPlanRunError(
+                    f"verified segment {field} is invalid"
+                )
+            return {
+                "source": source,
+                "masked": masked,
+                "ephemeral_sha256": digest,
+            }
+
+        for expected_ref in expected_refs:
+            if not isinstance(expected_ref, dict) or set(expected_ref) != {
+                "segment_id",
+                "region_id",
+                "query_id",
+                "path",
+                "sha256",
+                "egress",
+                "pages_count",
+            }:
+                raise CollectionPlanRunError("segment reference structure is invalid")
+            segment_id = expected_ref.get("segment_id")
+            expected_sha256 = expected_ref.get("sha256")
+            if (
+                type(segment_id) is not str
+                or not _ID_RE.fullmatch(segment_id)
+                or type(expected_sha256) is not str
+                or not _SHA256_RE.fullmatch(expected_sha256)
+            ):
+                raise CollectionPlanRunError("segment reference identity is invalid")
+            path = paths.segment_path(segment_id)
+            expected_path = _relative(path, paths.project_root)
+            if expected_ref.get("path") != expected_path:
+                raise CollectionPlanRunError("segment reference path mismatch")
+            payload_bytes = _read_regular_bytes(
+                path,
+                project_root=self.config.project_root,
+            )
+            payload_sha256 = _sha256_bytes(payload_bytes)
+            if expected_sha256 != payload_sha256:
+                raise CollectionPlanRunError("segment reference checksum mismatch")
+            segment = _json_object_from_bytes(payload_bytes, field="segment")
+            if set(segment) != {
+                "schema_version",
+                "run_id",
+                "segment_id",
+                "collection_plan_id",
+                "query_pack_sha256",
+                "collection_plan_sha256",
+                "region_registry_sha256",
+                "effective_plan_sha256",
+                "region_id",
+                "query_id",
+                "pages",
+                "endpoint_usage",
+                "egress",
+            }:
+                raise CollectionPlanRunError("segment structure is invalid")
+            identity = {
+                "schema_version": SEGMENT_SCHEMA_VERSION,
+                "run_id": self.run_id,
+                "collection_plan_id": bundle.collection_plan.collection_plan_id,
+                "query_pack_sha256": bundle.query_pack_sha256,
+                "collection_plan_sha256": bundle.collection_plan_sha256,
+                "region_registry_sha256": bundle.region_registry_sha256,
+                "effective_plan_sha256": effective_plan_sha256,
+            }
+            if any(segment.get(key) != value for key, value in identity.items()):
+                raise CollectionPlanRunError("segment provenance mismatch")
+            segment_id = segment.get("segment_id")
+            region_id = segment.get("region_id")
+            query_id = segment.get("query_id")
+            if (
+                type(segment_id) is not str
+                or path != paths.segment_path(segment_id)
+                or type(region_id) is not str
+                or type(query_id) is not str
+            ):
+                raise CollectionPlanRunError("segment identity is invalid")
+            if region_id not in allowed_regions or query_id not in allowed_queries:
+                raise CollectionPlanRunError("segment scope is outside enabled plan")
+            scope = (region_id, query_id)
+            if scope in scopes:
+                raise CollectionPlanRunError("multiple verified segments for one query scope")
+            egress = segment.get("egress")
+            pages = segment.get("pages")
+            if (
+                not isinstance(egress, dict)
+                or set(egress) != {
+                    "verification_status",
+                    "constant",
+                    "checks_completed",
+                    "checks_expected",
+                    "start",
+                    "end",
+                }
+                or egress.get("verification_status") != "verified_constant"
+                or egress.get("constant") is not True
+                or type(egress.get("checks_completed")) is not int
+                or egress.get("checks_completed") != 2
+                or type(egress.get("checks_expected")) is not int
+                or egress.get("checks_expected") != 2
+                or not isinstance(pages, list)
+                or len(pages) != expected_pages
+            ):
+                raise CollectionPlanRunError("segment is not complete and verified")
+            start_egress = validate_egress_item(
+                egress.get("start"),
+                field="egress start",
+                allowed_sources={
+                    "segment_start_check",
+                    "previous_segment_end",
+                },
+            )
+            end_egress = validate_egress_item(
+                egress.get("end"),
+                field="egress end",
+                allowed_sources={"segment_end_check"},
+            )
+            if (
+                start_egress["masked"] != end_egress["masked"]
+                or start_egress["ephemeral_sha256"]
+                != end_egress["ephemeral_sha256"]
+            ):
+                raise CollectionPlanRunError(
+                    "verified segment egress is not constant"
+                )
+            normalized_egress = {
+                "verification_status": "verified_constant",
+                "constant": True,
+                "checks_completed": 2,
+                "checks_expected": 2,
+                "start": start_egress,
+                "end": end_egress,
+            }
+
+            usage = segment.get("endpoint_usage")
+            if not isinstance(usage, dict) or set(usage) != allowed_endpoints:
+                raise CollectionPlanRunError(
+                    "verified segment endpoint usage is invalid"
+                )
+            normalized_usage: dict[str, dict[str, int]] = {}
+            for endpoint_id in endpoint_ids:
+                counters = usage.get(endpoint_id)
+                if not isinstance(counters, dict) or set(counters) != {
+                    "attempts",
+                    "pages_ok",
+                }:
+                    raise CollectionPlanRunError(
+                        "verified segment endpoint counters are invalid"
+                    )
+                attempts = counters.get("attempts")
+                pages_ok = counters.get("pages_ok")
+                if (
+                    type(attempts) is not int
+                    or type(pages_ok) is not int
+                    or attempts < 0
+                    or pages_ok < 0
+                    or pages_ok > attempts
+                ):
+                    raise CollectionPlanRunError(
+                        "verified segment endpoint counters are invalid"
+                    )
+                normalized_usage[endpoint_id] = {
+                    "attempts": attempts,
+                    "pages_ok": pages_ok,
+                }
+            if sum(
+                counters["pages_ok"]
+                for counters in normalized_usage.values()
+            ) != expected_pages:
+                raise CollectionPlanRunError(
+                    "verified segment pages do not match endpoint counters"
+                )
+
+            normalized_pages: list[dict[str, Any]] = []
+            for expected_page, page_ref in enumerate(pages, start=1):
+                if not isinstance(page_ref, dict) or set(page_ref) != {
+                    "page",
+                    "pending_raw_path",
+                    "canonical_raw_path",
+                    "raw_sha256",
+                    "pending_checkpoint_path",
+                    "canonical_checkpoint_path",
+                    "checkpoint_sha256",
+                }:
+                    raise CollectionPlanRunError(
+                        "verified segment page reference is invalid"
+                    )
+                page = page_ref.get("page")
+                raw_sha256 = page_ref.get("raw_sha256")
+                checkpoint_sha256 = page_ref.get("checkpoint_sha256")
+                if (
+                    type(page) is not int
+                    or page != expected_page
+                    or type(raw_sha256) is not str
+                    or not _SHA256_RE.fullmatch(raw_sha256)
+                    or type(checkpoint_sha256) is not str
+                    or not _SHA256_RE.fullmatch(checkpoint_sha256)
+                ):
+                    raise CollectionPlanRunError(
+                        "verified segment page identity is invalid"
+                    )
+                task = self._task(
+                    bundle=bundle,
+                    query_id=query_id,
+                    region_id=region_id,
+                    page=page,
+                )
+                expected_page_ref = {
+                    "page": page,
+                    "pending_raw_path": _relative(
+                        paths.segment_pending_raw_path(segment_id, task),
+                        paths.project_root,
+                    ),
+                    "canonical_raw_path": _relative(
+                        paths.raw_page_path(task),
+                        paths.project_root,
+                    ),
+                    "raw_sha256": raw_sha256,
+                    "pending_checkpoint_path": _relative(
+                        paths.segment_pending_checkpoint_path(segment_id, task),
+                        paths.project_root,
+                    ),
+                    "canonical_checkpoint_path": _relative(
+                        paths.checkpoint_path(task),
+                        paths.project_root,
+                    ),
+                    "checkpoint_sha256": checkpoint_sha256,
+                }
+                if page_ref != expected_page_ref:
+                    raise CollectionPlanRunError(
+                        "verified segment page path mismatch"
+                    )
+                normalized_pages.append(expected_page_ref)
+
+            normalized_segment = {
+                **identity,
+                "segment_id": segment_id,
+                "region_id": region_id,
+                "query_id": query_id,
+                "pages": normalized_pages,
+                "endpoint_usage": normalized_usage,
+                "egress": normalized_egress,
+            }
+            if segment != normalized_segment:
+                raise CollectionPlanRunError(
+                    "verified segment canonical content mismatch"
+                )
+            record = {
+                "segment_id": segment_id,
+                "region_id": region_id,
+                "query_id": query_id,
+                "path": expected_path,
+                "sha256": payload_sha256,
+                "egress": normalized_egress,
+                "pages_count": expected_pages,
+            }
+            if expected_ref != record:
+                raise CollectionPlanRunError(
+                    "segment reference does not match canonical segment"
+                )
+            scopes.add(scope)
+            verified_ids.add(segment_id)
+            records.append(record)
+            validated_segments.append(normalized_segment)
+
+        for segment in validated_segments:
+            self._validate_verified_segment_artifacts(
+                paths=paths,
+                segment=segment,
+            )
+        for segment in validated_segments:
+            self._promote_verified_segment(paths=paths, segment=segment)
+        return records, verified_ids
+
+    def _validate_verified_segment_artifacts(
+        self,
+        *,
+        paths: ScopedPaths,
+        segment: Mapping[str, Any],
+    ) -> None:
+        for page in segment["pages"]:
+            for kind in ("raw", "checkpoint"):
+                pending = paths.project_root / page[f"pending_{kind}_path"]
+                canonical = paths.project_root / page[f"canonical_{kind}_path"]
+                expected_hash = page[f"{kind}_sha256"]
+                pending_bytes = _read_regular_bytes(
+                    pending,
+                    project_root=paths.project_root,
+                )
+                if _sha256_bytes(pending_bytes) != expected_hash:
+                    raise CollectionPlanRunError(
+                        f"segment pending {kind} checksum mismatch"
+                    )
+                if canonical.exists():
+                    canonical_bytes = _read_regular_bytes(
+                        canonical,
+                        project_root=paths.project_root,
+                    )
+                    if _sha256_bytes(canonical_bytes) != expected_hash:
+                        raise CollectionPlanRunError(
+                            f"canonical {kind} conflicts with verified segment"
+                        )
+
+    def _promote_verified_segment(
+        self,
+        *,
+        paths: ScopedPaths,
+        segment: Mapping[str, Any],
+    ) -> None:
+        for page in segment["pages"]:
+            if not isinstance(page, dict):
+                raise CollectionPlanRunError("segment page reference is invalid")
+            for kind in ("raw", "checkpoint"):
+                pending_key = f"pending_{kind}_path"
+                canonical_key = f"canonical_{kind}_path"
+                hash_key = f"{kind}_sha256"
+                try:
+                    pending = paths.project_root / str(page[pending_key])
+                    canonical = paths.project_root / str(page[canonical_key])
+                    expected_hash = str(page[hash_key])
+                except KeyError as exc:
+                    raise CollectionPlanRunError(
+                        "segment page reference is incomplete"
+                    ) from exc
+                pending_bytes = _read_regular_bytes(
+                    pending,
+                    project_root=paths.project_root,
+                )
+                if _sha256_bytes(pending_bytes) != expected_hash:
+                    raise CollectionPlanRunError(
+                        f"segment pending {kind} checksum mismatch"
+                    )
+                if canonical.exists():
+                    canonical_bytes = _read_regular_bytes(
+                        canonical,
+                        project_root=paths.project_root,
+                    )
+                    if _sha256_bytes(canonical_bytes) != expected_hash:
+                        raise CollectionPlanRunError(
+                            f"canonical {kind} conflicts with verified segment"
+                        )
+                else:
+                    self._write(canonical, pending_bytes)
+
+    def _next_segment_id(
+        self,
+        paths: ScopedPaths,
+        *,
+        reserved_ids: set[str] | None = None,
+    ) -> str:
+        indices: list[int] = []
+        for segment_id in reserved_ids or set():
+            match = re.fullmatch(r"segment-([0-9]{3,6})", segment_id)
+            if match:
+                indices.append(int(match.group(1)))
+        for base in (paths.segment_dir, paths.state_run_dir / "pending_segments"):
+            if not base.exists():
+                continue
+            for path in base.glob("segment-*"):
+                match = re.fullmatch(r"segment-([0-9]{3,6})(?:\.json)?", path.name)
+                if match:
+                    indices.append(int(match.group(1)))
+        return f"segment-{max(indices, default=0) + 1:03d}"
+
+    def _run_resumable(
+        self,
+        *,
+        initial_bundle: CollectionPlanBundle,
+        paths: ScopedPaths,
+    ) -> dict[str, Any]:
+        with acquire_collection_plan_locks(
+            paths=paths,
+            stale_seconds=self.config.runtime.lock_stale_seconds,
+            event_hook=self.lock_event_hook,
+        ):
+            bundle = self._load_bundle()
+            self._validate_mode(bundle)
+            if self._bundle_identity(bundle) != self._bundle_identity(initial_bundle):
+                raise CollectionPlanRunError(
+                    "collection plan sources changed during lock acquisition"
+                )
+            if self.resume:
+                if not paths.state_run_dir.is_dir():
+                    raise CollectionPlanRunError("resume run state does not exist")
+            elif paths.state_run_dir.exists():
+                raise CollectionPlanRunError(
+                    f"immutable scoped run state already exists: {paths.state_run_dir}"
+                )
+
+            planned_pages = (
+                len(bundle.enabled_regions)
+                * len(bundle.enabled_queries)
+                * bundle.collection_plan.quality.expected_pages_per_query
+            )
+            transport_fingerprint = self._transport_fingerprint()
+            register_query_pack_provenance(
+                provenance_path=paths.provenance_path,
+                query_pack=bundle.query_pack,
+                project_root=paths.project_root,
+            )
+
+            prior_manifest: dict[str, Any] | None = None
+            if self.resume:
+                prior_manifest = _json_object_from_bytes(
+                    _read_regular_bytes(
+                        paths.manifest_path,
+                        project_root=paths.project_root,
+                    ),
+                    field="resume manifest",
+                )
+                for key, expected in {
+                    "run_id": self.run_id,
+                    "collection_plan_id": bundle.collection_plan.collection_plan_id,
+                    "query_pack_sha256": bundle.query_pack_sha256,
+                    "collection_plan_sha256": bundle.collection_plan_sha256,
+                    "region_registry_sha256": bundle.region_registry_sha256,
+                }.items():
+                    if prior_manifest.get(key) != expected:
+                        raise CollectionPlanRunError(
+                            f"resume manifest provenance mismatch: {key}"
+                        )
+                if prior_manifest.get("complete") is True:
+                    raise CollectionPlanRunError("completed run cannot be resumed")
+                if prior_manifest.get("transport_fingerprint") != transport_fingerprint:
+                    raise CollectionPlanRunError(
+                        "resume transport fingerprint mismatch"
+                    )
+
+            snapshot: dict[str, Any] | None = None
+            effective_sha256 = ""
+            segment_refs: list[dict[str, Any]] = []
+            verified_segment_ids: set[str] = set()
+            discarded_segments: list[dict[str, Any]] = []
+            if self.resume:
+                snapshot_bytes = _read_regular_bytes(
+                    paths.effective_plan_path,
+                    project_root=paths.project_root,
+                )
+                snapshot = _json_object_from_bytes(
+                    snapshot_bytes,
+                    field="effective plan",
+                )
+                effective_sha256 = canonical_effective_plan_sha256(snapshot)
+                if snapshot.get("transport_fingerprint") != transport_fingerprint:
+                    raise CollectionPlanRunError(
+                        "resume effective transport fingerprint mismatch"
+                    )
+                if prior_manifest is None or prior_manifest.get(
+                    "effective_plan_sha256"
+                ) != effective_sha256:
+                    raise CollectionPlanRunError("resume effective plan hash mismatch")
+                for key, expected in {
+                    "query_pack_sha256": bundle.query_pack_sha256,
+                    "collection_plan_sha256": bundle.collection_plan_sha256,
+                    "region_registry_sha256": bundle.region_registry_sha256,
+                    "depth": bundle.collection_plan.depth,
+                }.items():
+                    if snapshot.get(key) != expected:
+                        raise CollectionPlanRunError(
+                            f"resume effective plan mismatch: {key}"
+                        )
+                resume_state = prior_manifest.get("resume")
+                prior_refs = (
+                    resume_state.get("segments")
+                    if isinstance(resume_state, dict)
+                    else None
+                )
+                if not isinstance(prior_refs, list):
+                    raise CollectionPlanRunError(
+                        "resume manifest segment references are invalid"
+                    )
+                segment_refs, verified_segment_ids = self._verified_segments(
+                    paths=paths,
+                    bundle=bundle,
+                    effective_plan_sha256=effective_sha256,
+                    expected_refs=tuple(prior_refs),
+                )
+                discarded_segments = self._validate_discarded_segments(
+                    value=resume_state.get("discarded_segments", []),
+                    bundle=bundle,
+                    verified_segment_ids=verified_segment_ids,
+                )
+
+            confirmed_pages = sum(
+                int(ref.get("pages_count", 0)) for ref in segment_refs
+            )
+            pending_pages = planned_pages - confirmed_pages
+            if pending_pages < 0:
+                raise CollectionPlanRunError("resume has more pages than the plan")
+            self.deadline.ensure_estimated_window(
+                self._estimated_remaining_seconds(
+                    bundle=bundle,
+                    pending_pages=pending_pages,
+                )
+            )
+
+            publication_reconcile_only = (
+                self.resume
+                and pending_pages == 0
+                and prior_manifest is not None
+                and prior_manifest.get("status") == "publication_pending"
+            )
+            resolved_now: dict[str, ResolvedDestination] = {}
+            if not publication_reconcile_only:
+                for region in bundle.enabled_regions:
+                    dest_id = self.transport.resolve_destination(
+                        region,
+                        timeout_seconds=self.deadline.request_timeout(
+                            self.config.runtime.http_timeout_seconds
+                        ),
+                    )
+                    if type(dest_id) is not str or not _DEST_RE.fullmatch(dest_id):
+                        raise CollectionPlanRunError(
+                            f"resolver returned invalid dest for {region.region_id}"
+                        )
+                    resolved_now[region.region_id] = ResolvedDestination(
+                        region_id=region.region_id,
+                        dest_id_observed=dest_id,
+                        dest_resolved_at_utc=_utc_iso(self.now()),
+                    )
+
+            if self.resume:
+                if snapshot is None:
+                    raise CollectionPlanRunError("resume effective plan is missing")
+                stored_regions = {
+                    item.get("region_id"): item
+                    for item in snapshot.get("regions", [])
+                    if isinstance(item, dict)
+                }
+                resolved: dict[str, ResolvedDestination] = {}
+                for region in bundle.enabled_regions:
+                    region_id = region.region_id
+                    stored = stored_regions.get(region_id)
+                    if not isinstance(stored, dict):
+                        raise CollectionPlanRunError(
+                            f"resume destination is missing: {region_id}"
+                        )
+                    current = resolved_now.get(region_id)
+                    if (
+                        current is not None
+                        and stored.get("dest_id_observed")
+                        != current.dest_id_observed
+                    ):
+                        raise CollectionPlanRunError(
+                            f"resume destination mismatch: {region_id}"
+                        )
+                    resolved[region_id] = ResolvedDestination(
+                        region_id=region_id,
+                        dest_id_observed=stored["dest_id_observed"],
+                        dest_resolved_at_utc=stored["dest_resolved_at_utc"],
+                    )
+            else:
+                resolved = resolved_now
+                snapshot = build_effective_plan_snapshot(
+                    bundle,
+                    resolved_destinations=resolved,
+                    page_size=100,
+                    endpoint_policy=self.transport.endpoint_policy,
+                    transport_fingerprint=transport_fingerprint,
+                )
+                snapshot_bytes = canonical_effective_plan_bytes(snapshot)
+                effective_sha256 = canonical_effective_plan_sha256(snapshot)
+                self._write(paths.effective_plan_path, snapshot_bytes)
+
+            if not self.resume:
+                segment_refs, verified_segment_ids = self._verified_segments(
+                    paths=paths,
+                    bundle=bundle,
+                    effective_plan_sha256=effective_sha256,
+                    expected_refs=(),
+                )
+            endpoint_usage = {
+                endpoint_id: {"attempts": 0, "pages_ok": 0}
+                for endpoint_id in self.transport.endpoint_policy.endpoint_ids
+            }
+            for ref in segment_refs:
+                segment = _json_object_from_bytes(
+                    _read_regular_bytes(
+                        paths.segment_path(ref["segment_id"]),
+                        project_root=paths.project_root,
+                    ),
+                    field="segment",
+                )
+                for endpoint_id, usage in segment.get("endpoint_usage", {}).items():
+                    if endpoint_id not in endpoint_usage or not isinstance(usage, dict):
+                        raise CollectionPlanRunError("segment endpoint usage is invalid")
+                    endpoint_usage[endpoint_id]["attempts"] += int(
+                        usage.get("attempts", 0)
+                    )
+                    endpoint_usage[endpoint_id]["pages_ok"] += int(
+                        usage.get("pages_ok", 0)
+                    )
+            for discarded in discarded_segments:
+                for endpoint_id, usage in discarded["endpoint_usage"].items():
+                    endpoint_usage[endpoint_id]["attempts"] += usage["attempts"]
+                    endpoint_usage[endpoint_id]["pages_ok"] += usage["pages_ok"]
+
+            def write_progress_manifest() -> None:
+                progress = {
+                    "schema_version": RESUMABLE_MANIFEST_SCHEMA_VERSION,
+                    "run_id": self.run_id,
+                    "collection_scope": COLLECTION_SCOPE,
+                    "collection_plan_id": bundle.collection_plan.collection_plan_id,
+                    "query_pack_id": bundle.query_pack.query_pack_id,
+                    "query_pack_version": bundle.query_pack.version,
+                    "query_pack_sha256": bundle.query_pack_sha256,
+                    "collection_plan_sha256": bundle.collection_plan_sha256,
+                    "region_registry_sha256": bundle.region_registry_sha256,
+                    "effective_plan_sha256": effective_sha256,
+                    "transport_fingerprint": transport_fingerprint,
+                    "effective_plan_snapshot_path": _relative(
+                        paths.effective_plan_path,
+                        paths.project_root,
+                    ),
+                    "publication_mode": "none",
+                    "sellers_mode": "disabled",
+                    "proxy_rotation_mode": "disabled",
+                    "started_at_utc": (
+                        prior_manifest.get("started_at_utc")
+                        if prior_manifest is not None
+                        else self.started_at_utc
+                    ),
+                    "updated_at_utc": _utc_iso(self.now()),
+                    "status": "running",
+                    "complete": False,
+                    "resume": {
+                        "resumed": self.resume,
+                        "segments": segment_refs,
+                        "verified_segments": len(segment_refs),
+                        "discarded_segments": discarded_segments,
+                        "failed_segment": None,
+                        "maximum_repeated_pages": bundle.collection_plan.quality.expected_pages_per_query,
+                    },
+                }
+                self._replace(paths.manifest_path, _json_bytes(progress))
+
+            write_progress_manifest()
+
+            manifest_regions: list[dict[str, Any]] = []
+            region_rows: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
+            totals = {"regions_ok": 0, "pages_ok": 0, "products_ok": 0}
+            boundary_egress: str | None = None
+            failed_segment: dict[str, Any] | None = None
+            caught: Exception | None = None
+
+            try:
+                for region in bundle.enabled_regions:
+                    products_all: list[dict[str, Any]] = []
+                    pages_all: list[dict[str, Any]] = []
+                    region_manifest = {
+                        "region_id": region.region_id,
+                        "dest_id_observed": resolved[region.region_id].dest_id_observed,
+                        "dest_resolution_status": "resolved_not_sent",
+                        "status": "pending",
+                        "complete": False,
+                        "pages_ok": 0,
+                        "products_ok": 0,
+                    }
+                    manifest_regions.append(region_manifest)
+                    for query in bundle.enabled_queries:
+                        tasks = [
+                            self._task(
+                                bundle=bundle,
+                                query_id=query.query_id,
+                                region_id=region.region_id,
+                                page=page,
+                            )
+                            for page in range(
+                                1,
+                                bundle.collection_plan.quality.expected_pages_per_query + 1,
+                            )
+                        ]
+                        loaded = [
+                            self._load_reusable_page(
+                                paths=paths,
+                                task=task,
+                                resolution=resolved[region.region_id],
+                                bundle=bundle,
+                                effective_plan_sha256=effective_sha256,
+                                verified_segment_ids=verified_segment_ids,
+                            )
+                            for task in tasks
+                        ]
+                        if any(item is not None for item in loaded):
+                            if any(item is None for item in loaded):
+                                raise CollectionPlanRunError(
+                                    f"verified query segment is incomplete: {region.region_id}/{query.query_id}"
+                                )
+                            segment_ids = {item[2] for item in loaded if item is not None}
+                            if len(segment_ids) != 1:
+                                raise CollectionPlanRunError(
+                                    "query pages span multiple verified segments"
+                                )
+                            for rows, page_row, _segment_id in loaded:  # type: ignore[misc]
+                                products_all.extend(rows)
+                                pages_all.append(page_row)
+                            continue
+
+                        segment_id = self._next_segment_id(
+                            paths,
+                            reserved_ids={
+                                *verified_segment_ids,
+                                *(
+                                    item["segment_id"]
+                                    for item in discarded_segments
+                                ),
+                            },
+                        )
+                        start_egress = boundary_egress or self._check_egress()
+                        end_egress: str | None = None
+                        page_refs: list[dict[str, Any]] = []
+                        segment_usage = {
+                            endpoint_id: {"attempts": 0, "pages_ok": 0}
+                            for endpoint_id in endpoint_usage
+                        }
+                        last_attempts: tuple[str, ...] = ()
+                        last_endpoint_id = ""
+                        try:
+                            for task in tasks:
+                                last_attempts = ()
+                                last_endpoint_id = ""
+                                request = self._search_request(
+                                    task=task,
+                                    dest_id=resolved[region.region_id].dest_id_observed,
+                                )
+                                result = self.transport.search_ordered(
+                                    request,
+                                    timeout_seconds=self.deadline.request_timeout(
+                                        self.config.runtime.http_timeout_seconds
+                                    ),
+                                )
+                                attempts = result.attempted_endpoint_ids or (
+                                    result.endpoint_id,
+                                )
+                                if (
+                                    result.endpoint_id not in endpoint_usage
+                                    or result.endpoint_id not in attempts
+                                    or len(set(attempts)) != len(attempts)
+                                    or any(item not in endpoint_usage for item in attempts)
+                                ):
+                                    raise CollectionPlanRunError(
+                                        "search endpoint evidence mismatch"
+                                    )
+                                last_attempts = tuple(attempts)
+                                last_endpoint_id = result.endpoint_id
+                                for endpoint_id in attempts:
+                                    segment_usage[endpoint_id]["attempts"] += 1
+                                if result.dest_id_sent != request.dest_id_observed:
+                                    raise CollectionPlanRunError(
+                                        "search destination evidence mismatch"
+                                    )
+                                pending_raw = paths.segment_pending_raw_path(
+                                    segment_id, task
+                                )
+                                raw_bytes = _json_bytes(result.payload)
+                                self._write(pending_raw, raw_bytes)
+                                rows, page_row = self._rows_for_page(
+                                    task=task,
+                                    resolution=resolved[region.region_id],
+                                    products=_extract_products(result.payload),
+                                    raw_path=paths.raw_page_path(task),
+                                    endpoint_id=result.endpoint_id,
+                                )
+                                segment_usage[result.endpoint_id]["pages_ok"] += 1
+                                checkpoint = self._checkpoint_payload(
+                                    task=task,
+                                    resolution=resolved[region.region_id],
+                                    raw_path=paths.raw_page_path(task),
+                                    endpoint_id=result.endpoint_id,
+                                    attempted_endpoint_ids=attempts,
+                                    raw_sha256=_sha256_bytes(raw_bytes),
+                                    effective_plan_sha256=effective_sha256,
+                                    bundle=bundle,
+                                    segment_id=segment_id,
+                                )
+                                checkpoint_bytes = _json_bytes(checkpoint)
+                                pending_checkpoint = (
+                                    paths.segment_pending_checkpoint_path(
+                                        segment_id, task
+                                    )
+                                )
+                                self._write(pending_checkpoint, checkpoint_bytes)
+                                page_refs.append(
+                                    {
+                                        "page": task.page,
+                                        "pending_raw_path": _relative(
+                                            pending_raw, paths.project_root
+                                        ),
+                                        "canonical_raw_path": _relative(
+                                            paths.raw_page_path(task), paths.project_root
+                                        ),
+                                        "raw_sha256": _sha256_bytes(raw_bytes),
+                                        "pending_checkpoint_path": _relative(
+                                            pending_checkpoint, paths.project_root
+                                        ),
+                                        "canonical_checkpoint_path": _relative(
+                                            paths.checkpoint_path(task),
+                                            paths.project_root,
+                                        ),
+                                        "checkpoint_sha256": _sha256_bytes(
+                                            checkpoint_bytes
+                                        ),
+                                    }
+                                )
+                                self._sleep_from_serp_config(
+                                    "sleep_between_pages_ms"
+                                )
+                            end_egress = self._check_egress()
+                            if end_egress != start_egress:
+                                raise EgressIdentityChangedError(
+                                    "egress identity changed during query segment"
+                                )
+                        except Exception as exc:
+                            egress_changed = (
+                                end_egress is not None
+                                and end_egress != start_egress
+                            )
+                            failed_segment = {
+                                "segment_id": segment_id,
+                                "region_id": region.region_id,
+                                "query_id": query.query_id,
+                                "pages_written": sum(
+                                    usage["pages_ok"]
+                                    for usage in segment_usage.values()
+                                ),
+                                "status": "incomplete_not_reusable",
+                                "egress": {
+                                    "verification_status": (
+                                        "changed"
+                                        if egress_changed
+                                        else "unverified"
+                                    ),
+                                    "constant": False if egress_changed else None,
+                                    "checks_completed": 2 if egress_changed else 1,
+                                    "checks_expected": 2,
+                                    "start": {
+                                        "source": (
+                                            "previous_segment_end"
+                                            if boundary_egress is not None
+                                            else "segment_start_check"
+                                        ),
+                                        "masked": _mask_egress(start_egress),
+                                        "ephemeral_sha256": _egress_hash(
+                                            start_egress,
+                                            salt=self.egress_hash_salt,
+                                        ),
+                                    },
+                                    "end": (
+                                        {
+                                            "source": "segment_end_check",
+                                            "masked": _mask_egress(end_egress),
+                                            "ephemeral_sha256": _egress_hash(
+                                                end_egress,
+                                                salt=self.egress_hash_salt,
+                                            ),
+                                        }
+                                        if egress_changed
+                                        else None
+                                    ),
+                                },
+                            }
+                            if isinstance(exc, ScopedTransportError):
+                                attempts, endpoint_id = (
+                                    self._sanitized_endpoint_error_evidence(exc)
+                                )
+                                for attempted in attempts:
+                                    segment_usage[attempted]["attempts"] += 1
+                                failed_segment.update(
+                                    {
+                                        "endpoint_id": endpoint_id or None,
+                                        "attempted_endpoint_ids": list(attempts),
+                                        "error_code": exc.code,
+                                    }
+                                )
+                            else:
+                                local_attempts = (
+                                    last_attempts
+                                    if not egress_changed
+                                    else ()
+                                )
+                                local_endpoint_id = (
+                                    last_endpoint_id
+                                    if local_attempts
+                                    else None
+                                )
+                                failed_segment.update(
+                                    {
+                                        "endpoint_id": local_endpoint_id,
+                                        "attempted_endpoint_ids": list(
+                                            local_attempts
+                                        ),
+                                        "error_code": (
+                                            "egress_identity_changed"
+                                            if isinstance(
+                                                exc,
+                                                EgressIdentityChangedError,
+                                            )
+                                            else exc.__class__.__name__
+                                        ),
+                                    }
+                                )
+                            failed_segment["endpoint_usage"] = {
+                                endpoint_id: dict(usage)
+                                for endpoint_id, usage in segment_usage.items()
+                            }
+                            discarded_segments = self._validate_discarded_segments(
+                                value=[*discarded_segments, failed_segment],
+                                bundle=bundle,
+                                verified_segment_ids=verified_segment_ids,
+                            )
+                            failed_segment = discarded_segments[-1]
+                            for endpoint_id, usage in segment_usage.items():
+                                endpoint_usage[endpoint_id]["attempts"] += usage[
+                                    "attempts"
+                                ]
+                                endpoint_usage[endpoint_id]["pages_ok"] += usage[
+                                    "pages_ok"
+                                ]
+                            raise exc
+
+                        segment_payload = {
+                            "schema_version": SEGMENT_SCHEMA_VERSION,
+                            "run_id": self.run_id,
+                            "segment_id": segment_id,
+                            "collection_plan_id": bundle.collection_plan.collection_plan_id,
+                            "query_pack_sha256": bundle.query_pack_sha256,
+                            "collection_plan_sha256": bundle.collection_plan_sha256,
+                            "region_registry_sha256": bundle.region_registry_sha256,
+                            "effective_plan_sha256": effective_sha256,
+                            "region_id": region.region_id,
+                            "query_id": query.query_id,
+                            "pages": page_refs,
+                            "endpoint_usage": segment_usage,
+                            "egress": {
+                                "verification_status": "verified_constant",
+                                "constant": True,
+                                "checks_completed": 2,
+                                "checks_expected": 2,
+                                "start": {
+                                    "source": (
+                                        "previous_segment_end"
+                                        if boundary_egress is not None
+                                        else "segment_start_check"
+                                    ),
+                                    "masked": _mask_egress(start_egress),
+                                    "ephemeral_sha256": _egress_hash(
+                                        start_egress,
+                                        salt=self.egress_hash_salt,
+                                    ),
+                                },
+                                "end": {
+                                    "source": "segment_end_check",
+                                    "masked": _mask_egress(end_egress),
+                                    "ephemeral_sha256": _egress_hash(
+                                        end_egress,
+                                        salt=self.egress_hash_salt,
+                                    ),
+                                },
+                            },
+                        }
+                        segment_bytes = _json_bytes(segment_payload)
+                        self._write(paths.segment_path(segment_id), segment_bytes)
+                        segment_refs.append(
+                            {
+                                "segment_id": segment_id,
+                                "region_id": region.region_id,
+                                "query_id": query.query_id,
+                                "path": _relative(
+                                    paths.segment_path(segment_id),
+                                    paths.project_root,
+                                ),
+                                "sha256": _sha256_bytes(segment_bytes),
+                                "egress": segment_payload["egress"],
+                                "pages_count": len(page_refs),
+                            }
+                        )
+                        write_progress_manifest()
+                        self._promote_verified_segment(
+                            paths=paths,
+                            segment=segment_payload,
+                        )
+                        verified_segment_ids.add(segment_id)
+                        for endpoint_id, usage in segment_usage.items():
+                            endpoint_usage[endpoint_id]["attempts"] += usage["attempts"]
+                            endpoint_usage[endpoint_id]["pages_ok"] += usage["pages_ok"]
+                        for task in tasks:
+                            reused = self._load_reusable_page(
+                                paths=paths,
+                                task=task,
+                                resolution=resolved[region.region_id],
+                                bundle=bundle,
+                                effective_plan_sha256=effective_sha256,
+                                verified_segment_ids=verified_segment_ids,
+                            )
+                            if reused is None:
+                                raise CollectionPlanRunError(
+                                    "verified segment promotion is incomplete"
+                                )
+                            products_all.extend(reused[0])
+                            pages_all.append(reused[1])
+                        boundary_egress = end_egress
+                        self._sleep_from_serp_config("sleep_between_queries_ms")
+
+                    region_manifest["pages_ok"] = len(pages_all)
+                    region_manifest["products_ok"] = len(products_all)
+                    expected_region_pages = (
+                        len(bundle.enabled_queries)
+                        * bundle.collection_plan.quality.expected_pages_per_query
+                    )
+                    region_manifest["complete"] = (
+                        len(pages_all) == expected_region_pages
+                        and len(products_all) == expected_region_pages * 100
+                    )
+                    if not region_manifest["complete"]:
+                        raise CollectionPlanRunError(
+                            f"region scope incomplete: {region.region_id}"
+                        )
+                    region_manifest["status"] = "success"
+                    region_rows[region.region_id] = (products_all, pages_all)
+            except Exception as exc:
+                caught = exc
+
+            if caught is None:
+                for region_manifest in manifest_regions:
+                    products_all, pages_all = region_rows[region_manifest["region_id"]]
+                    region_manifest["outputs"] = self._write_scope_outputs(
+                        paths=paths,
+                        region_id=region_manifest["region_id"],
+                        product_rows=products_all,
+                        page_rows=pages_all,
+                        replace=self.resume,
+                    )
+                    self._replace(
+                        paths.region_state_path(region_manifest["region_id"]),
+                        _json_bytes(
+                            {
+                                "schema_version": REGION_STATE_SCHEMA_VERSION,
+                                **region_manifest,
+                            }
+                        ),
+                    )
+
+            canonical_pages = sum(
+                int(ref["pages_count"]) for ref in segment_refs
+            )
+            verified_queries_by_region: dict[str, set[str]] = {}
+            for ref in segment_refs:
+                verified_queries_by_region.setdefault(
+                    ref["region_id"],
+                    set(),
+                ).add(ref["query_id"])
+            totals = {
+                "regions_ok": sum(
+                    len(query_ids) == len(bundle.enabled_queries)
+                    for query_ids in verified_queries_by_region.values()
+                ),
+                "pages_ok": canonical_pages,
+                "products_ok": canonical_pages * 100,
+            }
+            expected_regions = len(bundle.enabled_regions)
+            collection_complete = (
+                caught is None
+                and totals["regions_ok"] == expected_regions
+                and totals["pages_ok"] == planned_pages
+                and totals["products_ok"] == planned_pages * 100
+            )
+            manifest = {
+                "schema_version": RESUMABLE_MANIFEST_SCHEMA_VERSION,
+                "run_id": self.run_id,
+                "collection_scope": COLLECTION_SCOPE,
+                "collection_plan_id": bundle.collection_plan.collection_plan_id,
+                "query_pack_id": bundle.query_pack.query_pack_id,
+                "query_pack_version": bundle.query_pack.version,
+                "query_pack_sha256": bundle.query_pack_sha256,
+                "collection_plan_sha256": bundle.collection_plan_sha256,
+                "region_registry_sha256": bundle.region_registry_sha256,
+                "effective_plan_sha256": effective_sha256,
+                "transport_fingerprint": transport_fingerprint,
+                "effective_plan_snapshot_path": _relative(
+                    paths.effective_plan_path,
+                    paths.project_root,
+                ),
+                "publication_mode": "none",
+                "sellers_mode": "disabled",
+                "proxy_rotation_mode": "disabled",
+                "started_at_utc": (
+                    prior_manifest.get("started_at_utc")
+                    if prior_manifest is not None
+                    else self.started_at_utc
+                ),
+                "finished_at_utc": _utc_iso(self.now()),
+                "deadline_utc": _utc_iso(self.deadline.deadline_utc),
+                "status": (
+                    "publication_pending"
+                    if collection_complete
+                    else "failed"
+                ),
+                "complete": False,
+                "totals": totals,
+                "endpoint_usage": endpoint_usage,
+                "regions": manifest_regions,
+                "resume": {
+                    "resumed": self.resume,
+                    "segments": segment_refs,
+                    "verified_segments": len(segment_refs),
+                    "discarded_segments": discarded_segments,
+                    "failed_segment": failed_segment,
+                    "maximum_repeated_pages": bundle.collection_plan.quality.expected_pages_per_query,
+                },
+                "error": (
+                    None
+                    if caught is None
+                    else {
+                        "error_class": caught.__class__.__name__,
+                        "error_code": str(
+                            getattr(caught, "code", "collection_plan_failed")
+                        ).replace("\n", " ")[:100],
+                    }
+                ),
+                "regional_latest": {
+                    "status": (
+                        "publication_pending"
+                        if collection_complete
+                        else "not_published"
+                    )
+                },
+            }
+            self._replace(paths.manifest_path, _json_bytes(manifest), final_manifest=True)
+            if caught is not None:
+                raise caught
+            if not collection_complete:
+                raise CollectionPlanRunError("collection plan run is incomplete")
+            try:
+                manifest["regional_latest"] = self._publish_regional_latest(
+                    paths=paths,
+                    bundle=bundle,
+                    effective_plan_sha256=effective_sha256,
+                    region_manifests=manifest_regions,
+                )
+            except Exception as exc:
+                manifest["status"] = "publication_pending"
+                manifest["complete"] = False
+                manifest["error"] = {
+                    "error_class": exc.__class__.__name__,
+                    "error_code": "regional_latest_publication_pending",
+                }
+                self._replace(
+                    paths.manifest_path,
+                    _json_bytes(manifest),
+                    final_manifest=True,
+                )
+                raise
+            manifest["status"] = "success"
+            manifest["complete"] = True
+            manifest["error"] = None
+            self._replace(paths.manifest_path, _json_bytes(manifest), final_manifest=True)
+            return manifest
 
     def run(self) -> dict[str, Any]:
         initial_bundle = self._load_bundle()
@@ -1492,7 +3415,23 @@ class CollectionPlanRunner:
             collection_plan_id=initial_bundle.collection_plan.collection_plan_id,
             run_id=self.run_id,
         )
+        if initial_bundle.collection_plan.depth > 500:
+            return self._run_resumable(
+                initial_bundle=initial_bundle,
+                paths=paths,
+            )
+        if self.resume:
+            raise CollectionPlanRunError(
+                "resume is supported only for collection plans deeper than 500"
+            )
+        return self._run_legacy(initial_bundle=initial_bundle, paths=paths)
 
+    def _run_legacy(
+        self,
+        *,
+        initial_bundle: CollectionPlanBundle,
+        paths: ScopedPaths,
+    ) -> dict[str, Any]:
         with acquire_collection_plan_locks(
             paths=paths,
             stale_seconds=self.config.runtime.lock_stale_seconds,
@@ -1512,6 +3451,7 @@ class CollectionPlanRunner:
             register_query_pack_provenance(
                 provenance_path=paths.provenance_path,
                 query_pack=bundle.query_pack,
+                project_root=paths.project_root,
             )
             egress_checks_expected = len(bundle.enabled_regions) + 1
             egress_checks_completed = 0
@@ -1897,6 +3837,7 @@ def run_collection_plan(
     no_publish: bool,
     transport: ScopedTransport | None = None,
     run_id: str | None = None,
+    resume_run_id: str | None = None,
     now: Callable[[], datetime] = _default_now,
     lock_event_hook: LockEventHook | None = None,
     write_event_hook: WriteEventHook | None = None,
@@ -1924,6 +3865,7 @@ def run_collection_plan(
             transport=active_transport,
             no_publish=no_publish,
             run_id=run_id,
+            resume_run_id=resume_run_id,
             now=now,
             lock_event_hook=lock_event_hook,
             write_event_hook=write_event_hook,

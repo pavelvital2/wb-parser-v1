@@ -68,7 +68,11 @@ load_collection_plan_bundle(
     region_registry_path=...,
     provenance_path=None,
 )
-register_query_pack_provenance(provenance_path=..., query_pack=...)
+register_query_pack_provenance(
+    provenance_path=...,
+    query_pack=...,
+    project_root=...,
+)
 build_effective_plan_snapshot(
     bundle,
     resolved_destinations=...,
@@ -83,7 +87,9 @@ Loading documents without `provenance_path` is read-only. Passing a provenance
 path explicitly records the immutable `(query_pack_id, version) -> exact-byte
 SHA-256` mapping. Stage 2 must call this only while holding the documented
 plan-specific lock. Reusing an identity with a different hash fails closed;
-malformed provenance is never overwritten.
+malformed provenance is never overwritten. The only accepted provenance target
+is `state/wb_collection_plans/provenance/query_pack_versions.json` below the
+project root; symlinked parents or targets fail closed.
 
 Bundle loading is restricted to the project configuration tree. The plan must
 be a regular JSON file directly under `config/wb/collection_plans`, the region
@@ -156,8 +162,9 @@ The runner:
   proxy route and requests session, using secret-free per-request headers, and
   stores only a masked value plus an experiment-local salted hash;
 - sends the exact resolved value as the search `dest`;
-- derives pages from the plan depth: supported depth is `100`, `200`, `300`,
-  `400` or `500`, with exactly 100 products required per page;
+- derives pages from the plan depth: supported depth is `100..1000` in
+  100-item increments, with exactly 100 unique valid products required per
+  page;
 - uses the production-configured primary/fallback endpoint list in the same
   active-first order as `SerpEngine`; retryable production statuses may advance
   once through the remaining configured endpoints for that page, while a
@@ -170,7 +177,11 @@ The runner:
   checkpoints, plus sanitized endpoint attempt counts in the run manifest;
 - records `resolved_and_sent` only as client-side request lifecycle evidence;
 - never claims that the search server applied the destination;
-- refuses to start within five minutes of the 23:45 MSK preflight cutoff.
+- refuses to start within five minutes of the 23:45 MSK preflight cutoff;
+- for plans deeper than 500, estimates the remaining worst-case request and
+  pacing window using every configured endpoint as a possible sequential
+  attempt per page, and refuses to start when that window plus a 15-minute
+  safety reserve would overlap the nightly 00:15 MSK collection.
 
 All outputs remain under:
 
@@ -179,8 +190,82 @@ data/{raw,staging,marts}/serp_scoped/{plan}/{region}/{run_id}/
 state/wb_collection_plans/{plan}/{run_id}/
 ```
 
-There is no scoped `latest` in Stage 2. The runner never writes global SERP
-latest, seller exports, global run-report latest or warehouse data.
+The production-ready manual plan is:
+
+```text
+config/wb/collection_plans/shevron-moscow-rostov-top1000-v1.json
+```
+
+It contains all 30 `shevron-core` queries in pack order, Moscow and
+Rostov-on-Don, depth 1000 (10 pages per query, 600 pages total). The tracked
+plan and both tracked regions remain disabled. Enabling or executing it needs
+separate owner authorization.
+
+Deep runs use one immutable segment per `region_id + query_id`, at most 10
+pages. Every segment has an egress check before and after its search pages.
+Within one process, a successful end check is reused as the next segment's
+start check. Across resumed processes, egress may differ; each segment must
+still be internally constant. Evidence stores only masked identities and
+run-local hashes, never a full IP.
+
+Pages are first written below `pending_segments`. Only after the segment end
+check succeeds does an immutable segment record authorize idempotent promotion
+to canonical raw/checkpoint paths. An interrupted segment is not reusable and
+is recollected in full, limiting automatic repetition to one query (10 pages).
+Confirmed segments are validated by exact source/effective hashes, metadata
+and raw/checkpoint checksums before reuse. On resume, each manifest reference
+must exactly match its canonical segment record. Enabled region/query scope,
+pages `1..N`, task-derived scoped paths, endpoint counters and constant
+hash-only egress evidence are validated for every segment before any promotion
+or network I/O. All segments and artifacts are validated before canonical
+promotion starts, so a later corrupt reference cannot cause partial recovery.
+
+Deep resumable runs use effective-plan schema v2. It binds resume to
+hash-only provenance for the ordered endpoint URLs, canonical request
+parameters and configured proxy route. It does not store those values. A
+fingerprint mismatch fails before resolver, egress or search I/O. Existing
+schema-v1 snapshots for legacy depth <=500 remain valid and unchanged.
+
+Failed or discarded segment attempts remain in a cumulative sanitized history
+across every resume. `endpoint_usage` therefore reports actual HTTP attempts
+and successful page responses, including discarded work, while `totals`
+reports only canonical confirmed pages. Segment IDs are deduplicated and all
+history counters, scopes and endpoint IDs are validated before resolver or
+search traffic. If the end egress differs, both checks are retained only as
+masked values and run-local hashes; that segment is never reusable.
+
+Publication is a recoverable two-phase transition. The manifest remains
+`complete=false` with `status=publication_pending` until the immutable
+per-region generation manifests and the atomic dual-region latest pointer are
+durable. Resume can reconcile that state without WB network calls. A matching
+already-durable pointer is accepted idempotently; only then is the manifest
+finalized as `success` and `complete=true`.
+
+Resume is explicit and keeps the original run identity:
+
+```bash
+scripts/run_wb_collection_plan.sh \
+  --config config/config.yaml \
+  --plan-file config/wb/collection_plans/shevron-moscow-rostov-top1000-v1.json \
+  --no-publish \
+  --resume-run-id YYYYMMDD_HHMMSSZ
+```
+
+Final CSV files are rebuilt deterministically in plan/region/query/page order
+from confirmed canonical pages. The plan-level scoped latest pointer is:
+
+```text
+state/wb_collection_plans/{plan}/latest.json
+```
+
+It atomically references two immutable region manifests under
+`latest_generations/{run_id}/`. Consumers must resolve the plan pointer first;
+partially written generation files are not visible. The pointer changes only
+after the whole plan and both regions are complete. Failure, partial result or
+interruption leaves the previous pointer unchanged.
+
+The runner never writes global SERP latest, seller exports, global run-report
+latest or warehouse data.
 
 The selected region or region set, query IDs and depth come only from the
 versioned collection plan. The query text comes only from its versioned query
@@ -202,7 +287,7 @@ Loaders reject:
 - enabled plans referencing disabled packs, queries, categories or regions;
 - external, non-canonical or symlinked bundle source paths;
 - unsafe query-pack paths;
-- depth outside `100..500` in 100-item increments, a mismatched expected page
+- depth outside `100..1000` in 100-item increments, a mismatched expected page
   count, or unsafe publication/sellers/rotation modes;
 - non-null destination observations in tracked Stage 1 region config;
 - unsafe destination IDs, non-UTC/non-RFC-3339 timestamps and duplicate

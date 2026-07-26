@@ -17,10 +17,11 @@ QUERY_PACK_SCHEMA_VERSION = "wb_query_pack_v1"
 REGION_REGISTRY_SCHEMA_VERSION = "wb_region_registry_v1"
 COLLECTION_PLAN_SCHEMA_VERSION = "wb_collection_plan_v1"
 EFFECTIVE_PLAN_SCHEMA_VERSION = "wb_effective_collection_plan_v1"
+RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION = "wb_effective_collection_plan_v2"
 PROVENANCE_SCHEMA_VERSION = "wb_query_pack_provenance_v1"
 
 PAGE_SIZE = 100
-SUPPORTED_DEPTHS = frozenset(range(PAGE_SIZE, 501, PAGE_SIZE))
+SUPPORTED_DEPTHS = frozenset(range(PAGE_SIZE, 1001, PAGE_SIZE))
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -897,6 +898,7 @@ def load_collection_plan_bundle(
         register_query_pack_provenance(
             provenance_path=provenance_path,
             query_pack=pack,
+            project_root=root,
         )
     return bundle
 
@@ -957,8 +959,53 @@ def _load_provenance_payload(path: Path) -> dict[str, Any]:
     }
 
 
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _ensure_durable_provenance_parent(
+    path: Path,
+    *,
+    project_root: Path,
+) -> None:
+    expected = (
+        project_root
+        / "state/wb_collection_plans/provenance/query_pack_versions.json"
+    )
+    lexical = Path(os.path.abspath(path))
+    if lexical != expected:
+        raise CollectionPlanValidationError(
+            "provenance_path must be the exact scoped provenance path"
+        )
+    current = project_root
+    for part in lexical.relative_to(project_root).parts[:-1]:
+        current /= part
+        if current.is_symlink():
+            raise CollectionPlanValidationError(
+                "provenance_path must not use symlink components"
+            )
+        if not current.exists():
+            parent = current.parent
+            current.mkdir()
+            for directory in (parent, current):
+                fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        elif not current.is_dir():
+            raise CollectionPlanValidationError(
+                "provenance_path parent must be a directory"
+            )
+    if lexical.is_symlink() or (lexical.exists() and not lexical.is_file()):
+        raise CollectionPlanValidationError(
+            "provenance target must be a regular non-symlink file"
+        )
+
+
+def _atomic_write_json(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    project_root: Path,
+) -> None:
+    _ensure_durable_provenance_parent(path, project_root=project_root)
     text = json.dumps(
         payload,
         ensure_ascii=False,
@@ -998,6 +1045,7 @@ def register_query_pack_provenance(
     *,
     provenance_path: Path | str,
     query_pack: QueryPack,
+    project_root: Path | str,
 ) -> bool:
     """Record immutable pack identity.
 
@@ -1005,7 +1053,9 @@ def register_query_pack_provenance(
     Returns True for a new record and False for an identical existing record.
     """
 
-    path = Path(provenance_path)
+    root = Path(project_root).resolve()
+    path = Path(os.path.abspath(provenance_path))
+    _ensure_durable_provenance_parent(path, project_root=root)
     payload = _load_provenance_payload(path)
     key = (query_pack.query_pack_id, query_pack.version)
     query_pack_sha256 = _require_sha256(
@@ -1034,7 +1084,7 @@ def register_query_pack_provenance(
     payload["query_packs"].sort(
         key=lambda item: (item["query_pack_id"], item["version"])
     )
-    _atomic_write_json(path, payload)
+    _atomic_write_json(path, payload, project_root=root)
     return True
 
 
@@ -1069,6 +1119,7 @@ def build_effective_plan_snapshot(
     resolved_destinations: Mapping[str, ResolvedDestination],
     page_size: int,
     endpoint_policy: EffectiveEndpointPolicy,
+    transport_fingerprint: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the secret-free Stage 2 snapshot in memory without writing it."""
 
@@ -1151,7 +1202,11 @@ def build_effective_plan_snapshot(
         )
 
     snapshot: dict[str, Any] = {
-        "schema_version": EFFECTIVE_PLAN_SCHEMA_VERSION,
+        "schema_version": (
+            RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION
+            if transport_fingerprint is not None
+            else EFFECTIVE_PLAN_SCHEMA_VERSION
+        ),
         "collection_plan_id": plan.collection_plan_id,
         "query_pack_id": bundle.query_pack.query_pack_id,
         "query_pack_version": bundle.query_pack.version,
@@ -1186,39 +1241,77 @@ def build_effective_plan_snapshot(
             "require_distinct_destinations": plan.quality.require_distinct_destinations,
         },
     }
+    if transport_fingerprint is not None:
+        snapshot["transport_fingerprint"] = dict(transport_fingerprint)
     _validate_effective_plan_snapshot(snapshot)
     return snapshot
 
 
 def _validate_effective_plan_snapshot(snapshot: Mapping[str, Any]) -> None:
+    schema_version = snapshot.get("schema_version")
+    if schema_version not in {
+        EFFECTIVE_PLAN_SCHEMA_VERSION,
+        RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION,
+    }:
+        raise CollectionPlanValidationError(
+            "effective_plan.schema_version is unsupported"
+        )
+    required = {
+        "schema_version",
+        "collection_plan_id",
+        "query_pack_id",
+        "query_pack_version",
+        "query_pack_sha256",
+        "collection_plan_sha256",
+        "region_registry_sha256",
+        "queries",
+        "regions",
+        "depth",
+        "page_size",
+        "endpoint_policy",
+        "schedule_id",
+        "publication_mode",
+        "sellers_mode",
+        "proxy_rotation_mode",
+        "quality",
+    }
+    if schema_version == RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION:
+        required.add("transport_fingerprint")
     _require_keys(
         snapshot,
-        required={
-            "schema_version",
-            "collection_plan_id",
-            "query_pack_id",
-            "query_pack_version",
-            "query_pack_sha256",
-            "collection_plan_sha256",
-            "region_registry_sha256",
-            "queries",
-            "regions",
-            "depth",
-            "page_size",
-            "endpoint_policy",
-            "schedule_id",
-            "publication_mode",
-            "sellers_mode",
-            "proxy_rotation_mode",
-            "quality",
-        },
+        required=required,
         field="effective_plan",
     )
-    _validate_schema_version(
-        snapshot,
-        expected=EFFECTIVE_PLAN_SCHEMA_VERSION,
-        field="effective_plan",
-    )
+    if schema_version == RESUMABLE_EFFECTIVE_PLAN_SCHEMA_VERSION:
+        fingerprint = _require_object(
+            snapshot["transport_fingerprint"],
+            field="effective_plan.transport_fingerprint",
+        )
+        _require_keys(
+            fingerprint,
+            required={
+                "schema_version",
+                "ordered_endpoint_urls_sha256",
+                "request_params_sha256",
+                "proxy_route_sha256",
+                "fingerprint_sha256",
+            },
+            field="effective_plan.transport_fingerprint",
+        )
+        if fingerprint["schema_version"] != "wb_transport_fingerprint_v1":
+            raise CollectionPlanValidationError(
+                "effective_plan.transport_fingerprint schema is unsupported"
+            )
+        for name in (
+            "ordered_endpoint_urls_sha256",
+            "request_params_sha256",
+            "proxy_route_sha256",
+            "fingerprint_sha256",
+        ):
+            _require_sha256(
+                fingerprint[name],
+                field=f"effective_plan.transport_fingerprint.{name}",
+            )
     _require_id(snapshot["collection_plan_id"], field="effective_plan.collection_plan_id")
     _require_id(snapshot["query_pack_id"], field="effective_plan.query_pack_id")
     _require_version(snapshot["query_pack_version"], field="effective_plan.query_pack_version")

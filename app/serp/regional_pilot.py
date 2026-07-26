@@ -1582,6 +1582,7 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
             register_query_pack_provenance(
                 provenance_path=paths.provenance_path,
                 query_pack=bundle.query_pack,
+                project_root=paths.project_root,
             )
 
             egress = PilotEgressEvidence()
