@@ -148,7 +148,7 @@ serp:
   cookie_required_env: PARSER_WB_COOKIE_REQUIRED
 
   wb_cookie_file: config/wb_cookie.txt
-
+
   proxy_url_env: PARSER_WB_PROXY_URL
 
   proxy_url: ""
