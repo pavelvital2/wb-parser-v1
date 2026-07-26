@@ -1,7 +1,7 @@
 {
   "schema_version": "wb_collection_plan_v1",
   "collection_plan_id": "shevron-moscow-rostov-top100-pilot-v1",
-  "enabled": true,
+  "enabled": false,
   "query_pack_file": "config/wb/query_packs/shevron-core/2026-07-26.1.json",
   "query_ids": [
     "shevron",
