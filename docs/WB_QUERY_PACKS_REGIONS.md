@@ -156,8 +156,9 @@ The runner:
   proxy route and requests session, using secret-free per-request headers, and
   stores only a masked value plus an experiment-local salted hash;
 - sends the exact resolved value as the search `dest`;
-- derives pages from the plan depth: supported depth is `100`, `200`, `300`,
-  `400` or `500`, with exactly 100 products required per page;
+- derives pages from the plan depth: supported depth is `100..1000` in
+  100-item increments, with exactly 100 unique valid products required per
+  page;
 - uses the production-configured primary/fallback endpoint list in the same
   active-first order as `SerpEngine`; retryable production statuses may advance
   once through the remaining configured endpoints for that page, while a
@@ -170,7 +171,10 @@ The runner:
   checkpoints, plus sanitized endpoint attempt counts in the run manifest;
 - records `resolved_and_sent` only as client-side request lifecycle evidence;
 - never claims that the search server applied the destination;
-- refuses to start within five minutes of the 23:45 MSK preflight cutoff.
+- refuses to start within five minutes of the 23:45 MSK preflight cutoff;
+- for plans deeper than 500, estimates the remaining worst-case request and
+  pacing window and refuses to start when that window plus a 15-minute safety
+  reserve would overlap the nightly 00:15 MSK collection.
 
 All outputs remain under:
 
@@ -179,8 +183,56 @@ data/{raw,staging,marts}/serp_scoped/{plan}/{region}/{run_id}/
 state/wb_collection_plans/{plan}/{run_id}/
 ```
 
-There is no scoped `latest` in Stage 2. The runner never writes global SERP
-latest, seller exports, global run-report latest or warehouse data.
+The production-ready manual plan is:
+
+```text
+config/wb/collection_plans/shevron-moscow-rostov-top1000-v1.json
+```
+
+It contains all 30 `shevron-core` queries in pack order, Moscow and
+Rostov-on-Don, depth 1000 (10 pages per query, 600 pages total). The tracked
+plan and both tracked regions remain disabled. Enabling or executing it needs
+separate owner authorization.
+
+Deep runs use one immutable segment per `region_id + query_id`, at most 10
+pages. Every segment has an egress check before and after its search pages.
+Within one process, a successful end check is reused as the next segment's
+start check. Across resumed processes, egress may differ; each segment must
+still be internally constant. Evidence stores only masked identities and
+run-local hashes, never a full IP.
+
+Pages are first written below `pending_segments`. Only after the segment end
+check succeeds does an immutable segment record authorize idempotent promotion
+to canonical raw/checkpoint paths. An interrupted segment is not reusable and
+is recollected in full, limiting automatic repetition to one query (10 pages).
+Confirmed segments are validated by exact source/effective hashes, metadata
+and raw/checkpoint checksums before reuse.
+
+Resume is explicit and keeps the original run identity:
+
+```bash
+scripts/run_wb_collection_plan.sh \
+  --config config/config.yaml \
+  --plan-file config/wb/collection_plans/shevron-moscow-rostov-top1000-v1.json \
+  --no-publish \
+  --resume-run-id YYYYMMDD_HHMMSSZ
+```
+
+Final CSV files are rebuilt deterministically in plan/region/query/page order
+from confirmed canonical pages. The plan-level scoped latest pointer is:
+
+```text
+state/wb_collection_plans/{plan}/latest.json
+```
+
+It atomically references two immutable region manifests under
+`latest_generations/{run_id}/`. Consumers must resolve the plan pointer first;
+partially written generation files are not visible. The pointer changes only
+after the whole plan and both regions are complete. Failure, partial result or
+interruption leaves the previous pointer unchanged.
+
+The runner never writes global SERP latest, seller exports, global run-report
+latest or warehouse data.
 
 The selected region or region set, query IDs and depth come only from the
 versioned collection plan. The query text comes only from its versioned query
@@ -202,7 +254,7 @@ Loaders reject:
 - enabled plans referencing disabled packs, queries, categories or regions;
 - external, non-canonical or symlinked bundle source paths;
 - unsafe query-pack paths;
-- depth outside `100..500` in 100-item increments, a mismatched expected page
+- depth outside `100..1000` in 100-item increments, a mismatched expected page
   count, or unsafe publication/sellers/rotation modes;
 - non-null destination observations in tracked Stage 1 region config;
 - unsafe destination IDs, non-UTC/non-RFC-3339 timestamps and duplicate

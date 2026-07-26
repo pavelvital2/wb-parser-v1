@@ -25,6 +25,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan-file", required=True)
     parser.add_argument("--no-publish", action="store_true", required=True)
     parser.add_argument("--guarded-pilot", action="store_true")
+    parser.add_argument(
+        "--resume-run-id",
+        help="Resume one existing deep scoped run after immutable validation",
+    )
     return parser
 
 
@@ -36,6 +40,10 @@ def main() -> int:
         if not plan_path.is_absolute():
             plan_path = config.project_root / plan_path
         if args.guarded_pilot:
+            if args.resume_run_id:
+                raise CollectionPlanValidationError(
+                    "--resume-run-id is not supported for guarded pilot"
+                )
             manifest = run_guarded_regional_pilot(
                 config=config,
                 plan_path=plan_path,
@@ -47,6 +55,7 @@ def main() -> int:
                 config=config,
                 plan_path=plan_path,
                 no_publish=args.no_publish,
+                resume_run_id=args.resume_run_id,
             )
     except (
         CriticalPipelineError,

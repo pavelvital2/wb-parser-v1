@@ -346,6 +346,17 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   remain under `serp_scoped` and never publish global latest, sellers input,
   run-report latest or Warehouse. Tracked regional plans and regions remain
   disabled until a separate owner-approved enable change.
+- The manual production-size regional plan
+  `config/wb/collection_plans/shevron-moscow-rostov-top1000-v1.json` remains
+  disabled by default and covers all 30 `shevron-core` queries for Moscow and
+  Rostov-on-Don at depth 1000 (600 pages). Deep resume is explicit through
+  `--resume-run-id`; one verified segment is one query in one region (at most
+  10 pages), with masked/hash-only egress checks at both boundaries. Never
+  reuse an unfinished segment. Scoped latest is exposed only through the
+  atomic plan pointer under
+  `state/wb_collection_plans/{plan}/latest.json`, referencing immutable
+  manifests for both complete regions. It must never affect global latest,
+  sellers, run reports or Warehouse.
 - Keep `validation.max_error_ratio.serp` at `0.05` for production-like runs.
   Partial SERP above this threshold must not publish `latest` outputs or
   downstream seller exports.

@@ -67,6 +67,17 @@ def test_scoped_paths_match_the_approved_layout(tmp_path: Path) -> None:
     )
     assert paths.effective_plan_path == paths.state_run_dir / "effective_plan.json"
     assert paths.manifest_path == paths.state_run_dir / "manifest.json"
+    assert paths.latest_path == (
+        tmp_path / "state/wb_collection_plans" / PLAN_ID / "latest.json"
+    )
+    assert paths.latest_region_manifest_path("moscow") == (
+        tmp_path
+        / "state/wb_collection_plans"
+        / PLAN_ID
+        / "latest_generations"
+        / RUN_ID
+        / "moscow.json"
+    )
     assert task.checkpoint_key == (
         "shevron-moscow-rostov-top100-pilot-v1|"
         "2026-07-26.1|moscow|shevron|1"

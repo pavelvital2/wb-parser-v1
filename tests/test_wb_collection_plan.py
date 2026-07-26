@@ -557,7 +557,10 @@ def test_effective_plan_hash_is_canonical_and_secret_free(tmp_path: Path) -> Non
         canonical_effective_plan_sha256(changed)
 
 
-@pytest.mark.parametrize("depth", [100, 200, 300, 400, 500])
+@pytest.mark.parametrize(
+    "depth",
+    [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000],
+)
 def test_collection_plan_accepts_page_aligned_depths(
     tmp_path: Path,
     depth: int,
@@ -573,6 +576,33 @@ def test_collection_plan_accepts_page_aligned_depths(
 
     assert loaded.depth == depth
     assert loaded.quality.expected_pages_per_query == depth // 100
+
+
+def test_tracked_top1000_plan_covers_exact_pack_order_and_600_pages() -> None:
+    bundle = load_collection_plan_bundle(
+        project_root=PROJECT_ROOT,
+        plan_path=(
+            PROJECT_ROOT
+            / "config/wb/collection_plans/"
+            "shevron-moscow-rostov-top1000-v1.json"
+        ),
+        region_registry_path=PROJECT_ROOT / REGIONS_RELATIVE,
+    )
+
+    assert bundle.collection_plan.enabled is False
+    assert bundle.collection_plan.depth == 1000
+    assert bundle.collection_plan.region_set == ("moscow", "rostov-on-don")
+    assert bundle.collection_plan.query_ids == tuple(
+        query.query_id for query in bundle.query_pack.queries
+    )
+    assert len(bundle.collection_plan.query_ids) == 30
+    assert bundle.collection_plan.quality.expected_pages_per_query == 10
+    assert (
+        len(bundle.collection_plan.region_set)
+        * len(bundle.collection_plan.query_ids)
+        * bundle.collection_plan.quality.expected_pages_per_query
+        == 600
+    )
 
 
 def test_collection_plan_rejects_depth_page_count_mismatch(tmp_path: Path) -> None:

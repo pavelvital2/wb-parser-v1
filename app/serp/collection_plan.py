@@ -20,7 +20,7 @@ EFFECTIVE_PLAN_SCHEMA_VERSION = "wb_effective_collection_plan_v1"
 PROVENANCE_SCHEMA_VERSION = "wb_query_pack_provenance_v1"
 
 PAGE_SIZE = 100
-SUPPORTED_DEPTHS = frozenset(range(PAGE_SIZE, 501, PAGE_SIZE))
+SUPPORTED_DEPTHS = frozenset(range(PAGE_SIZE, 1001, PAGE_SIZE))
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
