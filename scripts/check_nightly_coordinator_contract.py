@@ -335,6 +335,16 @@ def _validate_sources() -> list[dict[str, str]]:
         or "_published_target_matches(" not in durable_source
         or "publication_durable" not in durable_source
         or "durable atomic publication has cleanup debt" not in durable_source
+        or 'CLEANUP_DEBT_SCHEMA_VERSION = "wb_durable_cleanup_debt_v1"'
+        not in durable_source
+        or "CLEANUP_DEBT_LIMIT = 3" not in durable_source
+        or "class DurableAtomicResult" not in durable_source
+        or "class _CleanupDebtManager" not in durable_source
+        or "cleanup_debt_count" not in durable_source
+        or "durable cleanup debt limit reached" not in durable_source
+        or "_wb_cleanup_debt_validate_lease" not in attestation_source
+        or "publication_gate = integrity_gate(PROJECT_ROOT, parent_env)"
+        not in adapter_python_source
         or "require_absent=True" not in coordinator_source
         or "integrity_gate=integrity_gate" not in coordinator_source
         or "integrity_gate=integrity_gate" not in scoped_source

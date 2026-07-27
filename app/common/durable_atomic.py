@@ -1,21 +1,78 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import stat
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 
 IntegrityGate = Callable[[], None]
 WriteEventHook = Callable[[str, Path], None]
 LOGGER = logging.getLogger(__name__)
+CLEANUP_DEBT_SCHEMA_VERSION = "wb_durable_cleanup_debt_v1"
+CLEANUP_DEBT_LIMIT = 3
+CLEANUP_DEBT_DIRECTORY = Path("state/wb_durable_cleanup_debt")
+_MARKER_PREFIX = ".wb-durable-debt-v1."
+_MARKER_SUFFIX = ".json"
+_BACKUP_PREFIX = ".wb-rollback-v1."
+_BACKUP_SUFFIX = ".debt"
+_MAX_MARKER_BYTES = 16 * 1024
 
 
 class DurableAtomicWriteError(RuntimeError):
     pass
+
+
+class DurableCleanupDebtError(DurableAtomicWriteError):
+    pass
+
+
+@dataclass(frozen=True)
+class DurableAtomicResult:
+    sha256: str
+    cleanup_debt_count: int
+    cleanup_debt_limit: int
+    cleanup_debt_swept: int
+    cleanup_debt_status: str
+
+
+@dataclass(frozen=True)
+class _CleanupDebtRecord:
+    marker_id: str
+    marker_name: str
+    backup_name: str
+    payload: dict[str, object]
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_json(payload: Mapping[str, object]) -> bytes:
+    return (
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _strict_sha256(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise DurableCleanupDebtError("cleanup debt metadata is invalid")
+    return value
 
 
 def _directory_fd(path: Path) -> int:
@@ -178,6 +235,650 @@ def _read_open_fd(
     return payload, after
 
 
+def _hash_named_file(
+    directory_fd: int,
+    name: str,
+    *,
+    allowed_links: tuple[int, ...],
+    max_bytes: int,
+) -> tuple[str, os.stat_result]:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_mode & 0o002
+            or before.st_nlink not in allowed_links
+            or before.st_size > max_bytes
+        ):
+            raise DurableCleanupDebtError(
+                "cleanup debt file proof failed"
+            )
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < before.st_size:
+            chunk = os.pread(
+                fd,
+                min(1024 * 1024, before.st_size - offset),
+                offset,
+            )
+            if not chunk:
+                raise DurableCleanupDebtError(
+                    "cleanup debt file proof failed"
+                )
+            digest.update(chunk)
+            offset += len(chunk)
+        if os.pread(fd, 1, before.st_size):
+            raise DurableCleanupDebtError(
+                "cleanup debt file proof failed"
+            )
+        after = os.fstat(fd)
+        if _identity(before) != _identity(after):
+            raise DurableCleanupDebtError(
+                "cleanup debt file changed during proof"
+            )
+        return digest.hexdigest(), after
+    finally:
+        os.close(fd)
+
+
+class _CleanupDebtManager:
+    def __init__(
+        self,
+        project_root: Path,
+        lease_validator: IntegrityGate,
+    ) -> None:
+        self.project_root = project_root.resolve(strict=True)
+        self.lease_validator = lease_validator
+        self.registry_path = self.project_root / CLEANUP_DEBT_DIRECTORY
+
+    def _validate_lease(self) -> None:
+        try:
+            self.lease_validator()
+        except BaseException as exc:
+            raise DurableCleanupDebtError(
+                "cleanup debt requires verified host lease"
+            ) from exc
+
+    def _registry_fd(self, *, create: bool) -> int | None:
+        self._validate_lease()
+        state_path = self.project_root / "state"
+        root_fd = _directory_fd(self.project_root)
+        try:
+            try:
+                state_info = os.stat(
+                    "state",
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                if not create:
+                    return None
+                os.mkdir("state", 0o700, dir_fd=root_fd)
+                os.fsync(root_fd)
+                state_info = os.stat(
+                    "state",
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+            if (
+                not stat.S_ISDIR(state_info.st_mode)
+                or state_info.st_uid != os.geteuid()
+                or state_info.st_mode & 0o002
+            ):
+                raise DurableCleanupDebtError(
+                    "cleanup debt state directory is unsafe"
+                )
+        finally:
+            os.close(root_fd)
+        state_fd = _directory_fd(state_path)
+        try:
+            try:
+                registry_info = os.stat(
+                    self.registry_path.name,
+                    dir_fd=state_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                if not create:
+                    return None
+                os.mkdir(
+                    self.registry_path.name,
+                    0o700,
+                    dir_fd=state_fd,
+                )
+                os.fsync(state_fd)
+                registry_info = os.stat(
+                    self.registry_path.name,
+                    dir_fd=state_fd,
+                    follow_symlinks=False,
+                )
+            if (
+                not stat.S_ISDIR(registry_info.st_mode)
+                or registry_info.st_uid != os.geteuid()
+                or stat.S_IMODE(registry_info.st_mode) != 0o700
+            ):
+                raise DurableCleanupDebtError(
+                    "cleanup debt registry is unsafe"
+                )
+        finally:
+            os.close(state_fd)
+        return _directory_fd(self.registry_path)
+
+    @staticmethod
+    def _marker_name(marker_id: str) -> str:
+        if (
+            len(marker_id) != 32
+            or any(character not in "0123456789abcdef" for character in marker_id)
+        ):
+            raise DurableCleanupDebtError(
+                "cleanup debt marker id is invalid"
+            )
+        return f"{_MARKER_PREFIX}{marker_id}{_MARKER_SUFFIX}"
+
+    @staticmethod
+    def _validated_marker_name(name: str) -> str:
+        if not name.startswith(_MARKER_PREFIX) or not name.endswith(
+            _MARKER_SUFFIX
+        ):
+            raise DurableCleanupDebtError(
+                "cleanup debt registry contains unknown entry"
+            )
+        marker_id = name[
+            len(_MARKER_PREFIX) : -len(_MARKER_SUFFIX)
+        ]
+        if _CleanupDebtManager._marker_name(marker_id) != name:
+            raise DurableCleanupDebtError(
+                "cleanup debt marker name is invalid"
+            )
+        return marker_id
+
+    @staticmethod
+    def _identity_payload(info: os.stat_result, digest: str) -> dict[str, object]:
+        return {
+            "device": int(info.st_dev),
+            "inode": int(info.st_ino),
+            "uid": int(info.st_uid),
+            "gid": int(info.st_gid),
+            "mode": stat.S_IMODE(info.st_mode),
+            "size": int(info.st_size),
+            "sha256": digest,
+        }
+
+    @staticmethod
+    def _validate_identity_payload(value: object) -> dict[str, object]:
+        if not isinstance(value, dict) or set(value) != {
+            "device",
+            "inode",
+            "uid",
+            "gid",
+            "mode",
+            "size",
+            "sha256",
+        }:
+            raise DurableCleanupDebtError(
+                "cleanup debt identity is invalid"
+            )
+        for key in ("device", "inode", "uid", "gid", "mode", "size"):
+            item = value[key]
+            if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+                raise DurableCleanupDebtError(
+                    "cleanup debt identity is invalid"
+                )
+        _strict_sha256(value["sha256"])
+        return value
+
+    def _encode_marker(self, payload: dict[str, object]) -> bytes:
+        unsigned = dict(payload)
+        unsigned.pop("marker_sha256", None)
+        payload["marker_sha256"] = _sha256_bytes(_canonical_json(unsigned))
+        return _canonical_json(payload)
+
+    def _decode_marker(
+        self,
+        registry_fd: int,
+        name: str,
+    ) -> _CleanupDebtRecord:
+        marker_id = self._validated_marker_name(name)
+        raw, info = _read_target(
+            registry_fd,
+            name,
+            max_bytes=_MAX_MARKER_BYTES,
+        )
+        if (
+            stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            raise DurableCleanupDebtError(
+                "cleanup debt marker is unsafe"
+            )
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DurableCleanupDebtError(
+                "cleanup debt marker is invalid"
+            ) from exc
+        expected_keys = {
+            "schema_version",
+            "marker_id",
+            "target_parent",
+            "target_name",
+            "target_name_sha256",
+            "backup_name",
+            "parent_device",
+            "parent_inode",
+            "prior",
+            "candidate",
+            "marker_sha256",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected_keys:
+            raise DurableCleanupDebtError(
+                "cleanup debt marker is invalid"
+            )
+        if (
+            payload["schema_version"] != CLEANUP_DEBT_SCHEMA_VERSION
+            or payload["marker_id"] != marker_id
+            or not isinstance(payload["target_parent"], str)
+            or not Path(payload["target_parent"]).is_absolute()
+            or not isinstance(payload["target_name"], str)
+            or payload["target_name"] in {"", ".", ".."}
+            or "/" in payload["target_name"]
+            or _strict_sha256(payload["target_name_sha256"])
+            != _sha256_bytes(payload["target_name"].encode("utf-8"))
+            or not isinstance(payload["backup_name"], str)
+            or payload["backup_name"]
+            != (
+                f"{_BACKUP_PREFIX}{marker_id}."
+                f"{payload['target_name_sha256'][:16]}."
+                f"{payload['prior']['sha256']}{_BACKUP_SUFFIX}"
+            )
+        ):
+            raise DurableCleanupDebtError(
+                "cleanup debt marker is invalid"
+            )
+        for key in ("parent_device", "parent_inode"):
+            value = payload[key]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise DurableCleanupDebtError(
+                    "cleanup debt marker is invalid"
+                )
+        self._validate_identity_payload(payload["prior"])
+        self._validate_identity_payload(payload["candidate"])
+        marker_sha = _strict_sha256(payload["marker_sha256"])
+        unsigned = dict(payload)
+        unsigned.pop("marker_sha256")
+        if marker_sha != _sha256_bytes(_canonical_json(unsigned)):
+            raise DurableCleanupDebtError(
+                "cleanup debt marker hash mismatch"
+            )
+        if raw != _canonical_json(payload):
+            raise DurableCleanupDebtError(
+                "cleanup debt marker is not canonical"
+            )
+        return _CleanupDebtRecord(
+            marker_id=marker_id,
+            marker_name=name,
+            backup_name=str(payload["backup_name"]),
+            payload=payload,
+        )
+
+    def _write_marker(self, record: _CleanupDebtRecord) -> None:
+        registry_fd = self._registry_fd(create=True)
+        assert registry_fd is not None
+        temp_name = f".{record.marker_name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        fd = -1
+        created = False
+        try:
+            if os.stat(
+                record.marker_name,
+                dir_fd=registry_fd,
+                follow_symlinks=False,
+            ):
+                raise DurableCleanupDebtError(
+                    "cleanup debt marker already exists"
+                )
+        except FileNotFoundError:
+            pass
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(temp_name, flags, 0o600, dir_fd=registry_fd)
+            created = True
+            raw = self._encode_marker(record.payload)
+            view = memoryview(raw)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise DurableCleanupDebtError(
+                        "cleanup debt marker write made no progress"
+                    )
+                view = view[written:]
+            os.fsync(fd)
+            os.rename(
+                temp_name,
+                record.marker_name,
+                src_dir_fd=registry_fd,
+                dst_dir_fd=registry_fd,
+            )
+            created = False
+            os.fsync(registry_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if created:
+                try:
+                    os.unlink(temp_name, dir_fd=registry_fd)
+                except FileNotFoundError:
+                    pass
+            os.close(registry_fd)
+
+    def register(
+        self,
+        *,
+        target: Path,
+        parent_info: os.stat_result,
+        prior_info: os.stat_result,
+        prior_sha256: str,
+        candidate_sha256: str,
+        candidate_size: int,
+        candidate_mode: int,
+        candidate_gid: int,
+    ) -> _CleanupDebtRecord:
+        self._validate_lease()
+        target_parent = target.parent.resolve(strict=True)
+        if (
+            target_parent != self.project_root
+            and self.project_root not in target_parent.parents
+            and target_parent
+            != Path("/var/lib/parser-nightly-coordinator/results")
+        ):
+            raise DurableCleanupDebtError(
+                "cleanup debt target is outside approved roots"
+            )
+        marker_id = uuid.uuid4().hex
+        target_name_sha = _sha256_bytes(target.name.encode("utf-8"))
+        backup_name = (
+            f"{_BACKUP_PREFIX}{marker_id}.{target_name_sha[:16]}."
+            f"{prior_sha256}{_BACKUP_SUFFIX}"
+        )
+        payload: dict[str, object] = {
+            "schema_version": CLEANUP_DEBT_SCHEMA_VERSION,
+            "marker_id": marker_id,
+            "target_parent": str(target_parent),
+            "target_name": target.name,
+            "target_name_sha256": target_name_sha,
+            "backup_name": backup_name,
+            "parent_device": int(parent_info.st_dev),
+            "parent_inode": int(parent_info.st_ino),
+            "prior": self._identity_payload(prior_info, prior_sha256),
+            "candidate": {
+                "device": 0,
+                "inode": 0,
+                "uid": os.geteuid(),
+                "gid": candidate_gid,
+                "mode": candidate_mode,
+                "size": candidate_size,
+                "sha256": candidate_sha256,
+            },
+        }
+        record = _CleanupDebtRecord(
+            marker_id=marker_id,
+            marker_name=self._marker_name(marker_id),
+            backup_name=backup_name,
+            payload=payload,
+        )
+        self._write_marker(record)
+        return record
+
+    @staticmethod
+    def _matches_payload(
+        info: os.stat_result,
+        digest: str,
+        expected: Mapping[str, object],
+    ) -> bool:
+        return bool(
+            info.st_dev == expected["device"]
+            and info.st_ino == expected["inode"]
+            and info.st_uid == expected["uid"]
+            and info.st_gid == expected["gid"]
+            and stat.S_IMODE(info.st_mode) == expected["mode"]
+            and info.st_size == expected["size"]
+            and digest == expected["sha256"]
+        )
+
+    def _remove_marker(
+        self,
+        registry_fd: int,
+        record: _CleanupDebtRecord,
+    ) -> bool:
+        try:
+            os.unlink(record.marker_name, dir_fd=registry_fd)
+            os.fsync(registry_fd)
+        except OSError:
+            LOGGER.warning("durable cleanup debt marker cleanup deferred")
+            return False
+        return True
+
+    def _sweep_record(
+        self,
+        registry_fd: int,
+        record: _CleanupDebtRecord,
+    ) -> bool:
+        self._validate_lease()
+        payload = record.payload
+        parent_path = Path(str(payload["target_parent"]))
+        parent_fd = _directory_fd(parent_path)
+        try:
+            parent_info = os.fstat(parent_fd)
+            if (
+                parent_info.st_dev != payload["parent_device"]
+                or parent_info.st_ino != payload["parent_inode"]
+            ):
+                raise DurableCleanupDebtError(
+                    "cleanup debt parent identity changed"
+                )
+            try:
+                backup_info = os.stat(
+                    record.backup_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                backup_info = None
+            try:
+                target_info = os.stat(
+                    str(payload["target_name"]),
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                target_info = None
+            if target_info is not None and (
+                not stat.S_ISREG(target_info.st_mode)
+                or target_info.st_uid != os.geteuid()
+                or target_info.st_mode & 0o002
+                or target_info.st_nlink not in (1, 2)
+            ):
+                raise DurableCleanupDebtError(
+                    "cleanup debt target proof failed"
+                )
+            target_digest = ""
+            if target_info is not None:
+                target_digest, target_info = _hash_named_file(
+                    parent_fd,
+                    str(payload["target_name"]),
+                    allowed_links=(1, 2),
+                    max_bytes=max(
+                        int(payload["prior"]["size"]),
+                        int(payload["candidate"]["size"]),
+                    ),
+                )
+            if backup_info is None:
+                if target_info is None or not (
+                    self._matches_payload(
+                        target_info,
+                        target_digest,
+                        payload["prior"],
+                    )
+                    or (
+                        target_info.st_uid == payload["candidate"]["uid"]
+                        and target_info.st_gid == payload["candidate"]["gid"]
+                        and stat.S_IMODE(target_info.st_mode)
+                        == payload["candidate"]["mode"]
+                        and target_info.st_size
+                        == payload["candidate"]["size"]
+                        and target_digest
+                        == payload["candidate"]["sha256"]
+                    )
+                ):
+                    raise DurableCleanupDebtError(
+                        "cleanup debt without backup is unprovable"
+                    )
+                try:
+                    os.fsync(parent_fd)
+                except OSError:
+                    LOGGER.warning(
+                        "durable cleanup debt directory sync deferred"
+                    )
+                    return False
+            else:
+                backup_digest, backup_info = _hash_named_file(
+                    parent_fd,
+                    record.backup_name,
+                    allowed_links=(1, 2),
+                    max_bytes=int(payload["prior"]["size"]),
+                )
+                if not self._matches_payload(
+                    backup_info,
+                    backup_digest,
+                    payload["prior"],
+                ):
+                    raise DurableCleanupDebtError(
+                        "cleanup debt backup proof failed"
+                    )
+                if backup_info.st_nlink == 2 and (
+                    target_info is None
+                    or not _same_inode(target_info, backup_info)
+                    or not self._matches_payload(
+                        target_info,
+                        target_digest,
+                        payload["prior"],
+                    )
+                ):
+                    raise DurableCleanupDebtError(
+                        "cleanup debt hardlink proof failed"
+                    )
+                try:
+                    os.unlink(record.backup_name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                except OSError:
+                    LOGGER.warning(
+                        "durable cleanup debt sweep deferred"
+                    )
+                    return False
+        finally:
+            os.close(parent_fd)
+        return self._remove_marker(registry_fd, record)
+
+    def sweep(self) -> tuple[int, int]:
+        registry_fd = self._registry_fd(create=False)
+        if registry_fd is None:
+            return 0, 0
+        swept = 0
+        try:
+            names = sorted(os.listdir(registry_fd))
+            records = [
+                self._decode_marker(registry_fd, name)
+                for name in names
+            ]
+            for record in records:
+                if self._sweep_record(registry_fd, record):
+                    swept += 1
+            remaining = len(os.listdir(registry_fd))
+            for name in os.listdir(registry_fd):
+                self._decode_marker(registry_fd, name)
+            return remaining, swept
+        finally:
+            os.close(registry_fd)
+
+    def discard_marker(self, record: _CleanupDebtRecord) -> bool:
+        registry_fd = self._registry_fd(create=False)
+        if registry_fd is None:
+            return True
+        try:
+            current = self._decode_marker(
+                registry_fd,
+                record.marker_name,
+            )
+            if current.payload != record.payload:
+                raise DurableCleanupDebtError(
+                    "cleanup debt marker changed"
+                )
+            return self._remove_marker(registry_fd, record)
+        except FileNotFoundError:
+            return True
+        finally:
+            os.close(registry_fd)
+
+
+def _cleanup_debt_manager(
+    integrity_gate: IntegrityGate | None,
+) -> _CleanupDebtManager | None:
+    if integrity_gate is None or not bool(
+        getattr(integrity_gate, "_wb_cleanup_debt_enabled", False)
+    ):
+        return None
+    project_root = getattr(
+        integrity_gate,
+        "_wb_cleanup_debt_project_root",
+        None,
+    )
+    lease_validator = getattr(
+        integrity_gate,
+        "_wb_cleanup_debt_validate_lease",
+        None,
+    )
+    if not isinstance(project_root, Path) or not callable(lease_validator):
+        raise DurableCleanupDebtError(
+            "cleanup debt integrity gate metadata is invalid"
+        )
+    return _CleanupDebtManager(project_root, lease_validator)
+
+
+def inspect_cleanup_debt(
+    project_root: Path,
+    *,
+    lease_validator: IntegrityGate,
+) -> dict[str, int | str]:
+    manager = _CleanupDebtManager(project_root, lease_validator)
+    registry_fd = manager._registry_fd(create=False)
+    if registry_fd is None:
+        return {
+            "schema_version": CLEANUP_DEBT_SCHEMA_VERSION,
+            "count": 0,
+            "limit": CLEANUP_DEBT_LIMIT,
+            "status": "clear",
+        }
+    try:
+        names = os.listdir(registry_fd)
+        for name in names:
+            manager._decode_marker(registry_fd, name)
+    finally:
+        os.close(registry_fd)
+    count = len(names)
+    return {
+        "schema_version": CLEANUP_DEBT_SCHEMA_VERSION,
+        "count": count,
+        "limit": CLEANUP_DEBT_LIMIT,
+        "status": "blocked" if count >= CLEANUP_DEBT_LIMIT else "tracked",
+    }
+
+
 def _verify_open_path(
     directory_fd: int,
     name: str,
@@ -266,7 +967,7 @@ def durable_atomic_replace(
     integrity_gate: IntegrityGate | None = None,
     event_hook: WriteEventHook | None = None,
     source_integrity_gate: IntegrityGate | None = None,
-) -> str:
+) -> DurableAtomicResult:
     if (
         not path.is_absolute()
         or path.name in {"", ".", ".."}
@@ -275,10 +976,21 @@ def durable_atomic_replace(
         raise DurableAtomicWriteError("atomic target is invalid")
     directory_fd = _directory_fd(path.parent)
     directory_info = os.fstat(directory_fd)
+    debt_manager = _cleanup_debt_manager(integrity_gate)
+    debt_count = 0
+    debt_swept = 0
+    if debt_manager is not None:
+        debt_count, debt_swept = debt_manager.sweep()
+        if debt_count >= CLEANUP_DEBT_LIMIT:
+            os.close(directory_fd)
+            raise DurableCleanupDebtError(
+                "durable cleanup debt limit reached"
+            )
     temp_name = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     backup_name = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.rollback"
     temp_created = False
     backup_created = False
+    debt_record: _CleanupDebtRecord | None = None
     renamed = False
     publication_durable = False
     temp_fd = -1
@@ -367,6 +1079,28 @@ def durable_atomic_replace(
             expected_payload=payload,
         )
         if initial is not None:
+            if debt_manager is not None:
+                prior_sha256, prior_info = _hash_named_file(
+                    directory_fd,
+                    path.name,
+                    allowed_links=(1,),
+                    max_bytes=initial.st_size,
+                )
+                if _identity(prior_info) != _identity(initial):
+                    raise DurableAtomicWriteError(
+                        "atomic target changed before debt registration"
+                    )
+                debt_record = debt_manager.register(
+                    target=path,
+                    parent_info=directory_info,
+                    prior_info=prior_info,
+                    prior_sha256=prior_sha256,
+                    candidate_sha256=_sha256_bytes(payload),
+                    candidate_size=len(payload),
+                    candidate_mode=mode,
+                    candidate_gid=temp_info.st_gid,
+                )
+                backup_name = debt_record.backup_name
             os.link(
                 path.name,
                 backup_name,
@@ -469,14 +1203,41 @@ def durable_atomic_replace(
                 "atomic target changed after proof"
             )
         publication_durable = True
+        cleanup_ok = True
         if backup_created:
-            backup_created = not _cleanup_backup(
+            cleanup_ok = _cleanup_backup(
                 directory_fd,
                 backup_name,
                 event_hook=event_hook,
                 path=path,
             )
-        return hashlib.sha256(payload).hexdigest()
+            backup_created = not cleanup_ok
+        if (
+            debt_manager is not None
+            and debt_record is not None
+            and cleanup_ok
+        ):
+            cleanup_ok = debt_manager.discard_marker(debt_record)
+            if cleanup_ok:
+                debt_record = None
+        if debt_manager is not None:
+            debt_count, swept_now = debt_manager.sweep()
+            debt_swept += swept_now
+            if debt_count >= CLEANUP_DEBT_LIMIT:
+                raise DurableCleanupDebtError(
+                    "durable cleanup debt limit reached after commit"
+                )
+        else:
+            debt_count = 0 if cleanup_ok else 1
+        return DurableAtomicResult(
+            sha256=_sha256_bytes(payload),
+            cleanup_debt_count=debt_count,
+            cleanup_debt_limit=CLEANUP_DEBT_LIMIT,
+            cleanup_debt_swept=debt_swept,
+            cleanup_debt_status=(
+                "clear" if debt_count == 0 else "tracked"
+            ),
+        )
     except BaseException:
         rollback_error: BaseException | None = None
         if (
@@ -517,13 +1278,21 @@ def durable_atomic_replace(
                     os.fsync(directory_fd)
             except BaseException as exc:
                 rollback_error = exc
-        if backup_created:
+        if backup_created and not publication_durable:
             backup_created = not _cleanup_backup(
                 directory_fd,
                 backup_name,
                 event_hook=None,
                 path=path,
             )
+        if (
+            debt_manager is not None
+            and debt_record is not None
+            and not publication_durable
+            and not backup_created
+        ):
+            if debt_manager.discard_marker(debt_record):
+                debt_record = None
         if rollback_error is not None:
             raise DurableAtomicWriteError(
                 "atomic publication rollback failed"
@@ -548,7 +1317,7 @@ def durable_atomic_copy(
     integrity_gate: IntegrityGate | None = None,
     event_hook: WriteEventHook | None = None,
     max_bytes: int = 512 * 1024 * 1024,
-) -> str:
+) -> DurableAtomicResult:
     if (
         not source_path.is_absolute()
         or source_path.name in {"", ".", ".."}

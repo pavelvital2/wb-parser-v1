@@ -540,11 +540,31 @@ def integrity_gate(
     environment: Mapping[str, str] | None = None,
 ) -> Callable[[], None]:
     env = environment if environment is not None else os.environ
-    if MANIFEST_SHA_ENV not in env and RUNTIME_SHA_ENV not in env:
-        return lambda: None
-
     def verify() -> None:
-        verify_attested_environment(project_root, env)
+        if MANIFEST_SHA_ENV in env or RUNTIME_SHA_ENV in env:
+            verify_attested_environment(project_root, env)
 
     verify()
+    lock_v3_present = any(
+        key.startswith("PARSER_WB_LOCK_V3_") for key in env
+    )
+    if lock_v3_present:
+        def validate_lease() -> None:
+            from app.common.nightly_coordinator import (
+                validate_descendant_marketplace_lease,
+            )
+
+            validate_descendant_marketplace_lease(environment=env)
+
+        setattr(verify, "_wb_cleanup_debt_enabled", True)
+        setattr(
+            verify,
+            "_wb_cleanup_debt_project_root",
+            project_root.resolve(strict=True),
+        )
+        setattr(
+            verify,
+            "_wb_cleanup_debt_validate_lease",
+            validate_lease,
+        )
     return verify

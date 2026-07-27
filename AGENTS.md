@@ -102,6 +102,10 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   copies, seller exports, run reports, WB warehouse manifests, and warehouse
   refresh state. Tracked/runtime/dependency inputs that influence coordinator
   execution must be owner-controlled and neither group- nor world-writable.
+  Rollback cleanup debt is global across official writers and lease-protected
+  in `state/wb_durable_cleanup_debt`; only canonical, owner-controlled,
+  inode/hash-proven markers may be swept. The reviewed limit is `3`, and
+  reaching it fails closed before another trusted publication.
   The activation checker is executed directly with its absolute approved-Python
   shebang; do not replace it with `/usr/bin/env python3`.
 - Before changing WB proxy/cookie/header runtime or processing a fresh browser

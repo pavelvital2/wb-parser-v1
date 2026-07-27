@@ -185,11 +185,30 @@ target is still the exact inode and bytes published by that writer. A later
 cooperative writer is never overwritten by compensation from an earlier
 writer. Backup cleanup happens after durable success; an unlink or
 cleanup-fsync failure is reported as maintenance debt and does not turn an
-already durable commit into a false publication failure. A failed pre-commit
-check or partial temporary write cannot replace the prior publication. The
-stricter no-group-write rule applies to influencing inputs; existing runtime
-outputs created under the host `umask 0002` are safely replaced with
-writer-selected modes.
+already durable commit into a false publication failure.
+
+All official durable writers account for rollback cleanup debt in the
+lease-protected registry `state/wb_durable_cleanup_debt`. The
+`wb_durable_cleanup_debt_v1` marker is created and fsynced before its rollback
+hardlink. Recovery enumerates only this exact registry and removes a backup
+only after canonical marker, owner, type, mode, link count, parent inode,
+target identity, backup inode and content-hash proofs pass. Unknown entries,
+symlinks, changed ownership or unprovable metadata fail closed and are never
+deleted. The global limit is `3`: one or two proven but temporarily
+uncleanable entries are returned as explicit cleanup debt, while the third
+entry prevents a trusted success and later publications fail before commit
+until a verified lease-holder can sweep the proven debt. This bounds debt
+across latest files, run reports, scoped state, warehouse state and terminal
+coordinator results rather than per target name. A cleanup failure after a
+durable commit does not roll that commit back; it changes the writer result to
+tracked debt or, at the limit, a fail-closed outcome. The coordinator checker
+pins this schema and threshold, and terminal publication runs the same debt
+preflight under the inherited host lease.
+
+A failed pre-commit check or partial temporary write cannot replace the prior
+publication. The stricter no-group-write rule applies to influencing inputs;
+existing runtime outputs created under the host `umask 0002` are safely
+replaced with writer-selected modes.
 
 ## Operational Threat Model
 

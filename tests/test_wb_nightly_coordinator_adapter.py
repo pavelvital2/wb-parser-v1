@@ -70,6 +70,20 @@ class ExitCalled(RuntimeError):
         super().__init__(str(code))
 
 
+def _cleanup_debt_gate(project_root: Path):
+    def gate() -> None:
+        return None
+
+    setattr(gate, "_wb_cleanup_debt_enabled", True)
+    setattr(
+        gate,
+        "_wb_cleanup_debt_project_root",
+        project_root.resolve(strict=True),
+    )
+    setattr(gate, "_wb_cleanup_debt_validate_lease", lambda: None)
+    return gate
+
+
 class FakeLease:
     def __init__(
         self,
@@ -1997,8 +2011,9 @@ def test_durable_writer_cas_rollback_and_cleanup_debt(
 
     monkeypatch.setattr(durable_atomic.os, "unlink", fail_backup_unlink)
     caplog.set_level("WARNING")
-    digest = durable_atomic.durable_atomic_replace(target, b"durable\n")
-    assert digest == hashlib.sha256(b"durable\n").hexdigest()
+    result = durable_atomic.durable_atomic_replace(target, b"durable\n")
+    assert result.sha256 == hashlib.sha256(b"durable\n").hexdigest()
+    assert result.cleanup_debt_count == 1
     assert target.read_bytes() == b"durable\n"
     assert "cleanup debt" in caplog.text
 
@@ -2024,10 +2039,211 @@ def test_durable_writer_cleanup_fsync_failure_is_not_publication_failure(
 
     monkeypatch.setattr(durable_atomic.os, "fsync", fail_cleanup_fsync)
     caplog.set_level("WARNING")
-    digest = durable_atomic.durable_atomic_replace(target, b"durable\n")
-    assert digest == hashlib.sha256(b"durable\n").hexdigest()
+    result = durable_atomic.durable_atomic_replace(target, b"durable\n")
+    assert result.sha256 == hashlib.sha256(b"durable\n").hexdigest()
+    assert result.cleanup_debt_count == 1
     assert target.read_bytes() == b"durable\n"
     assert "cleanup debt" in caplog.text
+
+
+def test_durable_writer_bounds_cleanup_debt_under_verified_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir(mode=0o700)
+    target = project / "latest.json"
+    target.write_bytes(b"trusted\n")
+    gate = _cleanup_debt_gate(project)
+    original_unlink = durable_atomic.os.unlink
+
+    def fail_backup_unlink(
+        path: str,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if path.startswith(".wb-rollback-v1.") and path.endswith(".debt"):
+            raise OSError("cleanup unavailable")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(durable_atomic.os, "unlink", fail_backup_unlink)
+    first = durable_atomic.durable_atomic_replace(
+        target,
+        b"first\n",
+        integrity_gate=gate,
+    )
+    second = durable_atomic.durable_atomic_replace(
+        target,
+        b"second\n",
+        integrity_gate=gate,
+    )
+    assert first.cleanup_debt_count == 1
+    assert second.cleanup_debt_count == 2
+    with pytest.raises(
+        durable_atomic.DurableCleanupDebtError,
+        match="limit reached after commit",
+    ):
+        durable_atomic.durable_atomic_replace(
+            target,
+            b"third\n",
+            integrity_gate=gate,
+        )
+    assert target.read_bytes() == b"third\n"
+    with pytest.raises(
+        durable_atomic.DurableCleanupDebtError,
+        match="limit reached",
+    ):
+        durable_atomic.durable_atomic_replace(
+            target,
+            b"must-not-commit\n",
+            integrity_gate=gate,
+        )
+    assert target.read_bytes() == b"third\n"
+    debt_dir = project / durable_atomic.CLEANUP_DEBT_DIRECTORY
+    assert len(tuple(debt_dir.iterdir())) == durable_atomic.CLEANUP_DEBT_LIMIT
+
+
+def test_durable_writer_sweeps_only_proven_cleanup_debt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir(mode=0o700)
+    target = project / "latest.json"
+    unrelated = project / ".unrelated.rollback"
+    target.write_bytes(b"trusted\n")
+    unrelated.write_bytes(b"keep\n")
+    gate = _cleanup_debt_gate(project)
+    original_unlink = durable_atomic.os.unlink
+
+    def fail_once(
+        path: str,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if path.startswith(".wb-rollback-v1.") and path.endswith(".debt"):
+            raise OSError("cleanup unavailable")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(durable_atomic.os, "unlink", fail_once)
+    first = durable_atomic.durable_atomic_replace(
+        target,
+        b"first\n",
+        integrity_gate=gate,
+    )
+    assert first.cleanup_debt_count == 1
+    monkeypatch.setattr(durable_atomic.os, "unlink", original_unlink)
+    second = durable_atomic.durable_atomic_replace(
+        target,
+        b"second\n",
+        integrity_gate=gate,
+    )
+    assert second.cleanup_debt_count == 0
+    assert second.cleanup_debt_swept == 1
+    assert unrelated.read_bytes() == b"keep\n"
+    assert not tuple(
+        (project / durable_atomic.CLEANUP_DEBT_DIRECTORY).iterdir()
+    )
+
+
+@pytest.mark.parametrize("unsafe_kind", ("unknown", "symlink", "non_owner"))
+def test_cleanup_debt_sweep_refuses_unproved_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_kind: str,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir(mode=0o700)
+    target = project / "latest.json"
+    target.write_bytes(b"trusted\n")
+    gate = _cleanup_debt_gate(project)
+    state = project / "state"
+    state.mkdir(mode=0o700)
+    debt_dir = state / "wb_durable_cleanup_debt"
+    debt_dir.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside\n")
+    if unsafe_kind == "unknown":
+        unsafe = debt_dir / "unknown"
+        unsafe.write_bytes(b"unknown\n")
+    elif unsafe_kind == "symlink":
+        unsafe = debt_dir / (
+            ".wb-durable-debt-v1." + ("a" * 32) + ".json"
+        )
+        unsafe.symlink_to(outside)
+    else:
+        unsafe = debt_dir
+        original_geteuid = durable_atomic.os.geteuid
+        monkeypatch.setattr(
+            durable_atomic.os,
+            "geteuid",
+            lambda: original_geteuid() + 1,
+        )
+    with pytest.raises(
+        (durable_atomic.DurableAtomicWriteError, OSError)
+    ):
+        durable_atomic.durable_atomic_replace(
+            target,
+            b"candidate\n",
+            integrity_gate=gate,
+        )
+    assert target.read_bytes() == b"trusted\n"
+    assert unsafe.exists() or unsafe.is_symlink()
+    assert outside.read_bytes() == b"outside\n"
+
+
+def test_durable_writer_normal_path_has_no_cleanup_debt(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir(mode=0o700)
+    target = project / "latest.json"
+    target.write_bytes(b"trusted\n")
+    result = durable_atomic.durable_atomic_replace(
+        target,
+        b"candidate\n",
+        integrity_gate=_cleanup_debt_gate(project),
+    )
+    assert result.cleanup_debt_status == "clear"
+    assert result.cleanup_debt_count == 0
+    assert not tuple(
+        (project / durable_atomic.CLEANUP_DEBT_DIRECTORY).iterdir()
+    )
+
+
+def test_cleanup_debt_contract_revalidates_inherited_host_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir(mode=0o700)
+    target = project / "latest.json"
+    target.write_bytes(b"trusted\n")
+    validations: list[dict[str, str]] = []
+    environment = {"PARSER_WB_LOCK_V3_CONTRACT": "test"}
+
+    def validate(*, environment, policy=None) -> int:
+        del policy
+        validations.append(dict(environment))
+        return 1
+
+    monkeypatch.setattr(
+        contract,
+        "validate_descendant_marketplace_lease",
+        validate,
+    )
+    gate = attestation.integrity_gate(project, environment)
+    result = durable_atomic.durable_atomic_replace(
+        target,
+        b"candidate\n",
+        integrity_gate=gate,
+    )
+    assert result.cleanup_debt_status == "clear"
+    assert len(validations) >= 3
+    assert all(
+        item == environment
+        for item in validations
+    )
 
 
 def test_durable_copy_pins_source_before_and_after_commit(

@@ -31,6 +31,7 @@ from app.common.nightly_coordinator import (
 )
 from app.common.nightly_attestation import (
     capture_attested_environment,
+    integrity_gate,
     verify_attested_environment,
     verify_input_manifest,
 )
@@ -257,7 +258,12 @@ def _run_four_region(arguments: list[str]) -> int:
     lease = acquire_marketplace_collection_lease()
     terminal_committed = False
     writing_terminal = False
-    publication_gate = lambda: verify_input_manifest(PROJECT_ROOT)
+    parent_env = {
+        **os.environ,
+        **descendant_lease_environment(lease),
+    }
+    verify_input_manifest(PROJECT_ROOT)
+    publication_gate = integrity_gate(PROJECT_ROOT, parent_env)
     try:
         invocation = lease.invocation
         _validate_four_region_command(arguments, invocation=invocation)
@@ -278,10 +284,7 @@ def _run_four_region(arguments: list[str]) -> int:
         )
         child_env.update(descendant_lease_environment(lease))
         child_env = capture_attested_environment(PROJECT_ROOT, child_env)
-        publication_gate = lambda: verify_attested_environment(
-            PROJECT_ROOT,
-            child_env,
-        )
+        publication_gate = integrity_gate(PROJECT_ROOT, child_env)
         run_ref = (
             invocation.resume_ref
             if invocation is not None and invocation.phase == "resume"
