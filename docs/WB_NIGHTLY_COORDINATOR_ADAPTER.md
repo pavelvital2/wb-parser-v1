@@ -37,7 +37,8 @@ before loading `config/runtime.env` or starting parser work:
    exposing their values;
 7. recheck the absolute deadline immediately before process creation;
 8. pass both host-lock descriptors to a Linux subreaper supervisor, which
-   retains them until the process group and adopted descendants have exited.
+   retains them until every pinned child identity and adopted descendant has
+   exited.
 
 The coordinator owns the guard lock. Its inherited validation FD is checked
 against the coordinator ancestor process, secure lock inode and kernel lock.
@@ -48,6 +49,13 @@ inode/owner/mode and quarantine state before runtime loading. The
 authority. Neither path unlinks or replaces host lock files, and lease release
 closes descriptors without issuing `LOCK_UN` on a shared open-file
 description.
+
+Every official passthrough target follows the same attestation sequence as the
+four-region target: verify the tracked manifest, load runtime with the strict
+in-process parser, capture the exact manifest/runtime digests, verify them
+immediately before supervisor spawn, and pass them unchanged to the child.
+Consequently, `integrity_gate()` is active in coordinator descendants rather
+than silently degrading to a no-op.
 
 The absolute coordinator deadline caps the existing plan deadline. It is
 passed to collection and downstream guards and never extends their local
@@ -138,6 +146,13 @@ effective `WB_COOKIE_FILE` must resolve to the canonical ignored
 cookies, headers and proxy URLs are never written to evidence. The checks
 perform no network calls.
 
+The subreaper does not use a numeric process-group ID as ownership evidence.
+It parses `/proc/<pid>/stat` after the closing command-name parenthesis, pins
+each process by `(pid, starttime)`, discovers descendants and adopted children,
+and rechecks identity before signalling, using pidfd where available. A reused
+PID or PGID therefore cannot redirect a termination signal, while the host-lock
+FDs remain held until the last owned descendant exits.
+
 The activation checker has an absolute approved-Python shebang and is invoked
 directly by the coordinator. It therefore runs with
 `PATH=/usr/bin:/bin` without selecting a different system Python. All tracked
@@ -152,12 +167,17 @@ The exact checker command is:
 Latest outputs, run reports, warehouse manifests and warehouse refresh state
 use the shared durable atomic writer. It rejects symlink ancestors/leaves,
 world-writable paths and hardlinked leaves, fsyncs the same-directory temporary
-file and containing directory, reruns input attestation inside the writer
-immediately before the atomic rename, and verifies the committed bytes. A
-failed pre-commit check or partial temporary write cannot replace the prior
-publication. The stricter no-group-write rule applies to influencing inputs;
-existing runtime outputs created under the host `umask 0002` are safely
-replaced with writer-selected modes.
+file and containing directory, retains the temporary FD through rename, and
+proves that the committed leaf is the same inode with the exact encoded bytes
+and one link. Copy publication also retains and rechecks the source FD,
+pathname identity and bytes before and after commit. Input attestation runs
+inside the writer immediately before commit and again during post-commit
+verification. A transient hardlink backup restores the prior trusted
+publication if a post-rename integrity check fails; it is removed only after a
+fully verified commit. A failed pre-commit check or partial temporary write
+cannot replace the prior publication. The stricter no-group-write rule applies
+to influencing inputs; existing runtime outputs created under the host
+`umask 0002` are safely replaced with writer-selected modes.
 
 After lock-v3 cutover, WebUI config/upload mutations require the same validated
 lease and WebUI collection actions use `scripts/run_wb_live_component.sh`.

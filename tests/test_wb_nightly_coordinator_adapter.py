@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -1169,9 +1170,71 @@ def test_supervisor_waits_for_surviving_descendant(
 
 def test_proc_stat_parser_accepts_comm_with_spaces_and_parentheses() -> None:
     assert supervisor._parse_proc_stat(
-        "4321 (worker (x) with spaces) S 123 456 456 0 -1",
+        "4321 (worker (x) with spaces) "
+        "S 123 456 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 987654",
         expected_pid=4321,
-    ) == (123, 456, "S")
+    ) == supervisor.ProcessStat(
+        ppid=123,
+        pgrp=456,
+        state="S",
+        starttime=987654,
+    )
+
+
+def test_supervisor_does_not_signal_reused_pid_or_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor_pid = 50
+    leader = supervisor.ProcessIdentity(pid=100, starttime=1000)
+    descendant = supervisor.ProcessIdentity(pid=101, starttime=1001)
+    initial = {
+        100: supervisor.ProcessStat(50, 100, "S", 1000),
+        101: supervisor.ProcessStat(100, 100, "S", 1001),
+        200: supervisor.ProcessStat(1, 100, "S", 2000),
+    }
+    owned = supervisor._refresh_owned(
+        {leader},
+        supervisor_pid=supervisor_pid,
+        baseline_children=set(),
+        table=initial,
+    )
+    assert owned == {leader, descendant}
+
+    reused = {
+        100: supervisor.ProcessStat(1, 100, "S", 9000),
+        101: supervisor.ProcessStat(50, 777, "S", 1001),
+        200: supervisor.ProcessStat(1, 100, "S", 2000),
+    }
+    owned = supervisor._refresh_owned(
+        owned,
+        supervisor_pid=supervisor_pid,
+        baseline_children=set(),
+        table=reused,
+    )
+    assert owned == {descendant}
+
+    identities = {
+        100: supervisor.ProcessIdentity(100, 9000),
+        101: descendant,
+        200: supervisor.ProcessIdentity(200, 2000),
+    }
+    signaled: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        supervisor,
+        "_current_identity",
+        lambda pid: identities.get(pid),
+    )
+    monkeypatch.setattr(supervisor.os, "pidfd_open", None)
+    monkeypatch.setattr(supervisor.signal, "pidfd_send_signal", None)
+    monkeypatch.setattr(
+        supervisor.os,
+        "kill",
+        lambda pid, signum: signaled.append((pid, signum)),
+    )
+    assert supervisor._signal_identity(descendant, signal.SIGTERM) is True
+    assert signaled == [(101, signal.SIGTERM)]
+    assert supervisor._signal_identity(leader, signal.SIGTERM) is False
+    assert signaled == [(101, signal.SIGTERM)]
 
 
 def test_supervisor_waits_for_detached_adopted_descendant_with_complex_comm(
@@ -1643,6 +1706,83 @@ def test_durable_publication_attests_immediately_before_commit(
     assert not list(tmp_path.glob(".latest.json.*.tmp"))
 
 
+def test_durable_writer_pins_temp_and_target_identity_through_commit(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "latest.json"
+    target.write_bytes(b"trusted\n")
+
+    def substitute_temp(event: str, _path: Path) -> None:
+        if event != "before_commit":
+            return
+        temp = next(tmp_path.glob(".latest.json.*.tmp"))
+        temp.unlink()
+        temp.write_bytes(b"substitute\n")
+
+    with pytest.raises(
+        durable_atomic.DurableAtomicWriteError,
+        match="atomic file",
+    ):
+        durable_atomic.durable_atomic_replace(
+            target,
+            b"candidate\n",
+            event_hook=substitute_temp,
+        )
+    assert target.read_bytes() == b"trusted\n"
+
+    def mutate_committed_leaf(event: str, path: Path) -> None:
+        if event == "after_rename":
+            path.unlink()
+            path.write_bytes(b"late-substitute\n")
+
+    with pytest.raises(durable_atomic.DurableAtomicWriteError):
+        durable_atomic.durable_atomic_replace(
+            target,
+            b"candidate\n",
+            event_hook=mutate_committed_leaf,
+        )
+    assert target.read_bytes() == b"trusted\n"
+    assert target.stat().st_nlink == 1
+
+
+def test_durable_copy_pins_source_before_and_after_commit(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.csv"
+    target = tmp_path / "latest.csv"
+    source.write_bytes(b"source-v1\n")
+    target.write_bytes(b"trusted\n")
+
+    def replace_source_before_commit(event: str, _path: Path) -> None:
+        if event == "before_commit":
+            detached = tmp_path / "source.detached"
+            source.rename(detached)
+            source.write_bytes(b"source-v2\n")
+
+    with pytest.raises(durable_atomic.DurableAtomicWriteError):
+        durable_atomic.durable_atomic_copy(
+            source,
+            target,
+            event_hook=replace_source_before_commit,
+        )
+    assert target.read_bytes() == b"trusted\n"
+
+    source.write_bytes(b"source-v3\n")
+
+    def mutate_source_after_rename(event: str, _path: Path) -> None:
+        if event == "after_rename":
+            source.write_bytes(b"source-v4\n")
+
+    with pytest.raises(durable_atomic.DurableAtomicWriteError):
+        durable_atomic.durable_atomic_copy(
+            source,
+            target,
+            event_hook=mutate_source_after_rename,
+        )
+    assert target.read_bytes() == b"trusted\n"
+    assert target.stat().st_nlink == 1
+
+
 def test_deadline_refusal_happens_before_runtime_load_or_child(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1774,6 +1914,201 @@ def test_passthrough_rejects_unreviewed_target_before_spawn(
         assert lease.exited is True
     finally:
         os.close(validation_fd)
+
+
+@pytest.mark.parametrize(
+    "target",
+    sorted(adapter.OFFICIAL_PASSTHROUGH_TARGETS),
+    ids=lambda path: path.name,
+)
+def test_all_passthrough_targets_receive_exact_attested_environment(
+    target: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation = tmp_path / "validation.flock"
+    validation.touch()
+    validation_fd = os.open(validation, os.O_RDWR)
+    lease = FakeLease(invocation=None, validation_fd=validation_fd)
+    seen: dict[str, object] = {}
+    manifest_sha = "1" * 64
+    runtime_sha = "2" * 64
+
+    class Child:
+        def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr(
+        adapter,
+        "acquire_marketplace_collection_lease",
+        lambda: lease,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "load_required_runtime_environment",
+        lambda **_kwargs: {"PARSER_WB_RUNTIME_ENV_LOADED": "1"},
+    )
+    monkeypatch.setattr(
+        adapter,
+        "capture_attested_environment",
+        lambda _root, environment: {
+            **environment,
+            attestation.MANIFEST_SHA_ENV: manifest_sha,
+            attestation.RUNTIME_SHA_ENV: runtime_sha,
+        },
+    )
+
+    def verify(_root: Path, environment: dict[str, str]) -> None:
+        seen["verified_manifest"] = environment[attestation.MANIFEST_SHA_ENV]
+        seen["verified_runtime"] = environment[attestation.RUNTIME_SHA_ENV]
+
+    monkeypatch.setattr(adapter, "verify_attested_environment", verify)
+
+    def popen(
+        command: tuple[str, ...],
+        **kwargs: object,
+    ) -> Child:
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        seen["command"] = command
+        seen["child_manifest"] = environment[attestation.MANIFEST_SHA_ENV]
+        seen["child_runtime"] = environment[attestation.RUNTIME_SHA_ENV]
+        return Child()
+
+    monkeypatch.setattr(adapter.subprocess, "Popen", popen)
+    try:
+        assert adapter._run_passthrough([str(target)]) == 0
+        assert str(target) in seen["command"]
+        assert seen == {
+            "verified_manifest": manifest_sha,
+            "verified_runtime": runtime_sha,
+            "command": seen["command"],
+            "child_manifest": manifest_sha,
+            "child_runtime": runtime_sha,
+        }
+    finally:
+        os.close(validation_fd)
+
+
+def test_subprocess_in_writer_attestation_rejects_post_gate_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    for relative in ("app", "scripts", "config"):
+        shutil.copytree(PROJECT_ROOT / relative, project / relative)
+    shutil.copy2(PROJECT_ROOT / "main.py", project / "main.py")
+    shutil.copy2(PROJECT_ROOT / "requirements.txt", project / "requirements.txt")
+    dependencies = tmp_path / "site-packages"
+    dependencies.mkdir()
+    (dependencies / "approved.py").write_text("VALUE = 1\n", encoding="utf-8")
+    copied_attestation = project / "app/common/nightly_attestation.py"
+    copied_source = copied_attestation.read_text(encoding="utf-8")
+    copied_source = re.sub(
+        r'APPROVED_SITE_PACKAGES = Path\(\n'
+        r'\s*"/home/Codex/agent-tools/parser_wb-python/lib/python3\.14/'
+        r'site-packages"\n'
+        r'\)',
+        f'APPROVED_SITE_PACKAGES = Path({str(dependencies)!r})',
+        copied_source,
+        count=1,
+    )
+    copied_attestation.write_text(copied_source, encoding="utf-8")
+    publisher = project / "scripts/attestation_writer_probe.py"
+    publisher.write_text(
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "root=Path(sys.argv[1])\n"
+        "sys.path.insert(0, str(root))\n"
+        "from app.common.durable_atomic import durable_atomic_replace\n"
+        "from app.common.nightly_attestation import integrity_gate\n"
+        "ready=Path(sys.argv[2])\n"
+        "go=Path(sys.argv[3])\n"
+        "target=Path(sys.argv[4])\n"
+        "gate=integrity_gate(root)\n"
+        "ready.write_text('ready', encoding='utf-8')\n"
+        "while not go.exists(): time.sleep(0.01)\n"
+        "try:\n"
+        "    durable_atomic_replace(target, b'untrusted\\n', "
+        "integrity_gate=gate)\n"
+        "except Exception:\n"
+        "    raise SystemExit(23)\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    config = project / "config"
+    runtime = config / "runtime.env"
+    headers = config / "wb_request_headers.json"
+    cookie = config / "wb_cookie.txt"
+    runtime.write_text(
+        "PARSER_WB_PROXY_URL=http://proxy.invalid:18080\n"
+        f"PARSER_WB_REQUEST_HEADERS_FILE={headers}\n"
+        "PARSER_WB_COOKIE_REQUIRED=1\n",
+        encoding="utf-8",
+    )
+    headers.write_text("{}\n", encoding="utf-8")
+    cookie.write_text("test-cookie\n", encoding="utf-8")
+    _remove_group_world_write(project)
+    _remove_group_world_write(dependencies)
+    for path in (runtime, headers, cookie):
+        path.chmod(0o600)
+    monkeypatch.setattr(
+        attestation,
+        "APPROVED_SITE_PACKAGES",
+        dependencies,
+    )
+    manifest_path = project / attestation.MANIFEST_RELATIVE_PATH
+    manifest_path.write_text(
+        json.dumps(
+            attestation.build_input_manifest(project),
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.chmod(0o644)
+    loaded = runtime_env.load_strict_runtime_environment(
+        project_root=project,
+        base_environment={
+            "PATH": "/usr/bin:/bin",
+            "HOME": os.environ.get("HOME", "/home/pavel"),
+        },
+    )
+    environment = attestation.capture_attested_environment(
+        project,
+        loaded.environment,
+    )
+    publication = project / "publication"
+    publication.mkdir(mode=0o700)
+    target = publication / "latest.json"
+    target.write_bytes(b"trusted\n")
+    target.chmod(0o600)
+    ready = tmp_path / "ready"
+    go = tmp_path / "go"
+    child = subprocess.Popen(
+        [
+            str(attestation.APPROVED_PYTHON_BIN),
+            str(publisher),
+            str(project),
+            str(ready),
+            str(go),
+            str(target),
+        ],
+        cwd=project,
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 30
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists()
+    influencing = project / "app/common/cleanup.py"
+    influencing.write_bytes(influencing.read_bytes() + b"\n")
+    go.write_text("go", encoding="utf-8")
+    assert child.wait(timeout=30) == 23
+    assert target.read_bytes() == b"trusted\n"
 
 
 def test_absolute_deadline_caps_collection_window() -> None:

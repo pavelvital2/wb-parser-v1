@@ -200,6 +200,13 @@ def _validate_sources() -> list[dict[str, str]]:
         PROJECT_ROOT / "scripts/run_wb_collection_plan.py",
         executable=True,
     ).decode("utf-8")
+    adapter_python_source = _read_safe(
+        PROJECT_ROOT / "scripts/wb_nightly_coordinator_adapter.py",
+    ).decode("utf-8")
+    supervisor_source = _read_safe(
+        PROJECT_ROOT / "scripts/marketplace_lock_v3_supervisor.py",
+        executable=True,
+    ).decode("utf-8")
     manifest = _json_object(
         _read_safe(PROJECT_ROOT / MANIFEST_RELATIVE_PATH),
         "input manifest",
@@ -289,11 +296,36 @@ def _validate_sources() -> list[dict[str, str]]:
         or "coordinator_python_runtime_mismatch" not in attestation_source
     ):
         raise CheckError("runtime loading/attestation contract mismatch")
+    passthrough_source = adapter_python_source[
+        adapter_python_source.index("def _run_passthrough"):
+        adapter_python_source.index(
+            "\ndef main",
+            adapter_python_source.index("def _run_passthrough"),
+        )
+    ]
+    if (
+        "load_required_runtime_environment(" not in passthrough_source
+        or "capture_attested_environment(PROJECT_ROOT, env)" not in passthrough_source
+        or "verify_attested_environment(PROJECT_ROOT, env)" not in passthrough_source
+        or "env = os.environ.copy()" in passthrough_source
+    ):
+        raise CheckError("passthrough attestation contract mismatch")
+    if (
+        "ProcessIdentity" not in supervisor_source
+        or "starttime" not in supervisor_source
+        or "pidfd_open" not in supervisor_source
+        or "_refresh_owned(" not in supervisor_source
+        or "killpg" in supervisor_source
+    ):
+        raise CheckError("supervisor process identity contract mismatch")
     if (
         "os.O_NOFOLLOW" not in durable_source
         or "os.fsync(temp_fd)" not in durable_source
         or "os.fsync(directory_fd)" not in durable_source
         or "integrity_gate()" not in durable_source
+        or "source_integrity_gate()" not in durable_source
+        or 'event_hook("after_rename", path)' not in durable_source
+        or "_same_inode(committed, temp_info)" not in durable_source
         or "require_absent=True" not in coordinator_source
         or "integrity_gate=integrity_gate" not in coordinator_source
         or "integrity_gate=integrity_gate" not in scoped_source

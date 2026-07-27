@@ -445,14 +445,19 @@ def _run_passthrough(arguments: list[str]) -> int:
             )
         target = _canonical_passthrough_target(arguments[0])
         verify_input_manifest(PROJECT_ROOT)
-        env = os.environ.copy()
+        env = load_required_runtime_environment(
+            project_root=PROJECT_ROOT,
+            lease=lease,
+        )
         env.update(descendant_lease_environment(lease))
+        env = capture_attested_environment(PROJECT_ROOT, env)
         pass_fds = lease.pass_fds
         env = _prepare_supervisor_environment(env, pass_fds=pass_fds)
         command = _supervised_command(
             (str(target), *arguments[1:])
         )
         lease.assert_held()
+        verify_attested_environment(PROJECT_ROOT, env)
         try:
             child = subprocess.Popen(
                 command,

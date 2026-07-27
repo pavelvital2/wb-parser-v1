@@ -7,12 +7,27 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
 TERM_GRACE_SECONDS = 30.0
 POLL_SECONDS = 0.1
 PR_SET_CHILD_SUBREAPER = 36
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    starttime: int
+
+
+@dataclass(frozen=True)
+class ProcessStat:
+    ppid: int
+    pgrp: int
+    state: str
+    starttime: int
 
 
 def _fail(message: str) -> int:
@@ -48,7 +63,7 @@ def _parse_proc_stat(
     encoded: str,
     *,
     expected_pid: int,
-) -> tuple[int, int, str]:
+) -> ProcessStat:
     prefix = f"{expected_pid} ("
     if not encoded.startswith(prefix):
         raise ValueError("process stat PID mismatch")
@@ -56,13 +71,18 @@ def _parse_proc_stat(
     if closing < len(prefix):
         raise ValueError("process stat comm is malformed")
     fields = encoded[closing + 1 :].strip().split()
-    if len(fields) < 3 or len(fields[0]) != 1:
+    if len(fields) < 20 or len(fields[0]) != 1:
         raise ValueError("process stat fields are malformed")
-    return int(fields[1]), int(fields[2]), fields[0]
+    return ProcessStat(
+        ppid=int(fields[1]),
+        pgrp=int(fields[2]),
+        state=fields[0],
+        starttime=int(fields[19]),
+    )
 
 
-def _process_table() -> dict[int, tuple[int, int, str]]:
-    table: dict[int, tuple[int, int, str]] = {}
+def _process_table() -> dict[int, ProcessStat]:
+    table: dict[int, ProcessStat] = {}
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -77,26 +97,92 @@ def _process_table() -> dict[int, tuple[int, int, str]]:
     return table
 
 
-def _owned_members(pgid: int) -> set[int]:
-    table = _process_table()
-    members = {
-        pid
-        for pid, (_ppid, process_group, state) in table.items()
-        if process_group == pgid and state != "Z"
+def _identity(pid: int, table: dict[int, ProcessStat]) -> ProcessIdentity | None:
+    process = table.get(pid)
+    if process is None or process.state == "Z":
+        return None
+    return ProcessIdentity(pid=pid, starttime=process.starttime)
+
+
+def _refresh_owned(
+    owned: set[ProcessIdentity],
+    *,
+    supervisor_pid: int,
+    baseline_children: set[ProcessIdentity],
+    table: dict[int, ProcessStat] | None = None,
+) -> set[ProcessIdentity]:
+    current = table if table is not None else _process_table()
+    active = {
+        identity
+        for identity in owned
+        if _identity(identity.pid, current) == identity
     }
-    frontier = {os.getpid()}
-    while frontier:
+    adopted = {
+        ProcessIdentity(pid=pid, starttime=process.starttime)
+        for pid, process in current.items()
+        if (
+            process.ppid == supervisor_pid
+            and process.state != "Z"
+            and pid != supervisor_pid
+        )
+    }
+    active.update(adopted - baseline_children)
+    while True:
+        parent_pids = {identity.pid for identity in active}
         children = {
-            pid
-            for pid, (ppid, _process_group, state) in table.items()
-            if ppid in frontier and state != "Z" and pid != os.getpid()
+            ProcessIdentity(pid=pid, starttime=process.starttime)
+            for pid, process in current.items()
+            if (
+                process.ppid in parent_pids
+                and process.state != "Z"
+                and pid != supervisor_pid
+            )
         }
-        children -= members
-        if not children:
-            break
-        members.update(children)
-        frontier = children
-    return members
+        expanded = active | children
+        if expanded == active:
+            return active
+        active = expanded
+
+
+def _current_identity(pid: int) -> ProcessIdentity | None:
+    try:
+        process = _parse_proc_stat(
+            Path(f"/proc/{pid}/stat").read_text(encoding="utf-8"),
+            expected_pid=pid,
+        )
+    except (OSError, ValueError):
+        return None
+    if process.state == "Z":
+        return None
+    return ProcessIdentity(pid=pid, starttime=process.starttime)
+
+
+def _signal_identity(identity: ProcessIdentity, signum: int) -> bool:
+    if _current_identity(identity.pid) != identity:
+        return False
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is not None and pidfd_send_signal is not None:
+        try:
+            pidfd = pidfd_open(identity.pid, 0)
+        except (OSError, ProcessLookupError):
+            return False
+        try:
+            if _current_identity(identity.pid) != identity:
+                return False
+            pidfd_send_signal(pidfd, signum, None, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+        finally:
+            os.close(pidfd)
+    if _current_identity(identity.pid) != identity:
+        return False
+    try:
+        os.kill(identity.pid, signum)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def _reap_children() -> None:
@@ -109,34 +195,42 @@ def _reap_children() -> None:
             return
 
 
-def _terminate_owned(pgid: int) -> bool:
-    def signal_owned(signum: int) -> None:
-        for pid in _owned_members(pgid):
-            try:
-                os.kill(pid, signum)
-            except ProcessLookupError:
-                pass
+def _terminate_owned(
+    owned: set[ProcessIdentity],
+    *,
+    supervisor_pid: int,
+    baseline_children: set[ProcessIdentity],
+) -> bool:
+    def remaining() -> set[ProcessIdentity]:
+        return _refresh_owned(
+            owned,
+            supervisor_pid=supervisor_pid,
+            baseline_children=baseline_children,
+        )
 
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    signal_owned(signal.SIGTERM)
+    active = remaining()
+    for identity in active:
+        _signal_identity(identity, signal.SIGTERM)
     deadline = time.monotonic() + TERM_GRACE_SECONDS
     while time.monotonic() < deadline:
-        _reap_children()
-        if not _owned_members(pgid):
+        active = _refresh_owned(
+            active,
+            supervisor_pid=supervisor_pid,
+            baseline_children=baseline_children,
+        )
+        if not active:
             return True
         time.sleep(POLL_SECONDS)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    signal_owned(signal.SIGKILL)
+    for identity in active:
+        _signal_identity(identity, signal.SIGKILL)
     deadline = time.monotonic() + TERM_GRACE_SECONDS
     while time.monotonic() < deadline:
-        _reap_children()
-        if not _owned_members(pgid):
+        active = _refresh_owned(
+            active,
+            supervisor_pid=supervisor_pid,
+            baseline_children=baseline_children,
+        )
+        if not active:
             return True
         time.sleep(POLL_SECONDS)
     return False
@@ -155,24 +249,25 @@ def main() -> int:
     if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
         return _fail("cannot enable child subreaper")
 
+    supervisor_pid = os.getpid()
+    initial_table = _process_table()
+    baseline_children = {
+        ProcessIdentity(pid=pid, starttime=process.starttime)
+        for pid, process in initial_table.items()
+        if process.ppid == supervisor_pid and process.state != "Z"
+    }
     child_env = os.environ.copy()
     child_env["PARSER_WB_LOCK_V3_VALIDATION_OWNER_PID"] = str(
-        os.getpid()
+        supervisor_pid
     )
     terminating = False
-    child: subprocess.Popen[bytes] | None = None
 
-    def forward(signum: int, _frame: object) -> None:
+    def request_termination(_signum: int, _frame: object) -> None:
         nonlocal terminating
         terminating = True
-        if child is not None:
-            try:
-                os.killpg(child.pid, signum)
-            except ProcessLookupError:
-                pass
 
-    signal.signal(signal.SIGTERM, forward)
-    signal.signal(signal.SIGINT, forward)
+    signal.signal(signal.SIGTERM, request_termination)
+    signal.signal(signal.SIGINT, request_termination)
     try:
         child = subprocess.Popen(
             sys.argv[2:],
@@ -184,22 +279,52 @@ def main() -> int:
     except OSError as exc:
         return _fail(f"child spawn failed: {exc}")
 
-    while child.poll() is None:
-        if terminating:
-            if not _terminate_owned(child.pid):
-                return _fail("child process group cleanup failed")
+    owned: set[ProcessIdentity] = set()
+    identity_deadline = time.monotonic() + 1.0
+    while time.monotonic() < identity_deadline:
+        table = _process_table()
+        leader = _identity(child.pid, table)
+        if leader is not None:
+            owned.add(leader)
+            break
+        if child.poll() is not None:
             break
         time.sleep(POLL_SECONDS)
-    status = child.wait()
-    pgid = child.pid
-    while _owned_members(pgid):
+
+    status: int | None = None
+    while True:
+        owned = _refresh_owned(
+            owned,
+            supervisor_pid=supervisor_pid,
+            baseline_children=baseline_children,
+        )
         if terminating:
-            if not _terminate_owned(pgid):
-                return _fail("child process group cleanup failed")
+            if not _terminate_owned(
+                owned,
+                supervisor_pid=supervisor_pid,
+                baseline_children=baseline_children,
+            ):
+                return _fail("owned descendant cleanup failed")
+            if status is None:
+                status = child.poll()
+                if status is None:
+                    status = child.wait()
             break
-        _reap_children()
+        if status is None:
+            status = child.poll()
+        if status is not None:
+            _reap_children()
+            owned = _refresh_owned(
+                owned,
+                supervisor_pid=supervisor_pid,
+                baseline_children=baseline_children,
+            )
+            if not owned:
+                break
         time.sleep(POLL_SECONDS)
     _reap_children()
+    if status is None:
+        status = child.wait()
     return status if status >= 0 else 128 + abs(status)
 
 
