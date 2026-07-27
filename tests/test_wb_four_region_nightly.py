@@ -1886,6 +1886,25 @@ def test_publication_rejects_state_mutation_before_latest_replace(
     assert lease.latest_published is False
 
 
+def test_publication_integrity_gate_rejects_latest_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, lease, _state_path, latest_path, pointer, prior_latest = (
+        _publication_transaction(tmp_path, monkeypatch)
+    )
+
+    def reject_drift() -> None:
+        raise CriticalPipelineError("input attestation changed")
+
+    lease.integrity_gate = reject_drift
+    with pytest.raises(CriticalPipelineError, match="input attestation changed"):
+        four_region._write_authoritative_latest(lease, pointer)
+
+    assert latest_path.read_bytes() == prior_latest
+    assert lease.latest_published is False
+
+
 def test_completed_unpublished_reconcile_publishes_without_stage_rerun(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

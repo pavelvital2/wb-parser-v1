@@ -18,8 +18,10 @@ from types import SimpleNamespace
 import pytest
 
 from app.common import cli as wb_cli
+from app.common import durable_atomic
 from app.common import nightly_coordinator as contract
 from app.common import nightly_attestation as attestation
+from app.common import runtime_env
 from app.serp.collection_plan_runner import CollectionPlanRunError, DeadlineGuard
 from scripts import check_nightly_coordinator_contract as checker
 from scripts import marketplace_lock_v3_supervisor as supervisor
@@ -52,6 +54,11 @@ def _isolate_pipeline_launcher_host_lock(
         adapter,
         "verify_attested_environment",
         lambda _root, _environment: None,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "verify_input_manifest",
+        lambda _root: "a" * 64,
     )
 
 
@@ -625,6 +632,53 @@ def test_terminal_result_is_exact_atomic_mode_0440(
         )
 
 
+def test_terminal_result_checks_integrity_inside_atomic_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocation = _invocation(tmp_path)
+    monkeypatch.setattr(
+        contract,
+        "RESULT_DIRECTORY",
+        invocation.result_path.parent,
+    )
+    sentinel = tmp_path / "attested"
+    sentinel.write_bytes(b"approved")
+
+    def mutate_before_gate(event: str, _path: Path) -> None:
+        if event == "before_integrity_check":
+            sentinel.write_bytes(b"changed")
+
+    def gate() -> None:
+        if sentinel.read_bytes() != b"approved":
+            raise contract.NightlyCoordinatorContractError(
+                "coordinator_input_changed",
+                outcome="hard_failure",
+            )
+
+    with pytest.raises(
+        contract.NightlyCoordinatorContractError,
+        match="coordinator_input_changed",
+    ):
+        contract.write_terminal_result(
+            invocation=invocation,
+            outcome="success",
+            run_ref=RUN_REF,
+            resume_ref="",
+            reason_code="completed",
+            started_at_utc=datetime.now(UTC),
+            finished_at_utc=datetime.now(UTC),
+            integrity_gate=gate,
+            write_event_hook=mutate_before_gate,
+        )
+    assert not invocation.result_path.exists()
+    assert not list(
+        invocation.result_path.parent.glob(
+            f".{invocation.result_path.name}.*.tmp"
+        )
+    )
+
+
 @pytest.mark.parametrize(
     "report_ref",
     (
@@ -1145,10 +1199,20 @@ def test_lease_release_never_uses_lock_un() -> None:
 
 def test_input_manifest_detects_omission_and_mutation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for relative in ("app", "scripts", "config"):
         shutil.copytree(PROJECT_ROOT / relative, tmp_path / relative)
     shutil.copy2(PROJECT_ROOT / "main.py", tmp_path / "main.py")
+    shutil.copy2(PROJECT_ROOT / "requirements.txt", tmp_path / "requirements.txt")
+    dependencies = tmp_path / "site-packages"
+    dependencies.mkdir()
+    (dependencies / "approved.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        attestation,
+        "APPROVED_SITE_PACKAGES",
+        dependencies,
+    )
     manifest_path = tmp_path / attestation.MANIFEST_RELATIVE_PATH
     manifest_path.write_text(
         json.dumps(
@@ -1189,17 +1253,181 @@ def test_runtime_input_fingerprint_binds_secret_files_without_values(
     cookie.write_text("test-cookie-value\n", encoding="utf-8")
     for path in (runtime, headers, cookie):
         path.chmod(0o600)
-    environment = {
-        "PARSER_WB_PROXY_URL": "http://test-route.invalid",
-        "PARSER_WB_REQUEST_HEADERS_FILE": str(headers),
-        "PARSER_WB_COOKIE_REQUIRED": "1",
-    }
+    loaded = runtime_env.load_strict_runtime_environment(
+        project_root=tmp_path,
+        base_environment={
+            "PARSER_WB_PROXY_URL": "http://test-route.invalid",
+            "PARSER_WB_REQUEST_HEADERS_FILE": str(headers),
+            "PARSER_WB_COOKIE_REQUIRED": "1",
+        },
+    )
+    environment = loaded.environment
     first = attestation.runtime_input_sha256(tmp_path, environment)
     headers.write_text('{"x-test-header":"changed"}\n', encoding="utf-8")
     headers.chmod(0o600)
     second = attestation.runtime_input_sha256(tmp_path, environment)
     assert first != second
     assert len(first) == len(second) == 64
+
+
+def test_runtime_attestation_rejects_substitute_cookie_path(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    runtime = config_dir / "runtime.env"
+    headers = config_dir / "wb_request_headers.json"
+    cookie = config_dir / "wb_cookie.txt"
+    substitute = config_dir / "substitute_cookie.txt"
+    runtime.write_text(
+        "PARSER_WB_REQUEST_HEADERS_FILE="
+        f"{headers.as_posix()}\n",
+        encoding="utf-8",
+    )
+    headers.write_text("{}\n", encoding="utf-8")
+    cookie.write_text("approved\n", encoding="utf-8")
+    substitute.write_text("substitute\n", encoding="utf-8")
+    for path in (runtime, headers, cookie, substitute):
+        path.chmod(0o600)
+    with pytest.raises(
+        runtime_env.RuntimeEnvironmentError,
+        match="runtime_cookie_path_invalid",
+    ):
+        runtime_env.load_strict_runtime_environment(
+            project_root=tmp_path,
+            base_environment={
+                "WB_COOKIE_FILE": str(substitute),
+            },
+        )
+    substitute.unlink()
+    substitute.symlink_to(cookie)
+    with pytest.raises(
+        runtime_env.RuntimeEnvironmentError,
+        match="runtime_cookie_path_invalid",
+    ):
+        runtime_env.load_strict_runtime_environment(
+            project_root=tmp_path,
+            base_environment={
+                "WB_COOKIE_FILE": str(substitute),
+            },
+        )
+
+
+def test_dependency_tree_drift_invalidates_pinned_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    for relative in ("app", "scripts", "config"):
+        shutil.copytree(PROJECT_ROOT / relative, project / relative)
+    shutil.copy2(PROJECT_ROOT / "main.py", project / "main.py")
+    shutil.copy2(PROJECT_ROOT / "requirements.txt", project / "requirements.txt")
+    dependencies = tmp_path / "site-packages"
+    dependencies.mkdir()
+    dependency = dependencies / "approved.py"
+    dependency.write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        attestation,
+        "APPROVED_SITE_PACKAGES",
+        dependencies,
+    )
+    manifest_path = project / attestation.MANIFEST_RELATIVE_PATH
+    manifest_path.write_text(
+        json.dumps(
+            attestation.build_input_manifest(project),
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.chmod(0o644)
+    assert len(attestation.verify_input_manifest(project)) == 64
+    dependency.write_text("VALUE = 2\n", encoding="utf-8")
+    with pytest.raises(
+        contract.NightlyCoordinatorContractError,
+        match="coordinator_python_runtime_mismatch",
+    ):
+        attestation.verify_input_manifest(project)
+
+
+def test_strict_runtime_loader_rejects_shell_expression_without_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    runtime = config / "runtime.env"
+    cookie = config / "wb_cookie.txt"
+    runtime.write_text(
+        "PARSER_WB_PROXY_URL=$(touch should-not-run)\n",
+        encoding="utf-8",
+    )
+    cookie.write_text("cookie\n", encoding="utf-8")
+    runtime.chmod(0o600)
+    cookie.chmod(0o600)
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "strict runtime loading must not spawn"
+        ),
+    )
+    with pytest.raises(
+        runtime_env.RuntimeEnvironmentError,
+        match="runtime_env_value_invalid",
+    ):
+        runtime_env.load_strict_runtime_environment(
+            project_root=tmp_path,
+            base_environment={},
+        )
+
+
+def test_durable_atomic_writer_refuses_symlink_race_and_partial_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "latest.json"
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b"outside\n")
+    target.symlink_to(outside)
+    with pytest.raises(durable_atomic.DurableAtomicWriteError):
+        durable_atomic.durable_atomic_replace(target, b"new\n")
+    assert outside.read_bytes() == b"outside\n"
+    target.unlink()
+    target.write_bytes(b"old\n")
+
+    def race(event: str, path: Path) -> None:
+        if event == "before_target_recheck":
+            path.write_bytes(b"racer\n")
+
+    with pytest.raises(
+        durable_atomic.DurableAtomicWriteError,
+        match="changed before commit",
+    ):
+        durable_atomic.durable_atomic_replace(
+            target,
+            b"new\n",
+            event_hook=race,
+        )
+    assert target.read_bytes() == b"racer\n"
+
+    original_fsync = durable_atomic.os.fsync
+    failed = False
+
+    def fail_first_fsync(fd: int) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected fsync failure")
+        original_fsync(fd)
+
+    target.write_bytes(b"stable\n")
+    monkeypatch.setattr(durable_atomic.os, "fsync", fail_first_fsync)
+    with pytest.raises(OSError, match="injected fsync failure"):
+        durable_atomic.durable_atomic_replace(target, b"partial\n")
+    assert target.read_bytes() == b"stable\n"
+    assert not list(tmp_path.glob(".latest.json.*.tmp"))
 
 
 def test_deadline_refusal_happens_before_runtime_load_or_child(
@@ -1249,6 +1477,63 @@ def test_deadline_refusal_happens_before_runtime_load_or_child(
         assert raised.value.code == 75
         assert captured["outcome"] == "deferred"
         assert captured["reason_code"] == "absolute_deadline_reached_before_runtime"
+    finally:
+        os.close(validation_fd)
+
+
+def test_runtime_validation_failure_stops_before_child_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation = tmp_path / "validation.flock"
+    validation.touch()
+    validation_fd = os.open(validation, os.O_RDWR)
+    lease = FakeLease(
+        invocation=_invocation(tmp_path),
+        validation_fd=validation_fd,
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        adapter,
+        "acquire_marketplace_collection_lease",
+        lambda: lease,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "load_required_runtime_environment",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            contract.NightlyCoordinatorContractError(
+                "runtime_env_syntax_invalid",
+                outcome="hard_failure",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        adapter.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "child must not start after runtime validation failure"
+        ),
+    )
+
+    def fake_write(**kwargs: object) -> int:
+        captured.update(kwargs)
+        return 2
+
+    monkeypatch.setattr(adapter, "write_terminal_result", fake_write)
+    monkeypatch.setattr(
+        adapter.os,
+        "_exit",
+        lambda code: (_ for _ in ()).throw(ExitCalled(code)),
+    )
+    try:
+        with pytest.raises(ExitCalled) as raised:
+            adapter._run_four_region(
+                ["--plan-file", PLAN_ARGUMENT, "--no-publish"]
+            )
+        assert raised.value.code == 2
+        assert captured["outcome"] == "hard_failure"
+        assert captured["reason_code"] == "runtime_env_syntax_invalid"
     finally:
         os.close(validation_fd)
 

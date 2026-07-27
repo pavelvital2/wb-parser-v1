@@ -4,15 +4,26 @@ import hashlib
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 from typing import Callable, Mapping
 
 from .nightly_coordinator import NightlyCoordinatorContractError
+from .runtime_env import (
+    RuntimeEnvironmentError,
+    load_strict_runtime_environment,
+)
 
 
-MANIFEST_SCHEMA_VERSION = "wb_nightly_coordinator_input_manifest_v1"
+MANIFEST_SCHEMA_VERSION = "wb_nightly_coordinator_input_manifest_v2"
 MANIFEST_RELATIVE_PATH = Path(
     "config/wb/nightly_coordinator_adapter_inputs.json"
+)
+APPROVED_PYTHON_BIN = Path(
+    "/home/Codex/agent-tools/parser_wb-python/bin/python"
+)
+APPROVED_SITE_PACKAGES = Path(
+    "/home/Codex/agent-tools/parser_wb-python/lib/python3.14/site-packages"
 )
 MANIFEST_SHA_ENV = "PARSER_WB_COORDINATOR_INPUT_MANIFEST_SHA256"
 RUNTIME_SHA_ENV = "PARSER_WB_COORDINATOR_RUNTIME_INPUT_SHA256"
@@ -34,6 +45,7 @@ RUNTIME_ENV_INCLUDED_NAMES = frozenset(
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "NO_PROXY",
+        "WB_COOKIE_FILE",
     }
 )
 
@@ -125,6 +137,7 @@ def expected_manifest_files(project_root: Path) -> tuple[str, ...]:
     root = project_root.resolve(strict=True)
     candidates: set[Path] = {
         Path("main.py"),
+        Path("requirements.txt"),
         Path("config/config.yaml"),
         Path("config/wb/regions.json"),
         Path(
@@ -149,6 +162,191 @@ def expected_manifest_files(project_root: Path) -> tuple[str, ...]:
     return tuple(sorted(path.as_posix() for path in candidates))
 
 
+def _read_fd_bytes(fd: int, size: int, *, code: str) -> bytes:
+    payload = b""
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, min(1024 * 1024, remaining))
+        if not chunk:
+            _fail(code)
+        payload += chunk
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        _fail(code)
+    return payload
+
+
+def _dependency_tree_contract(root: Path) -> dict[str, object]:
+    try:
+        canonical = root.resolve(strict=True)
+        root_info = canonical.lstat()
+    except OSError:
+        _fail("coordinator_python_dependencies_unavailable")
+    if (
+        stat.S_ISLNK(root_info.st_mode)
+        or not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+        or root_info.st_mode & 0o002
+    ):
+        _fail("coordinator_python_dependencies_unsafe")
+    digest = hashlib.sha256()
+    file_count = 0
+    directory_count = 0
+
+    def visit(directory: Path, relative_parent: Path) -> None:
+        nonlocal file_count, directory_count
+        try:
+            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+        except OSError:
+            _fail("coordinator_python_dependencies_unavailable")
+        for entry in entries:
+            relative = relative_parent / entry.name
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                _fail("coordinator_python_dependencies_unavailable")
+            if stat.S_ISLNK(info.st_mode):
+                _fail("coordinator_python_dependencies_unsafe")
+            if stat.S_ISDIR(info.st_mode):
+                if entry.name == "__pycache__":
+                    continue
+                if info.st_uid != os.geteuid() or info.st_mode & 0o002:
+                    _fail("coordinator_python_dependencies_unsafe")
+                directory_count += 1
+                digest.update(
+                    (
+                        f"D\0{relative.as_posix()}\0{info.st_uid}\0"
+                        f"{info.st_gid}\0{stat.S_IMODE(info.st_mode):o}\0"
+                    ).encode("utf-8")
+                )
+                visit(Path(entry.path), relative)
+                continue
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_mode & 0o002
+            ):
+                _fail("coordinator_python_dependencies_unsafe")
+            if relative.suffix in {".pyc", ".pyo"}:
+                continue
+            flags = os.O_RDONLY | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(entry.path, flags)
+            except OSError:
+                _fail("coordinator_python_dependencies_unavailable")
+            try:
+                before = os.fstat(fd)
+                payload = _read_fd_bytes(
+                    fd,
+                    before.st_size,
+                    code="coordinator_python_dependencies_changed",
+                )
+                after = os.fstat(fd)
+            finally:
+                os.close(fd)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                _fail("coordinator_python_dependencies_changed")
+            file_count += 1
+            digest.update(
+                (
+                    f"F\0{relative.as_posix()}\0{before.st_uid}\0"
+                    f"{before.st_gid}\0{stat.S_IMODE(before.st_mode):o}\0"
+                    f"{before.st_size}\0{_sha256(payload)}\0"
+                ).encode("utf-8")
+            )
+
+    visit(canonical, Path())
+    if file_count < 1:
+        _fail("coordinator_python_dependencies_unavailable")
+    return {
+        "configured_path": str(root),
+        "resolved_path": str(canonical),
+        "owner_uid": root_info.st_uid,
+        "owner_gid": root_info.st_gid,
+        "mode": stat.S_IMODE(root_info.st_mode),
+        "file_count": file_count,
+        "directory_count": directory_count,
+        "tree_sha256": digest.hexdigest(),
+    }
+
+
+def _python_runtime_contract() -> dict[str, object]:
+    if Path(sys.executable) != APPROVED_PYTHON_BIN:
+        _fail("coordinator_python_path_mismatch")
+    try:
+        configured_info = APPROVED_PYTHON_BIN.lstat()
+        resolved = APPROVED_PYTHON_BIN.resolve(strict=True)
+        resolved_info = resolved.lstat()
+    except OSError:
+        _fail("coordinator_python_unavailable")
+    if (
+        not stat.S_ISLNK(configured_info.st_mode)
+        or not stat.S_ISREG(resolved_info.st_mode)
+        or resolved_info.st_uid != os.geteuid()
+        or resolved_info.st_mode & 0o022
+    ):
+        _fail("coordinator_python_unsafe")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(resolved, flags)
+    except OSError:
+        _fail("coordinator_python_unavailable")
+    try:
+        before = os.fstat(fd)
+        payload = _read_fd_bytes(
+            fd,
+            before.st_size,
+            code="coordinator_python_changed",
+        )
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        _fail("coordinator_python_changed")
+    return {
+        "configured_path": str(APPROVED_PYTHON_BIN),
+        "configured_link_target": os.readlink(APPROVED_PYTHON_BIN),
+        "resolved_path": str(resolved),
+        "version": ".".join(str(item) for item in sys.version_info[:3]),
+        "implementation": sys.implementation.name,
+        "owner_uid": resolved_info.st_uid,
+        "owner_gid": resolved_info.st_gid,
+        "mode": stat.S_IMODE(resolved_info.st_mode),
+        "binary_sha256": _sha256(payload),
+        "dependencies": _dependency_tree_contract(
+            APPROVED_SITE_PACKAGES
+        ),
+    }
+
+
 def build_input_manifest(project_root: Path) -> dict[str, object]:
     files = expected_manifest_files(project_root)
     hashes = {
@@ -160,6 +358,7 @@ def build_input_manifest(project_root: Path) -> dict[str, object]:
         "adapter_executable": "scripts/run_wb_four_region_nightly.sh",
         "files": list(files),
         "file_sha256": hashes,
+        "python_runtime": _python_runtime_contract(),
     }
 
 
@@ -181,6 +380,7 @@ def verify_input_manifest(project_root: Path) -> str:
             "adapter_executable",
             "files",
             "file_sha256",
+            "python_runtime",
         }
         or value.get("schema_version") != MANIFEST_SCHEMA_VERSION
         or value.get("adapter_executable")
@@ -206,6 +406,8 @@ def verify_input_manifest(project_root: Path) -> str:
             or _sha256(_safe_read(project_root, relative)) != expected_hash
         ):
             _fail("coordinator_input_manifest_hash_mismatch")
+    if value.get("python_runtime") != _python_runtime_contract():
+        _fail("coordinator_python_runtime_mismatch")
     return _sha256(manifest_bytes)
 
 
@@ -214,32 +416,47 @@ def _runtime_file_digest(
     path_value: str,
     *,
     required: bool,
+    expected_relative: str,
 ) -> dict[str, object]:
     if not path_value:
         if required:
             _fail("coordinator_runtime_input_missing")
         return {"present": False, "sha256": ""}
+    expected = project_root / _safe_relative(expected_relative)
     path = Path(path_value)
     if not path.is_absolute():
         path = project_root / path
+    if path != expected:
+        _fail("coordinator_runtime_input_path_invalid")
     if not os.path.lexists(path):
         if required:
             _fail("coordinator_runtime_input_missing")
         return {"present": False, "sha256": ""}
-    try:
-        relative = path.resolve(strict=False).relative_to(
-            project_root.resolve(strict=True)
-        )
-    except ValueError:
-        _fail("coordinator_runtime_input_path_invalid")
+    relative = _safe_relative(expected_relative)
     encoded = _safe_read(project_root, relative.as_posix(), exact_mode=0o600)
-    return {"present": True, "sha256": _sha256(encoded)}
+    return {
+        "present": True,
+        "relative_path": relative.as_posix(),
+        "sha256": _sha256(encoded),
+    }
 
 
 def runtime_input_sha256(
     project_root: Path,
     environment: Mapping[str, str],
 ) -> str:
+    try:
+        strict = load_strict_runtime_environment(
+            project_root=project_root,
+            base_environment=environment,
+        )
+    except RuntimeEnvironmentError as exc:
+        _fail(exc.code)
+    if any(
+        environment.get(key) != strict.environment.get(key)
+        for key in strict.exported_keys
+    ):
+        _fail("coordinator_runtime_environment_mismatch")
     selected = {
         key: value
         for key, value in environment.items()
@@ -253,16 +470,19 @@ def runtime_input_sha256(
         project_root,
         str(project_root / "config/runtime.env"),
         required=True,
+        expected_relative="config/runtime.env",
     )
     headers = _runtime_file_digest(
         project_root,
         environment.get("PARSER_WB_REQUEST_HEADERS_FILE", ""),
         required=True,
+        expected_relative="config/wb_request_headers.json",
     )
     cookie = _runtime_file_digest(
         project_root,
-        str(project_root / "config/wb_cookie.txt"),
-        required=False,
+        environment.get("WB_COOKIE_FILE", ""),
+        required=True,
+        expected_relative="config/wb_cookie.txt",
     )
     payload = {
         "schema_version": "wb_runtime_input_fingerprint_v1",
@@ -275,6 +495,7 @@ def runtime_input_sha256(
             ).encode("utf-8")
         ),
         "runtime_env": runtime_env,
+        "runtime_source_set_sha256": strict.source_set_sha256,
         "request_headers": headers,
         "cookie": cookie,
     }

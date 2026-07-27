@@ -32,6 +32,7 @@ from app.common.nightly_coordinator import (
 from app.common.nightly_attestation import (
     capture_attested_environment,
     verify_attested_environment,
+    verify_input_manifest,
 )
 
 
@@ -255,6 +256,7 @@ def _run_four_region(arguments: list[str]) -> int:
     lease = acquire_marketplace_collection_lease()
     terminal_committed = False
     writing_terminal = False
+    publication_gate = lambda: verify_input_manifest(PROJECT_ROOT)
     try:
         invocation = lease.invocation
         _validate_four_region_command(arguments, invocation=invocation)
@@ -268,12 +270,17 @@ def _run_four_region(arguments: list[str]) -> int:
                 "wb_python_runtime_unavailable",
                 outcome="hard_failure",
             )
+        publication_gate()
         child_env = load_required_runtime_environment(
             project_root=PROJECT_ROOT,
             lease=lease,
         )
         child_env.update(descendant_lease_environment(lease))
         child_env = capture_attested_environment(PROJECT_ROOT, child_env)
+        publication_gate = lambda: verify_attested_environment(
+            PROJECT_ROOT,
+            child_env,
+        )
         run_ref = (
             invocation.resume_ref
             if invocation is not None and invocation.phase == "resume"
@@ -389,6 +396,7 @@ def _run_four_region(arguments: list[str]) -> int:
             started_at_utc=started,
             finished_at_utc=finished,
             report_refs=report_refs,
+            integrity_gate=publication_gate,
         )
         writing_terminal = False
         terminal_committed = True
@@ -412,6 +420,7 @@ def _run_four_region(arguments: list[str]) -> int:
                 reason_code=exc.code,
                 started_at_utc=started,
                 finished_at_utc=_utc_now(),
+                integrity_gate=publication_gate,
             )
             writing_terminal = False
             terminal_committed = True
@@ -435,6 +444,7 @@ def _run_passthrough(arguments: list[str]) -> int:
                 outcome="hard_failure",
             )
         target = _canonical_passthrough_target(arguments[0])
+        verify_input_manifest(PROJECT_ROOT)
         env = os.environ.copy()
         env.update(descendant_lease_environment(lease))
         pass_fds = lease.pass_fds

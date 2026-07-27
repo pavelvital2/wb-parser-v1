@@ -1,12 +1,18 @@
 ﻿from __future__ import annotations
 
+import hashlib
+import sqlite3
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.common import cli as wb_cli
+from app.common.nightly_coordinator import NightlyCoordinatorContractError
 from app.common.run_context import utc_now_iso
 from app.common.state_db import StateDB
 from app.webui.app import create_app
+from app.webui import services as webui_services
 
 
 def _write_text(path: Path, content: str) -> None:
@@ -166,3 +172,128 @@ def test_action_endpoint_starts_task(tmp_path: Path, monkeypatch) -> None:
     assert r.status_code == 303
     assert "run" in " ".join(str(x) for x in launched.get("cmd", []))
     assert "serp" in " ".join(str(x) for x in launched.get("cmd", []))
+
+
+def test_webui_mutations_require_host_lease_after_cutover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_config(tmp_path)
+    monkeypatch.setenv("WEBUI_ADMIN_PASSWORD", "secret")
+    monkeypatch.setenv("WEBUI_SECRET_KEY", "secret-key")
+    app = create_app(config_path=str(cfg))
+    services = app.state.webui_services
+    prefixes = tmp_path / "config/prefixes.txt"
+    before = prefixes.read_bytes()
+
+    def refuse() -> None:
+        raise NightlyCoordinatorContractError(
+            "official_live_entry_requires_lock_v3",
+            outcome="hard_failure",
+        )
+
+    monkeypatch.setattr(
+        webui_services,
+        "require_official_live_entry_lease",
+        refuse,
+    )
+    with pytest.raises(NightlyCoordinatorContractError):
+        services.save_text_config("prefixes", "changed\n")
+    with pytest.raises(NightlyCoordinatorContractError):
+        services.save_wordstat_upload("input.csv", b"changed\n")
+    assert prefixes.read_bytes() == before
+    assert not (tmp_path / "data/raw/wordstat/input.csv").exists()
+
+
+def test_all_webui_actions_use_reviewed_live_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_config(tmp_path)
+    monkeypatch.setenv("WEBUI_ADMIN_PASSWORD", "secret")
+    monkeypatch.setenv("WEBUI_SECRET_KEY", "secret-key")
+    app = create_app(config_path=str(cfg))
+    captured: list[list[str]] = []
+
+    class DummyProc:
+        pid = 12345
+
+    monkeypatch.setattr(
+        webui_services.subprocess,
+        "Popen",
+        lambda command, **_kwargs: (
+            captured.append(list(command)) or DummyProc()
+        ),
+    )
+    ok, _message = app.state.webui_services.start_action(
+        target="filter",
+        user="admin",
+    )
+    assert ok is True
+    assert captured == [
+        [
+            str(tmp_path / "scripts/run_wb_live_component.sh"),
+            "filter",
+            "--job-id",
+            "webui_admin",
+        ]
+    ]
+
+
+def test_read_only_cli_never_migrates_legacy_sqlite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_config(tmp_path)
+    db_path = tmp_path / "state/sqlite/state.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                component TEXT NOT NULL,
+                job_id TEXT,
+                status TEXT NOT NULL,
+                created_at_utc TEXT NOT NULL,
+                started_at_utc TEXT,
+                finished_at_utc TEXT,
+                items_ok INTEGER NOT NULL DEFAULT 0,
+                items_error INTEGER NOT NULL DEFAULT 0,
+                critical_errors INTEGER NOT NULL DEFAULT 0,
+                non_critical_errors INTEGER NOT NULL DEFAULT 0,
+                note TEXT
+            );
+            CREATE TABLE tasks (id INTEGER PRIMARY KEY);
+            CREATE TABLE errors (
+                id INTEGER PRIMARY KEY,
+                error_class TEXT
+            );
+            CREATE TABLE checkpoints (
+                component TEXT,
+                checkpoint_key TEXT
+            );
+            INSERT INTO runs(
+                run_id, component, status, created_at_utc
+            ) VALUES(
+                '20260727_000000Z', 'serp', 'success',
+                '2026-07-27T00:00:00Z'
+            );
+            """
+        )
+    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    monkeypatch.setenv("WEBUI_ADMIN_PASSWORD", "secret")
+    monkeypatch.setenv("WEBUI_SECRET_KEY", "secret-key")
+    assert wb_cli.cmd_runs(str(cfg), 5) == 0
+    assert wb_cli.cmd_doctor(str(cfg)) in {0, 1}
+    after = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    assert after == before
+    with sqlite3.connect(db_path) as conn:
+        run_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(runs)")
+        }
+        error_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(errors)")
+        }
+    assert "pipeline" not in run_columns
+    assert "error_code" not in error_columns

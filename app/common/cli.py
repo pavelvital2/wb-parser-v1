@@ -141,18 +141,16 @@ def _doctor_checks(config: AppConfig, db: StateDB) -> tuple[list[str], list[str]
         elif not p.is_dir():
             errors.append(f"path is not directory {name}: {p}")
 
-    db.init_schema()
-    try:
-        with sqlite3.connect(config.paths.SQLITE_DB) as conn:
-            tables = {
-                row[0]
-                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            }
-        for table in {"runs", "tasks", "errors", "checkpoints"}:
-            if table not in tables:
-                errors.append(f"state_db missing table: {table}")
-    except Exception as exc:
-        errors.append(f"state_db is not readable: {exc}")
+    if not db.db_path.exists():
+        warnings.append(f"state_db not found yet: {db.db_path}")
+    else:
+        try:
+            schema = db.schema_snapshot_read_only()
+            for table in {"runs", "tasks", "errors", "checkpoints"}:
+                if table not in schema:
+                    errors.append(f"state_db missing table: {table}")
+        except Exception as exc:
+            errors.append(f"state_db is not readable: {exc}")
 
     suggest_cfg = config.raw.get("suggest", {})
     filter_cfg = config.raw.get("filter", {})
@@ -236,7 +234,7 @@ def cmd_doctor(config_path: str) -> int:
     config = load_config(config_path)
     configure_logging(config)
     logger = get_logger("doctor")
-    db = StateDB(config.paths.SQLITE_DB)
+    db = StateDB(config.paths.SQLITE_DB, create_parent=False)
 
     errors, warnings = _doctor_checks(config=config, db=db)
 
@@ -262,9 +260,12 @@ def cmd_doctor(config_path: str) -> int:
 def cmd_runs(config_path: str, limit: int) -> int:
     config = load_config(config_path)
     configure_logging(config)
-    db = StateDB(config.paths.SQLITE_DB)
-    db.init_schema()
-    rows = db.list_runs(limit=limit)
+    db = StateDB(config.paths.SQLITE_DB, create_parent=False)
+    try:
+        rows = db.list_runs_read_only(limit=limit)
+    except (OSError, sqlite3.Error):
+        print("State DB is not readable")
+        return 1
     if not rows:
         print("No runs yet")
         return 0

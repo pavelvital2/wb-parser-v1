@@ -20,6 +20,10 @@ from zoneinfo import ZoneInfo
 import requests
 
 from app.common.config import AppConfig
+from app.common.durable_atomic import (
+    DurableAtomicWriteError,
+    durable_atomic_replace,
+)
 from app.common.exceptions import CriticalPipelineError
 from app.common.proxy_required import (
     assert_requests_session_proxy,
@@ -681,39 +685,27 @@ def _write_atomic_bytes(
     *,
     project_root: Path,
     event_hook: WriteEventHook | None = None,
+    integrity_gate: Callable[[], None] | None = None,
+    require_absent: bool = False,
 ) -> None:
     _ensure_scoped_parent(
         path,
         project_root=project_root,
         event_hook=event_hook,
     )
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise CollectionPlanRunError(f"atomic target must be a regular file: {path}")
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = -1
     try:
-        fd = os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        view = memoryview(payload)
-        while view:
-            written = os.write(fd, view)
-            view = view[written:]
-        os.fsync(fd)
-        if event_hook is not None:
-            event_hook("file_fsynced", path)
-        os.close(fd)
-        fd = -1
-        os.replace(temp_path, path)
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-        if event_hook is not None:
-            event_hook("directory_fsynced", path)
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        temp_path.unlink(missing_ok=True)
+        durable_atomic_replace(
+            path,
+            payload,
+            mode=0o600,
+            require_absent=require_absent,
+            integrity_gate=integrity_gate,
+            event_hook=event_hook,
+        )
+    except DurableAtomicWriteError as exc:
+        raise CollectionPlanRunError(
+            f"durable atomic write failed: {path}"
+        ) from exc
 
 
 def _json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -1734,9 +1726,16 @@ class CollectionPlanRunner:
             payload,
             project_root=self.config.project_root,
             event_hook=self.write_event_hook,
+            integrity_gate=self.input_integrity_gate,
         )
 
-    def _write_or_verify(self, path: Path, payload: bytes) -> None:
+    def _write_or_verify(
+        self,
+        path: Path,
+        payload: bytes,
+        *,
+        publication: bool = False,
+    ) -> None:
         if path.exists():
             existing = _read_regular_bytes(
                 path,
@@ -1747,7 +1746,22 @@ class CollectionPlanRunner:
                     f"immutable artifact content mismatch: {path}"
                 )
             return
-        self._write(path, payload)
+        if publication:
+            _ensure_scoped_parent(
+                path,
+                project_root=self.config.project_root,
+                event_hook=self.write_event_hook,
+            )
+            _write_atomic_bytes(
+                path,
+                payload,
+                project_root=self.config.project_root,
+                event_hook=self.write_event_hook,
+                integrity_gate=self.input_integrity_gate,
+                require_absent=True,
+            )
+        else:
+            self._write(path, payload)
 
     def _estimated_remaining_seconds(
         self,
@@ -2458,7 +2472,11 @@ class CollectionPlanRunner:
             }
             payload_bytes = _json_bytes(payload)
             target = paths.latest_region_manifest_path(region["region_id"])
-            self._write_or_verify(target, payload_bytes)
+            self._write_or_verify(
+                target,
+                payload_bytes,
+                publication=True,
+            )
             region_refs.append(
                 {
                     "region_id": region["region_id"],

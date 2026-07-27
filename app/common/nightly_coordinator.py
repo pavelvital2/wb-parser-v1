@@ -7,14 +7,21 @@ import json
 import os
 import re
 import stat
-import subprocess
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
+from .durable_atomic import (
+    DurableAtomicWriteError,
+    durable_atomic_replace,
+)
 from .exceptions import CriticalPipelineError
+from .runtime_env import (
+    RuntimeEnvironmentError,
+    load_strict_runtime_environment,
+)
 
 
 RESULT_SCHEMA_VERSION = "marketplace_parser_result_v3"
@@ -46,7 +53,6 @@ RUN_ID = re.compile(r"^nightly-(\d{8})-[a-f0-9]{6,32}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 WB_RUN_REF = re.compile(r"^[0-9]{8}_[0-9]{6}Z$")
 MAX_RESULT_BYTES = 1024 * 1024
-MAX_RUNTIME_ENV_BYTES = 4 * 1024 * 1024
 MAX_QUARANTINE_BYTES = 16 * 1024
 
 COORDINATOR_ENV_KEYS = {
@@ -923,62 +929,26 @@ def load_required_runtime_environment(
     lease: MarketplaceCollectionLease,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    loader = project_root / "scripts/wb_runtime_env.sh"
-    runtime_env = project_root / "config/runtime.env"
     lease.assert_held()
-    command = (
-        "/bin/bash",
-        "-c",
-        'source "$1"; wb_load_required_runtime_env "$2"; /usr/bin/env -0',
-        "wb-runtime-loader",
-        str(loader),
-        str(runtime_env),
-    )
     try:
-        completed = subprocess.run(
-            command,
-            cwd=project_root,
-            env=dict(environment if environment is not None else os.environ),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=15,
-            check=False,
-            close_fds=True,
-            pass_fds=lease.pass_fds,
+        loaded = load_strict_runtime_environment(
+            project_root=project_root,
+            base_environment=(
+                environment if environment is not None else os.environ
+            ),
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except RuntimeEnvironmentError as exc:
         raise NightlyCoordinatorContractError(
-            "wb_runtime_environment_load_failed",
+            exc.code,
             outcome="hard_failure",
         ) from exc
-    if (
-        completed.returncode != 0
-        or len(completed.stdout) > MAX_RUNTIME_ENV_BYTES
-        or len(completed.stderr) > MAX_RUNTIME_ENV_BYTES
-    ):
-        raise NightlyCoordinatorContractError(
-            "wb_runtime_environment_load_failed",
-            outcome="hard_failure",
-        )
-    loaded: dict[str, str] = {}
-    try:
-        for item in completed.stdout.split(b"\0"):
-            if not item:
-                continue
-            key, value = item.split(b"=", 1)
-            loaded[os.fsdecode(key)] = os.fsdecode(value)
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise NightlyCoordinatorContractError(
-            "wb_runtime_environment_load_failed",
-            outcome="hard_failure",
-        ) from exc
-    if loaded.get("PARSER_WB_RUNTIME_ENV_LOADED") != "1":
+    if loaded.environment.get("PARSER_WB_RUNTIME_ENV_LOADED") != "1":
         raise NightlyCoordinatorContractError(
             "wb_runtime_environment_not_attested",
             outcome="hard_failure",
         )
     lease.assert_held()
-    return loaded
+    return loaded.environment
 
 
 def write_terminal_result(
@@ -991,6 +961,8 @@ def write_terminal_result(
     started_at_utc: datetime,
     finished_at_utc: datetime,
     report_refs: tuple[str, ...] = (),
+    integrity_gate: Callable[[], None] | None = None,
+    write_event_hook: Callable[[str, Path], None] | None = None,
 ) -> int:
     if outcome not in EXIT_BY_OUTCOME:
         raise NightlyCoordinatorContractError(
@@ -1108,51 +1080,18 @@ def write_terminal_result(
             "coordinator_result_already_exists",
             outcome="hard_failure",
         )
-    temp = parent / f".{result_path.name}.{invocation.invocation_id}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(temp, flags, 0o440)
     try:
-        os.fchmod(fd, 0o440)
-        view = memoryview(encoded)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError("terminal result write made no progress")
-            view = view[written:]
-        os.fsync(fd)
-    except Exception:
-        temp.unlink(missing_ok=True)
-        raise
-    finally:
-        os.close(fd)
-    os.replace(temp, result_path)
-    directory_fd = os.open(
-        parent,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-    )
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-    verify_flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        verify_flags |= os.O_NOFOLLOW
-    verify_fd = os.open(result_path, verify_flags)
-    try:
-        info = os.fstat(verify_fd)
-        verified = os.read(verify_fd, MAX_RESULT_BYTES + 1)
-    finally:
-        os.close(verify_fd)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.geteuid()
-        or stat.S_IMODE(info.st_mode) != 0o440
-        or verified != encoded
-    ):
-        raise NightlyCoordinatorContractError(
-            "coordinator_result_verification_failed",
-            outcome="hard_failure",
+        durable_atomic_replace(
+            result_path,
+            encoded,
+            mode=0o440,
+            require_absent=True,
+            integrity_gate=integrity_gate,
+            event_hook=write_event_hook,
         )
+    except DurableAtomicWriteError as exc:
+        raise NightlyCoordinatorContractError(
+            "coordinator_result_commit_failed",
+            outcome="hard_failure",
+        ) from exc
     return EXIT_BY_OUTCOME[outcome]

@@ -453,9 +453,15 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   inherited guard and validation FD/inode/owner/mode plus quarantine before
   runtime or network work. The parser-owned subreaper supervisor retains both
   descriptors until all adopted descendants exit. The versioned input manifest
-  and hash-only runtime fingerprint are pinned per invocation and rechecked
-  before stages and publication; empty or corrupt scoped state must never be
-  advertised as resumable.
+  pins the complete tracked graph, `requirements.txt`, exact centralized Python
+  runtime and approved installed dependency tree. Coordinator runtime loading
+  uses the strict dotenv parser under the lease, never shell-sources
+  `runtime.env`, and requires canonical ignored cookie/header paths. Hash-only
+  runtime provenance is rechecked before stages and inside durable,
+  symlink-safe publication writers. After cutover, WebUI config/upload
+  mutations require the same validated lease; read-only CLI/WebUI inspection
+  must not implicitly initialize or migrate SQLite. Empty or corrupt scoped
+  state must never be advertised as resumable.
 - On 2026-07-14, `state/locks/pipeline.lock` recovery was hardened after an
   empty lock with no owner blocked the nightly retry path until
   `runtime.lock_stale_seconds`. A working lock must not be removed: active is

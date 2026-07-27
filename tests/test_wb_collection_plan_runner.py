@@ -1754,6 +1754,37 @@ def test_all_locks_remain_held_through_final_manifest_fsync_and_release_reverse(
     assert release_events == ["collection_plan", "warehouse", "pipeline", "daily"]
 
 
+def test_scoped_atomic_publication_rechecks_integrity_before_replace(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    target = root / "state/wb_collection_plans/plan/run/manifest.json"
+    influencing_file = root / "config/influencing.json"
+    influencing_file.parent.mkdir(parents=True)
+    influencing_file.write_text('{"version":1}\n', encoding="utf-8")
+    expected_sha256 = hashlib.sha256(influencing_file.read_bytes()).hexdigest()
+
+    def integrity_gate() -> None:
+        if hashlib.sha256(influencing_file.read_bytes()).hexdigest() != expected_sha256:
+            raise CollectionPlanRunError("input attestation changed")
+
+    def mutate_before_gate(event: str, _path: Path) -> None:
+        if event == "before_integrity_check":
+            influencing_file.write_text('{"version":2}\n', encoding="utf-8")
+
+    with pytest.raises(CollectionPlanRunError, match="input attestation changed"):
+        runner_module._write_atomic_bytes(
+            target,
+            b'{"status":"success"}\n',
+            project_root=root,
+            event_hook=mutate_before_gate,
+            integrity_gate=integrity_gate,
+        )
+
+    assert not target.exists()
+    assert not list(target.parent.glob(f".{target.name}.*.tmp"))
+
+
 def test_partial_http_failure_has_no_retry_and_cannot_be_complete(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

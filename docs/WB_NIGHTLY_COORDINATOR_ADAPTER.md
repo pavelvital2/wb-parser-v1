@@ -30,10 +30,13 @@ before loading `config/runtime.env` or starting parser work:
 2. validate or acquire the host locks in fixed order `guard -> validation`;
 3. inspect the quarantine marker while both locks are held;
 4. validate the exact four-region command and reject other plans;
-5. verify the versioned input manifest, then load and hash the effective
-   runtime inputs without exposing their values;
-6. recheck the absolute deadline immediately before process creation;
-7. pass both host-lock descriptors to a Linux subreaper supervisor, which
+5. verify the versioned input manifest, exact centralized Python
+   binary/version/hash and the approved installed dependency tree;
+6. parse `config/runtime.env` in-process with the strict dotenv grammar, bind
+   the canonical cookie/header files and hash effective runtime inputs without
+   exposing their values;
+7. recheck the absolute deadline immediately before process creation;
+8. pass both host-lock descriptors to a Linux subreaper supervisor, which
    retains them until the process group and adopted descendants have exited.
 
 The coordinator owns the guard lock. Its inherited validation FD is checked
@@ -53,9 +56,11 @@ cutoffs.
 ## Terminal Result
 
 The adapter writes one exact JSON result to the path supplied by the
-coordinator. The file is written by temporary-file replace, file and directory
-`fsync`, verified byte-for-byte, and has mode `0440`. It is the final adapter
-action before the matching process exit.
+coordinator. The writer refuses symlink components and non-regular targets,
+writes a same-directory exclusive temporary file, performs file `fsync`,
+rechecks attested inputs inside the writer immediately before `rename`, then
+performs directory `fsync` and exact byte verification. The result has mode
+`0440` and is the final adapter action before the matching process exit.
 
 Outcomes are:
 
@@ -121,11 +126,23 @@ The contract checker returns at most 32 direct coordinator roots, including
 the attested verifier and
 `config/wb/nightly_coordinator_adapter_inputs.json`. That versioned manifest
 contains the complete tracked Python/shell/config/query-pack graph and exact
-SHA-256 values. The adapter pins the manifest SHA per invocation and rechecks
-the graph and hash-only effective runtime inputs before each stage and
-immediately before scoped or downstream publication. Runtime values, cookies,
-headers and proxy URLs are never written to evidence. It performs no network
-calls.
+SHA-256 values, `requirements.txt`, the exact centralized Python executable
+path/version/hash, and a deterministic digest of the approved installed
+site-packages tree. The adapter pins the manifest SHA per invocation and
+rechecks the graph, Python/dependencies and hash-only effective runtime inputs
+before each stage and inside every durable publication writer. The coordinator
+path never shell-sources `runtime.env`; the strict parser accepts only reviewed
+dotenv assignments and the single approved shared proxy-env include. The
+effective `WB_COOKIE_FILE` must resolve to the canonical ignored
+`config/wb_cookie.txt`; substitutes fail before child execution. Runtime values,
+cookies, headers and proxy URLs are never written to evidence. The checks
+perform no network calls.
+
+After lock-v3 cutover, WebUI config/upload mutations require the same validated
+lease and WebUI collection actions use `scripts/run_wb_live_component.sh`.
+Without a valid descendant lease they fail closed. Read-only `doctor`, `runs`
+and WebUI run listing open SQLite in read-only/query-only mode and must not
+create directories or migrate schema implicitly.
 
 ## Cutover Gates
 

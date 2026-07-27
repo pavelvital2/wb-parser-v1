@@ -2,7 +2,6 @@
 
 import sqlite3
 import subprocess
-import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,7 +10,9 @@ from typing import Any
 import yaml
 
 from app.common.config import AppConfig
+from app.common.durable_atomic import durable_atomic_replace
 from app.common.logging_setup import get_logger
+from app.common.nightly_coordinator import require_official_live_entry_lease
 
 
 ALLOWED_ACTIONS = {"suggest", "filter", "serp", "sellers", "monthly", "daily"}
@@ -36,30 +37,41 @@ class WebUIServices:
         )
 
     def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT
-                    r.run_id,
-                    COALESCE(r.pipeline, r.component, '') AS component,
-                    r.status,
-                    r.started_at_utc,
-                    r.finished_at_utc,
-                    COALESCE((
-                        SELECT e.error_message
-                        FROM errors e
-                        WHERE e.run_id = r.run_id
-                        ORDER BY e.id DESC
-                        LIMIT 1
-                    ), '') AS error_message
-                FROM runs r
-                ORDER BY r.created_at_utc DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-            return [dict(row) for row in rows]
+        try:
+            resolved = self.db_path.resolve(strict=True)
+        except (OSError, sqlite3.Error):
+            return []
+        try:
+            with sqlite3.connect(
+                f"{resolved.as_uri()}?mode=ro",
+                uri=True,
+            ) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only=ON;")
+                rows = conn.execute(
+                    """
+                    SELECT
+                        r.run_id,
+                        COALESCE(r.pipeline, r.component, '') AS component,
+                        r.status,
+                        r.started_at_utc,
+                        r.finished_at_utc,
+                        COALESCE((
+                            SELECT e.error_message
+                            FROM errors e
+                            WHERE e.run_id = r.run_id
+                            ORDER BY e.id DESC
+                            LIMIT 1
+                        ), '') AS error_message
+                    FROM runs r
+                    ORDER BY r.created_at_utc DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error:
+            return []
 
     def latest_outputs(self) -> list[dict[str, str]]:
         targets = [
@@ -181,6 +193,7 @@ class WebUIServices:
         return p.read_text(encoding="utf-8")
 
     def save_text_config(self, name: str, content: str) -> None:
+        require_official_live_entry_lease()
         p = self.config_file_path(name)
         p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -192,9 +205,15 @@ class WebUIServices:
             if content and not content.endswith("\n"):
                 content += "\n"
 
-        p.write_text(content, encoding="utf-8")
+        mode = p.stat().st_mode & 0o777 if p.exists() else 0o600
+        durable_atomic_replace(
+            p,
+            content.encode("utf-8"),
+            mode=mode,
+        )
 
     def save_wordstat_upload(self, filename: str, payload: bytes) -> Path:
+        require_official_live_entry_lease()
         clean_name = Path(filename or "wordstat_upload.csv").name
         if not clean_name.lower().endswith(".csv"):
             clean_name = f"{clean_name}.csv"
@@ -207,7 +226,12 @@ class WebUIServices:
             stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
             target = target_dir / f"{target.stem}_{stamp}{target.suffix}"
 
-        target.write_bytes(payload)
+        durable_atomic_replace(
+            target,
+            payload,
+            mode=0o600,
+            require_absent=True,
+        )
         return target
 
     def start_action(self, target: str, user: str) -> tuple[bool, str]:
@@ -215,28 +239,16 @@ class WebUIServices:
         if action not in ALLOWED_ACTIONS:
             return False, f"Unsupported action: {target}"
 
-        if action == "filter":
-            cmd = [
-                sys.executable,
-                str(self.config.project_root / "main.py"),
-                "--config",
-                str(self.config.config_file),
-                "run",
-                action,
-                "--job-id",
-                f"webui_{user}",
-            ]
-        else:
-            cmd = [
-                str(
-                    self.config.project_root
-                    / "scripts"
-                    / "run_wb_live_component.sh"
-                ),
-                action,
-                "--job-id",
-                f"webui_{user}",
-            ]
+        cmd = [
+            str(
+                self.config.project_root
+                / "scripts"
+                / "run_wb_live_component.sh"
+            ),
+            action,
+            "--job-id",
+            f"webui_{user}",
+        ]
 
         try:
             proc = subprocess.Popen(

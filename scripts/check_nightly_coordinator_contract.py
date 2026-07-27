@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.common.nightly_attestation import (
+    MANIFEST_SCHEMA_VERSION,
     MANIFEST_RELATIVE_PATH,
     verify_input_manifest,
 )
@@ -34,9 +35,16 @@ DIRECT_ATTESTATION_ROOTS = (
     PROJECT_ROOT / MANIFEST_RELATIVE_PATH,
     PROJECT_ROOT / "app/common/nightly_attestation.py",
     PROJECT_ROOT / "app/common/nightly_coordinator.py",
+    PROJECT_ROOT / "app/common/runtime_env.py",
+    PROJECT_ROOT / "app/common/durable_atomic.py",
+    PROJECT_ROOT / "app/common/state_db.py",
+    PROJECT_ROOT / "app/webui/app.py",
+    PROJECT_ROOT / "app/webui/services.py",
     PROJECT_ROOT / "scripts/check_nightly_coordinator_contract.py",
     PROJECT_ROOT / "scripts/marketplace_lock_v3_supervisor.py",
     PROJECT_ROOT / "scripts/wb_nightly_coordinator_adapter.py",
+    PROJECT_ROOT / "scripts/wb_runtime_env.py",
+    PROJECT_ROOT / "scripts/wb_runtime_env.sh",
     PROJECT_ROOT / "scripts/run_wb_four_region_nightly.py",
     ADAPTER,
     PLAN,
@@ -192,6 +200,106 @@ def _validate_sources() -> list[dict[str, str]]:
         PROJECT_ROOT / "scripts/run_wb_collection_plan.py",
         executable=True,
     ).decode("utf-8")
+    manifest = _json_object(
+        _read_safe(PROJECT_ROOT / MANIFEST_RELATIVE_PATH),
+        "input manifest",
+    )
+    runtime_shell_source = _read_safe(
+        PROJECT_ROOT / "scripts/wb_runtime_env.sh",
+        executable=True,
+    ).decode("utf-8")
+    runtime_python_source = _read_safe(
+        PROJECT_ROOT / "scripts/wb_runtime_env.py",
+    ).decode("utf-8")
+    runtime_contract_source = _read_safe(
+        PROJECT_ROOT / "app/common/runtime_env.py",
+    ).decode("utf-8")
+    attestation_source = _read_safe(
+        PROJECT_ROOT / "app/common/nightly_attestation.py",
+    ).decode("utf-8")
+    durable_source = _read_safe(
+        PROJECT_ROOT / "app/common/durable_atomic.py",
+    ).decode("utf-8")
+    coordinator_source = _read_safe(
+        PROJECT_ROOT / "app/common/nightly_coordinator.py",
+    ).decode("utf-8")
+    scoped_source = _read_safe(
+        PROJECT_ROOT / "app/serp/collection_plan_runner.py",
+    ).decode("utf-8")
+    downstream_source = _read_safe(
+        PROJECT_ROOT / "app/serp/four_region_nightly.py",
+    ).decode("utf-8")
+    warehouse_source = _read_safe(
+        PROJECT_ROOT / "app/warehouse/wb_regional.py",
+    ).decode("utf-8")
+    webui_app_source = _read_safe(
+        PROJECT_ROOT / "app/webui/app.py",
+    ).decode("utf-8-sig")
+    webui_services_source = _read_safe(
+        PROJECT_ROOT / "app/webui/services.py",
+    ).decode("utf-8-sig")
+    if (
+        manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        or "requirements.txt" not in manifest.get("files", [])
+        or not isinstance(manifest.get("python_runtime"), dict)
+        or not isinstance(
+            manifest.get("python_runtime", {}).get("dependencies"),
+            dict,
+        )
+    ):
+        raise CheckError("runtime attestation manifest contract mismatch")
+    if (
+        'source "$runtime_env_file"' in runtime_shell_source
+        or ". \"$runtime_env_file\"" in runtime_shell_source
+        or "wb_runtime_env.py" not in runtime_shell_source
+        or "require_official_live_entry_lease(environment=os.environ)"
+        not in runtime_python_source
+        or "load_strict_runtime_environment" not in runtime_python_source
+        or "subprocess" in runtime_contract_source
+        or "runtime_cookie_path_invalid" not in runtime_contract_source
+        or "APPROVED_PYTHON_BIN" not in attestation_source
+        or "APPROVED_SITE_PACKAGES" not in attestation_source
+        or "coordinator_python_runtime_mismatch" not in attestation_source
+    ):
+        raise CheckError("runtime loading/attestation contract mismatch")
+    if (
+        "os.O_NOFOLLOW" not in durable_source
+        or "os.fsync(temp_fd)" not in durable_source
+        or "os.fsync(directory_fd)" not in durable_source
+        or "integrity_gate()" not in durable_source
+        or "require_absent=True" not in coordinator_source
+        or "integrity_gate=integrity_gate" not in coordinator_source
+        or "integrity_gate=integrity_gate" not in scoped_source
+        or "integrity_gate=lease.integrity_gate" not in downstream_source
+        or warehouse_source.count("integrity_gate()") < 2
+        or "integrity_gate=input_integrity_gate" not in downstream_source
+    ):
+        raise CheckError("durable publication contract mismatch")
+    if (
+        "db.init_schema()" in webui_app_source
+        or webui_services_source.count(
+            "require_official_live_entry_lease()"
+        )
+        < 2
+        or "run_wb_live_component.sh" not in webui_services_source
+        or "sys.executable" in webui_services_source
+    ):
+        raise CheckError("WebUI maintenance lease contract mismatch")
+    doctor_source = cli_source[
+        cli_source.index("def cmd_doctor"):
+        cli_source.index("\ndef cmd_runs")
+    ]
+    runs_source = cli_source[
+        cli_source.index("def cmd_runs"):
+        cli_source.index("\ndef cmd_cleanup")
+    ]
+    if (
+        "init_schema" in doctor_source
+        or "init_schema" in runs_source
+        or "list_runs_read_only" not in runs_source
+        or "schema_snapshot_read_only" not in cli_source
+    ):
+        raise CheckError("read-only CLI state contract mismatch")
     if (
         "require_official_live_entry_lease(environment=os.environ)"
         not in cli_source
