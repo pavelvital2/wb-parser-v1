@@ -23,8 +23,13 @@ from app.common.nightly_coordinator import (
     parse_utc,
     require_official_live_entry_lease,
 )
+from app.common.nightly_attestation import integrity_gate
 from app.serp.collection_plan import CollectionPlanValidationError
-from app.serp.collection_plan_runner import CollectionPlanRunError, run_collection_plan
+from app.serp.collection_plan_runner import (
+    CollectionPlanRunError,
+    run_collection_plan,
+    validate_resumable_collection_state,
+)
 from app.serp.four_region_nightly import (
     FOUR_REGION_PLAN_ID,
     PRE_CUTOVER_DOWNSTREAM_MODE,
@@ -153,33 +158,6 @@ def _completed_collection_manifest(
     return manifest
 
 
-def _has_resumable_collection_state(project_root: Path, run_id: str) -> bool:
-    run_dir = (
-        project_root
-        / "state/wb_collection_plans"
-        / FOUR_REGION_PLAN_ID
-        / run_id
-    )
-    manifest = _read_json(run_dir / "manifest.json")
-    snapshot = _read_json(run_dir / "effective_plan.json")
-    if (
-        manifest is None
-        or snapshot is None
-        or manifest.get("schema_version") != "wb_collection_plan_manifest_v2"
-        or manifest.get("run_id") != run_id
-        or manifest.get("collection_plan_id") != FOUR_REGION_PLAN_ID
-        or manifest.get("complete") is True
-    ):
-        return False
-    resume = manifest.get("resume")
-    return (
-        isinstance(resume, dict)
-        and isinstance(resume.get("segments"), list)
-        and snapshot.get("schema_version") == "wb_effective_collection_plan_v2"
-        and snapshot.get("collection_plan_id") == FOUR_REGION_PLAN_ID
-    )
-
-
 def _is_deferred_error(exc: BaseException) -> bool:
     if isinstance(exc, NightlyCoordinatorContractError):
         return exc.outcome == "deferred"
@@ -222,7 +200,8 @@ def main() -> int:
     config = None
     downstream_started = False
     try:
-        require_official_live_entry_lease()
+        require_official_live_entry_lease(environment=os.environ)
+        verify_inputs = integrity_gate(PROJECT_ROOT)
         absolute_deadline_utc = _adapter_deadline()
         if not args.downstream_only_run_id and not args.resume_run_id:
             run_id = _adapter_run_ref(now)
@@ -249,6 +228,7 @@ def main() -> int:
                 run_id=None if args.resume_run_id else run_id,
                 resume_run_id=args.resume_run_id,
                 absolute_deadline_utc=absolute_deadline_utc,
+                input_integrity_gate=verify_inputs,
             )
             if manifest.get("status") != "success" or manifest.get("complete") is not True:
                 raise CriticalPipelineError(
@@ -261,6 +241,7 @@ def main() -> int:
             run_id=str(manifest["run_id"]),
             execution_mode=PRE_CUTOVER_DOWNSTREAM_MODE,
             absolute_deadline_utc=absolute_deadline_utc,
+            input_integrity_gate=verify_inputs,
         )
     except (
         CriticalPipelineError,
@@ -275,7 +256,11 @@ def main() -> int:
                 error=exc,
             )
         resumable = config is not None and (
-            _has_resumable_collection_state(config.project_root, run_id)
+            validate_resumable_collection_state(
+                config=config,
+                plan_path=plan_path,
+                run_id=run_id,
+            )
             or _completed_collection_manifest(config.project_root, run_id)
             is not None
         )
@@ -291,6 +276,11 @@ def main() -> int:
             )
             print(f"{exc.__class__.__name__}: operation deferred", file=sys.stderr)
             return 75
+        if resumable and not _is_coordinator_resume_phase():
+            try:
+                verify_inputs()
+            except CriticalPipelineError:
+                resumable = False
         if resumable and not _is_coordinator_resume_phase():
             _emit_adapter_status(
                 outcome="checkpoint",
@@ -316,6 +306,17 @@ def main() -> int:
             reason_code="pipeline_hard_failure",
         )
         print(f"{exc.__class__.__name__}: operation failed", file=sys.stderr)
+        return 2
+    try:
+        verify_inputs()
+    except CriticalPipelineError:
+        _emit_adapter_status(
+            outcome="hard_failure",
+            run_ref=run_id,
+            resume_ref="",
+            reason_code="attested_input_changed",
+        )
+        print("WB attested input changed", file=sys.stderr)
         return 2
     _emit_adapter_status(
         outcome="success",

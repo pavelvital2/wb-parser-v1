@@ -60,7 +60,7 @@ def _isolate_host_lock_v3(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         four_region_launcher,
         "require_official_live_entry_lease",
-        lambda: None,
+        lambda **_kwargs: None,
     )
 
 
@@ -1142,11 +1142,16 @@ def test_legacy_nightly_wrapper_diff_is_only_lock_v3_bootstrap_and_safe_fd() -> 
         1,
     )
     source = source.replace(
-        '\nif [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" \\\n'
-        '  && ( -e "$COORDINATOR_LOCK_DIR" '
-        '|| -L "$COORDINATOR_LOCK_DIR" ) ]]; then\n'
-        '  exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" '
+        '\nif [[ -e "$COORDINATOR_LOCK_DIR" '
+        '|| -L "$COORDINATOR_LOCK_DIR" ]]; then\n'
+        '  if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" ]]; then\n'
+        '    exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" '
         'passthrough -- "$0" "$@"\n'
+        "  fi\n"
+        '  if ! "$PYTHON_BIN" "$COORDINATOR_ADAPTER" entry-check; then\n'
+        '    echo "WB host lock-v3 lease validation failed" >&2\n'
+        "    exit 2\n"
+        "  fi\n"
         "fi\n",
         "",
         1,
@@ -1167,6 +1172,11 @@ def test_launcher_blocks_downstream_for_partial_collection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     called = {"downstream": False}
+    monkeypatch.setattr(
+        four_region_launcher,
+        "validate_resumable_collection_state",
+        lambda **_kwargs: False,
+    )
     monkeypatch.setattr(
         four_region_launcher,
         "load_config",
@@ -1566,6 +1576,11 @@ def test_launcher_preserves_authoritative_downstream_failure_state(
 ) -> None:
     monkeypatch.setattr(
         four_region_launcher,
+        "validate_resumable_collection_state",
+        lambda **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
         "load_config",
         lambda _path: SimpleNamespace(project_root=tmp_path),
     )
@@ -1640,6 +1655,11 @@ def test_launcher_rejected_published_resume_preserves_state_and_latest(
     state_path, latest_path = _write_published_downstream_state(tmp_path)
     state_before = state_path.read_bytes()
     latest_before = latest_path.read_bytes()
+    monkeypatch.setattr(
+        four_region_launcher,
+        "validate_resumable_collection_state",
+        lambda **_kwargs: False,
+    )
     monkeypatch.setattr(
         four_region_launcher,
         "load_config",

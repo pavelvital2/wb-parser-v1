@@ -9,8 +9,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.common.nightly_attestation import (
+    MANIFEST_RELATIVE_PATH,
+    verify_input_manifest,
+)
+
 DEPLOYED_PROJECT_ROOT = Path("/home/pavel/projects/parser_wb")
 ADAPTER = PROJECT_ROOT / "scripts/run_wb_four_region_nightly.sh"
 PLAN = (
@@ -23,17 +30,19 @@ QUERY_PACK = (
     / "config/wb/query_packs/shevron-core/2026-07-26.1.json"
 )
 TRACKED_CONFIG = PROJECT_ROOT / "config/config.yaml"
-ATTESTED_RUNTIME_SOURCES = (
-    PROJECT_ROOT / "main.py",
-    PROJECT_ROOT / "app/common/cli.py",
+DIRECT_ATTESTATION_ROOTS = (
+    PROJECT_ROOT / MANIFEST_RELATIVE_PATH,
+    PROJECT_ROOT / "app/common/nightly_attestation.py",
     PROJECT_ROOT / "app/common/nightly_coordinator.py",
-    PROJECT_ROOT / "app/serp/collection_plan_runner.py",
-    PROJECT_ROOT / "app/serp/four_region_nightly.py",
+    PROJECT_ROOT / "scripts/check_nightly_coordinator_contract.py",
+    PROJECT_ROOT / "scripts/marketplace_lock_v3_supervisor.py",
     PROJECT_ROOT / "scripts/wb_nightly_coordinator_adapter.py",
-)
-ATTESTED_RUNTIME_EXECUTABLES = (
     PROJECT_ROOT / "scripts/run_wb_four_region_nightly.py",
-    PROJECT_ROOT / "scripts/wb_runtime_env.sh",
+    ADAPTER,
+    PLAN,
+    REGISTRY,
+    QUERY_PACK,
+    TRACKED_CONFIG,
 )
 RESULT_SCHEMA = "marketplace_parser_result_v3"
 LOCK_CONTRACT = "marketplace_collection_lock_v3"
@@ -61,6 +70,15 @@ OFFICIAL_ENTRYPOINTS = (
 COORDINATOR_DISABLED_ENTRYPOINTS = (
     "run_wb_persistent_session.sh",
     "run_wb_persistent_watchdog.sh",
+)
+DIRECT_PYTHON_ENTRYPOINTS = (
+    "run_wb_collection_plan.py",
+    "run_wb_four_region_nightly.py",
+    "wb_cookie_keeper.py",
+    "wb_nightly_preflight.py",
+    "wb_persistent_session.py",
+    "wb_persistent_session_watchdog.py",
+    "wb_warehouse.py",
 )
 
 
@@ -97,11 +115,12 @@ def _read_safe(path: Path, *, executable: bool = False, mode: int = 0o644) -> by
     try:
         info = os.fstat(fd)
         expected_mode = 0o755 if executable else mode
+        allowed_modes = {expected_mode, expected_mode | 0o020}
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != os.geteuid()
-            or stat.S_IMODE(info.st_mode) != expected_mode
-            or info.st_mode & 0o022
+            or stat.S_IMODE(info.st_mode) not in allowed_modes
+            or info.st_mode & 0o002
             or info.st_size <= 0
             or info.st_size > 32 * 1024 * 1024
         ):
@@ -146,6 +165,11 @@ def _configured_command(stage: str) -> tuple[str, ...]:
 
 
 def _validate_sources() -> list[dict[str, str]]:
+    if (
+        stat.S_IMODE(ADAPTER.stat().st_mode) != 0o755
+        or stat.S_IMODE(PLAN.stat().st_mode) != 0o644
+    ):
+        raise CheckError("production target mode mismatch")
     adapter_source = _read_safe(ADAPTER, executable=True).decode("utf-8")
     if (
         "wb_nightly_coordinator_adapter.py" not in adapter_source
@@ -164,12 +188,32 @@ def _validate_sources() -> list[dict[str, str]]:
         PROJECT_ROOT / "scripts/run_wb_four_region_nightly.py",
         executable=True,
     ).decode("utf-8")
+    collection_source = _read_safe(
+        PROJECT_ROOT / "scripts/run_wb_collection_plan.py",
+        executable=True,
+    ).decode("utf-8")
     if (
         "require_official_live_entry_lease(environment=os.environ)"
         not in cli_source
-        or "require_official_live_entry_lease()" not in inner_source
+        or '"cleanup", "collection-plan", "run"' not in cli_source
+        or "require_official_live_entry_lease(environment=os.environ)"
+        not in inner_source
+        or "require_official_live_entry_lease(environment=os.environ)"
+        not in collection_source
     ):
         raise CheckError("direct live entry lock contract mismatch")
+    for name in DIRECT_PYTHON_ENTRYPOINTS:
+        source = _read_safe(
+            PROJECT_ROOT / "scripts" / name,
+            executable=True,
+        ).decode("utf-8")
+        expected_guard = (
+            "_require_host_lease_after_cutover()"
+            if name in {"wb_cookie_keeper.py", "wb_warehouse.py"}
+            else "require_official_live_entry_lease(environment=os.environ)"
+        )
+        if expected_guard not in source:
+            raise CheckError("direct Python entrypoint contract mismatch")
     if (
         plan.get("schema_version") != "wb_collection_plan_v2"
         or plan.get("collection_plan_id")
@@ -222,9 +266,8 @@ def _validate_sources() -> list[dict[str, str]]:
         )
         source = source_bytes.decode("utf-8")
         bootstrap = (
-            'if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" \\\n'
-            '  && ( -e "$COORDINATOR_LOCK_DIR" '
-            '|| -L "$COORDINATOR_LOCK_DIR" ) ]]; then'
+            'if [[ -e "$COORDINATOR_LOCK_DIR" '
+            '|| -L "$COORDINATOR_LOCK_DIR" ]]; then'
         )
         bootstrap_index = source.find(bootstrap)
         exec_index = source.find(
@@ -233,6 +276,10 @@ def _validate_sources() -> list[dict[str, str]]:
         if (
             bootstrap_index < 0
             or exec_index <= bootstrap_index
+            or source.find(
+                '"$PYTHON_BIN" "$COORDINATOR_ADAPTER" entry-check'
+            )
+            <= exec_index
             or source.find(
                 'COORDINATOR_LOCK_DIR="/run/lock/parser-nightly-coordinator"'
             )
@@ -275,28 +322,16 @@ def _validate_sources() -> list[dict[str, str]]:
                 raise CheckError("disabled entrypoint lock order mismatch")
         disabled_sources.append((path, source_bytes))
 
-    tracked_inputs = [
-        (PLAN, plan_bytes),
-        (REGISTRY, registry_bytes),
-        (QUERY_PACK, pack_bytes),
-        (TRACKED_CONFIG, _read_safe(TRACKED_CONFIG)),
-    ]
-    tracked_inputs.extend(
-        (path, _read_safe(path)) for path in ATTESTED_RUNTIME_SOURCES
-    )
-    tracked_inputs.extend(
-        (path, _read_safe(path, executable=True))
-        for path in ATTESTED_RUNTIME_EXECUTABLES
-    )
-    tracked_inputs.extend(official_sources)
-    tracked_inputs.extend(disabled_sources)
+    verify_input_manifest(PROJECT_ROOT)
+    tracked_inputs = []
+    for path in DIRECT_ATTESTATION_ROOTS:
+        executable = path.suffix in {".py", ".sh"} and os.access(path, os.X_OK)
+        tracked_inputs.append(
+            (path, _read_safe(path, executable=executable))
+        )
     return [
-        {"path": str(PLAN), "sha256": _sha256(plan_bytes)},
-        *[
-            {"path": str(path), "sha256": _sha256(encoded)}
-            for path, encoded in tracked_inputs
-            if path != PLAN
-        ],
+        {"path": str(path), "sha256": _sha256(encoded)}
+        for path, encoded in tracked_inputs
     ]
 
 
@@ -351,7 +386,7 @@ def main() -> int:
             "inputs_verified": True,
             "input_files": inputs,
         }
-    except (CheckError, KeyError, OSError):
+    except (CheckError, KeyError, OSError, RuntimeError):
         print(
             json.dumps(
                 {

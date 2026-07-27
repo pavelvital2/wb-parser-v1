@@ -16,9 +16,14 @@ DRY_RUN=0
 CHECK_ONLY=0
 STARTED_AT="$(date --iso-8601=seconds)"
 
-if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" \
-  && ( -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ) ]]; then
-  exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"
+if [[ -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ]]; then
+  if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" ]]; then
+    exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"
+  fi
+  if ! "$PYTHON_BIN" "$COORDINATOR_ADAPTER" entry-check; then
+    echo "WB host lock-v3 lease validation failed" >&2
+    exit 2
+  fi
 fi
 
 usage() {

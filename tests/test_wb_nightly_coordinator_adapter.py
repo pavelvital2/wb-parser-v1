@@ -5,8 +5,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
+import subprocess
 import sys
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,8 +19,10 @@ import pytest
 
 from app.common import cli as wb_cli
 from app.common import nightly_coordinator as contract
+from app.common import nightly_attestation as attestation
 from app.serp.collection_plan_runner import CollectionPlanRunError, DeadlineGuard
 from scripts import check_nightly_coordinator_contract as checker
+from scripts import marketplace_lock_v3_supervisor as supervisor
 from scripts import run_wb_four_region_nightly as pipeline_launcher
 from scripts import wb_nightly_coordinator_adapter as adapter
 
@@ -36,7 +41,17 @@ def _isolate_pipeline_launcher_host_lock(
     monkeypatch.setattr(
         pipeline_launcher,
         "require_official_live_entry_lease",
-        lambda: None,
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "capture_attested_environment",
+        lambda _root, environment: dict(environment),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "verify_attested_environment",
+        lambda _root, _environment: None,
     )
 
 
@@ -55,23 +70,29 @@ class FakeLease:
     ) -> None:
         self.invocation = invocation
         self.validation_fd = validation_fd
+        self.guard_fd = os.dup(validation_fd)
         validation_path = Path(os.readlink(f"/proc/self/fd/{validation_fd}"))
         self.policy = SimpleNamespace(
             guard_path=validation_path,
             validation_path=validation_path,
         )
+        self.quarantine_marker_path = Path("/tmp/missing-wb-quarantine")
         self.exited = False
         self.assertions = 0
 
     @property
     def pass_fds(self) -> tuple[int, ...]:
-        return (self.validation_fd,)
+        return tuple(sorted((self.guard_fd, self.validation_fd)))
 
     def assert_held(self) -> None:
         os.fstat(self.validation_fd)
         self.assertions += 1
 
     def __exit__(self, *_args: object) -> None:
+        try:
+            os.close(self.guard_fd)
+        except OSError:
+            pass
         self.exited = True
 
 
@@ -237,13 +258,26 @@ def test_checker_dry_run_is_exact_and_no_network(
     assert payload["network_used"] is False
     assert payload["official_entrypoints_quarantine_checked"] is True
     input_paths = {item["path"] for item in payload["input_files"]}
-    assert str(PROJECT_ROOT / "scripts/wb_nightly_coordinator_adapter.py") in input_paths
-    assert str(PROJECT_ROOT / "app/common/nightly_coordinator.py") in input_paths
+    assert (
+        str(PROJECT_ROOT / "scripts/wb_nightly_coordinator_adapter.py")
+        in input_paths
+    )
+    assert (
+        str(PROJECT_ROOT / "app/common/nightly_coordinator.py")
+        in input_paths
+    )
+    assert len(input_paths) <= 32
+    manifest = json.loads(
+        (
+            PROJECT_ROOT
+            / "config/wb/nightly_coordinator_adapter_inputs.json"
+        ).read_text(encoding="utf-8")
+    )
     for name in (
         *checker.OFFICIAL_ENTRYPOINTS,
         *checker.COORDINATOR_DISABLED_ENTRYPOINTS,
     ):
-        assert str(PROJECT_ROOT / "scripts" / name) in input_paths
+        assert f"scripts/{name}" in manifest["files"]
 
 
 def test_all_official_shell_entrants_gate_before_runtime_and_preserve_fds() -> None:
@@ -256,12 +290,16 @@ def test_all_official_shell_entrants_gate_before_runtime_and_preserve_fds() -> N
         adapter_exec = source.index(
             'exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"'
         )
+        entry_check = source.index(
+            '"$PYTHON_BIN" "$COORDINATOR_ADAPTER" entry-check'
+        )
         runtime_indices = [
             index
             for token in ('source "$RUNTIME_LOADER"', "wb_load_required_runtime_env")
             if (index := source.find(token)) >= 0
         ]
-        assert all(adapter_exec < index for index in runtime_indices)
+        assert adapter_exec < entry_check
+        assert all(entry_check < index for index in runtime_indices)
         assert re.search(r"exec [0-9]+>", source) is None
         assert re.search(r"flock (?:-n |-u )?[0-9]+(?:\\s|$)", source) is None
 
@@ -280,6 +318,19 @@ def test_persistent_entrants_stop_before_runtime_or_state_after_cutover() -> Non
         ):
             index = source.find(token)
             assert index < 0 or refusal < index
+
+
+def test_direct_python_entrants_require_full_host_lease() -> None:
+    for name in checker.DIRECT_PYTHON_ENTRYPOINTS:
+        source = (PROJECT_ROOT / "scripts" / name).read_text(
+            encoding="utf-8"
+        )
+        expected = (
+            "_require_host_lease_after_cutover()"
+            if name in {"wb_cookie_keeper.py", "wb_warehouse.py"}
+            else "require_official_live_entry_lease(environment=os.environ)"
+        )
+        assert expected in source
 
 
 def test_checker_rejects_command_hash_mismatch(
@@ -370,6 +421,20 @@ def test_descendant_lease_is_required_after_secure_layout_exists(
         lease.__exit__()
 
 
+def test_forged_wrapped_flag_cannot_authorize_live_entry(
+    tmp_path: Path,
+) -> None:
+    policy = _lock_policy(tmp_path)
+    with pytest.raises(
+        contract.NightlyCoordinatorContractError,
+        match="official_live_entry_requires_lock_v3",
+    ):
+        contract.require_official_live_entry_lease(
+            environment={"PARSER_WB_LOCK_V3_WRAPPED": "1"},
+            policy=policy,
+        )
+
+
 def test_direct_cli_refuses_before_config_or_network(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -401,6 +466,32 @@ def test_direct_cli_refuses_before_config_or_network(
     assert capsys.readouterr().err == (
         "WB live entry refused by host lock contract\n"
     )
+
+
+def test_direct_cleanup_refuses_before_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    monkeypatch.setattr(wb_cli, "_COORDINATOR_LOCK_DIRECTORY", lock_dir)
+    monkeypatch.setattr(
+        contract,
+        "require_official_live_entry_lease",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            contract.NightlyCoordinatorContractError(
+                "official_live_entry_requires_lock_v3",
+                outcome="deferred",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        wb_cli,
+        "cmd_cleanup",
+        lambda *_args, **_kwargs: pytest.fail("cleanup must not start"),
+    )
+    monkeypatch.setattr(sys, "argv", ["main.py", "cleanup", "--apply"])
+    assert wb_cli.main() == 75
 
 
 def test_coordinator_inherited_validation_fd_and_marker_are_verified(
@@ -668,6 +759,11 @@ def test_adapter_passes_validation_fd_to_collection_descendant(
     monkeypatch.setattr(adapter, "FOUR_REGION_SCRIPT", child)
     monkeypatch.setattr(
         adapter,
+        "_utc_now",
+        lambda: datetime(2026, 7, 27, 0, 15, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        adapter,
         "load_required_runtime_environment",
         lambda **_kwargs: {"TEST_VALIDATION_FD": str(validation_fd)},
     )
@@ -723,6 +819,11 @@ def test_child_exit_must_match_status_before_result_commit(
     monkeypatch.setattr(adapter, "FOUR_REGION_SCRIPT", child)
     monkeypatch.setattr(
         adapter,
+        "_utc_now",
+        lambda: datetime(2026, 7, 27, 0, 15, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        adapter,
         "load_required_runtime_environment",
         lambda **_kwargs: {},
     )
@@ -747,6 +848,358 @@ def test_child_exit_must_match_status_before_result_commit(
         assert captured["reason_code"] == "child_exit_contract_mismatch"
     finally:
         os.close(validation_fd)
+
+
+def test_status_run_ref_cannot_override_invocation(
+    tmp_path: Path,
+) -> None:
+    invocation = _invocation(tmp_path)
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(
+            write_fd,
+            json.dumps(
+                {
+                    "schema_version": contract.ADAPTER_STATUS_SCHEMA_VERSION,
+                    "outcome": "success",
+                    "run_ref": "20260727_001501Z",
+                    "resume_ref": "",
+                    "reason_code": "completed",
+                    "report_refs": [],
+                }
+            ).encode(),
+        )
+        os.close(write_fd)
+        write_fd = -1
+        assert (
+            adapter._read_status(
+                read_fd,
+                expected_run_ref=RUN_REF,
+                invocation=invocation,
+            )
+            is None
+        )
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
+def test_relative_passthrough_target_is_canonical_and_allowlisted() -> None:
+    expected = PROJECT_ROOT / "scripts/run_wb_collection_plan.sh"
+    assert (
+        adapter._canonical_passthrough_target(
+            "scripts/run_wb_collection_plan.sh"
+        )
+        == expected
+    )
+    with pytest.raises(
+        contract.NightlyCoordinatorContractError,
+        match="passthrough_target_invalid",
+    ):
+        adapter._canonical_passthrough_target("../parser_ozon/run.sh")
+
+
+def test_deadline_is_rechecked_immediately_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation = tmp_path / "validation.flock"
+    validation.touch()
+    validation_fd = os.open(validation, os.O_RDWR)
+    invocation = replace(
+        _invocation(tmp_path),
+        deadline_utc=datetime(2026, 7, 27, 0, 16, tzinfo=UTC),
+    )
+    lease = FakeLease(invocation=invocation, validation_fd=validation_fd)
+    times = iter(
+        (
+            datetime(2026, 7, 27, 0, 15, tzinfo=UTC),
+            datetime(2026, 7, 27, 0, 15, tzinfo=UTC),
+            datetime(2026, 7, 27, 0, 16, tzinfo=UTC),
+            datetime(2026, 7, 27, 0, 16, tzinfo=UTC),
+        )
+    )
+    monkeypatch.setattr(adapter, "_utc_now", lambda: next(times))
+    monkeypatch.setattr(
+        adapter,
+        "acquire_marketplace_collection_lease",
+        lambda: lease,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "load_required_runtime_environment",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        adapter.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("child must not spawn"),
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        adapter,
+        "write_terminal_result",
+        lambda **kwargs: captured.update(kwargs) or 75,
+    )
+    monkeypatch.setattr(
+        adapter.os,
+        "_exit",
+        lambda code: (_ for _ in ()).throw(ExitCalled(code)),
+    )
+    try:
+        with pytest.raises(ExitCalled) as raised:
+            adapter._run_four_region(
+                ["--plan-file", PLAN_ARGUMENT, "--no-publish"]
+            )
+        assert raised.value.code == 75
+        assert captured["reason_code"] == (
+            "absolute_deadline_reached_before_spawn"
+        )
+    finally:
+        os.close(validation_fd)
+
+
+def test_supervisor_waits_for_surviving_descendant(
+    tmp_path: Path,
+) -> None:
+    policy = _lock_policy(tmp_path)
+    lease = contract.acquire_marketplace_collection_lease(
+        environment={},
+        policy=policy,
+        quarantine_marker_path=tmp_path / "missing.json",
+    )
+    leader = tmp_path / "leader.py"
+    leader.write_text(
+        "import subprocess\n"
+        "subprocess.Popen(['/bin/sleep', '0.45'])\n",
+        encoding="utf-8",
+    )
+    environment = {
+        **os.environ,
+        **contract.descendant_lease_environment(lease),
+    }
+    environment["PARSER_WB_SUPERVISOR_PASS_FDS"] = ",".join(
+        str(value) for value in lease.pass_fds
+    )
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(adapter.SUPERVISOR),
+                "--",
+                sys.executable,
+                str(leader),
+            ],
+            env=environment,
+            close_fds=True,
+            pass_fds=lease.pass_fds,
+            check=False,
+        )
+        assert completed.returncode == 0
+        assert time.monotonic() - started >= 0.35
+        lease.assert_held()
+    finally:
+        lease.__exit__()
+
+
+def test_proc_stat_parser_accepts_comm_with_spaces_and_parentheses() -> None:
+    assert supervisor._parse_proc_stat(
+        "4321 (worker (x) with spaces) S 123 456 456 0 -1",
+        expected_pid=4321,
+    ) == (123, 456, "S")
+
+
+def test_supervisor_waits_for_detached_adopted_descendant_with_complex_comm(
+    tmp_path: Path,
+) -> None:
+    policy = _lock_policy(tmp_path)
+    lease = contract.acquire_marketplace_collection_lease(
+        environment={},
+        policy=policy,
+        quarantine_marker_path=tmp_path / "missing.json",
+    )
+    detached = tmp_path / "detached.py"
+    detached.write_text(
+        "import time\n"
+        "open('/proc/self/comm', 'w').write('worker (x) ok\\n')\n"
+        "time.sleep(0.55)\n",
+        encoding="utf-8",
+    )
+    leader = tmp_path / "leader.py"
+    leader.write_text(
+        "import subprocess, sys\n"
+        "subprocess.Popen("
+        "[sys.executable, sys.argv[1]], start_new_session=True)\n",
+        encoding="utf-8",
+    )
+    environment = {
+        **os.environ,
+        **contract.descendant_lease_environment(lease),
+    }
+    environment["PARSER_WB_SUPERVISOR_PASS_FDS"] = ",".join(
+        str(value) for value in lease.pass_fds
+    )
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(adapter.SUPERVISOR),
+                "--",
+                sys.executable,
+                str(leader),
+                str(detached),
+            ],
+            env=environment,
+            close_fds=True,
+            pass_fds=lease.pass_fds,
+            check=False,
+        )
+        assert completed.returncode == 0
+        assert time.monotonic() - started >= 0.45
+        lease.assert_held()
+    finally:
+        lease.__exit__()
+
+
+def test_supervisor_retains_locks_after_adapter_parent_death(
+    tmp_path: Path,
+) -> None:
+    policy = _lock_policy(tmp_path)
+    bootstrap = tmp_path / "bootstrap.py"
+    ready = tmp_path / "ready"
+    bootstrap.write_text(
+        "import fcntl, os, subprocess, sys\n"
+        "guard=os.open(sys.argv[1], os.O_RDWR)\n"
+        "validation=os.open(sys.argv[2], os.O_RDWR)\n"
+        "fcntl.flock(guard, fcntl.LOCK_EX)\n"
+        "fcntl.flock(validation, fcntl.LOCK_EX)\n"
+        "env=os.environ.copy()\n"
+        "env['PARSER_WB_LOCK_V3_GUARD_FD']=str(guard)\n"
+        "env['PARSER_WB_LOCK_V3_VALIDATION_FD']=str(validation)\n"
+        "env['PARSER_WB_SUPERVISOR_PASS_FDS']=f'{guard},{validation}'\n"
+        "child=subprocess.Popen("
+        "[sys.executable, sys.argv[3], '--', '/bin/sleep', '0.55'], "
+        "env=env, pass_fds=(guard, validation), start_new_session=True)\n"
+        "open(sys.argv[4], 'w').write(str(child.pid))\n",
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(bootstrap),
+            str(policy.guard_path),
+            str(policy.validation_path),
+            str(adapter.SUPERVISOR),
+            str(ready),
+        ],
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert ready.is_file()
+    guard_probe = os.open(policy.guard_path, os.O_RDWR)
+    validation_probe = os.open(policy.validation_path, os.O_RDWR)
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(guard_probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(
+                validation_probe,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                fcntl.flock(
+                    guard_probe,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                fcntl.flock(
+                    validation_probe,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                break
+            except BlockingIOError:
+                time.sleep(0.05)
+        else:
+            pytest.fail("orphan supervisor did not release finished lease")
+    finally:
+        os.close(guard_probe)
+        os.close(validation_probe)
+
+
+def test_lease_release_never_uses_lock_un() -> None:
+    source = (
+        PROJECT_ROOT / "app/common/nightly_coordinator.py"
+    ).read_text(encoding="utf-8")
+    exit_source = source[
+        source.index("def __exit__"):source.index(
+            "\ndef _safe_id",
+            source.index("def __exit__"),
+        )
+    ]
+    assert "LOCK_UN" not in exit_source
+
+
+def test_input_manifest_detects_omission_and_mutation(
+    tmp_path: Path,
+) -> None:
+    for relative in ("app", "scripts", "config"):
+        shutil.copytree(PROJECT_ROOT / relative, tmp_path / relative)
+    shutil.copy2(PROJECT_ROOT / "main.py", tmp_path / "main.py")
+    manifest_path = tmp_path / attestation.MANIFEST_RELATIVE_PATH
+    manifest_path.write_text(
+        json.dumps(
+            attestation.build_input_manifest(tmp_path),
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.chmod(0o644)
+    assert len(attestation.verify_input_manifest(tmp_path)) == 64
+    target = tmp_path / "app/common/cleanup.py"
+    target.write_bytes(target.read_bytes() + b"\n")
+    with pytest.raises(
+        contract.NightlyCoordinatorContractError,
+        match="coordinator_input_manifest_hash_mismatch",
+    ):
+        attestation.verify_input_manifest(tmp_path)
+
+
+def test_runtime_input_fingerprint_binds_secret_files_without_values(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    runtime = config_dir / "runtime.env"
+    headers = config_dir / "wb_request_headers.json"
+    cookie = config_dir / "wb_cookie.txt"
+    runtime.write_text(
+        "PARSER_WB_PROXY_URL=test-route.invalid\n",
+        encoding="utf-8",
+    )
+    headers.write_text(
+        '{"x-test-header":"test-value"}\n',
+        encoding="utf-8",
+    )
+    cookie.write_text("test-cookie-value\n", encoding="utf-8")
+    for path in (runtime, headers, cookie):
+        path.chmod(0o600)
+    environment = {
+        "PARSER_WB_PROXY_URL": "http://test-route.invalid",
+        "PARSER_WB_REQUEST_HEADERS_FILE": str(headers),
+        "PARSER_WB_COOKIE_REQUIRED": "1",
+    }
+    first = attestation.runtime_input_sha256(tmp_path, environment)
+    headers.write_text('{"x-test-header":"changed"}\n', encoding="utf-8")
+    headers.chmod(0o600)
+    second = attestation.runtime_input_sha256(tmp_path, environment)
+    assert first != second
+    assert len(first) == len(second) == 64
 
 
 def test_deadline_refusal_happens_before_runtime_load_or_child(
@@ -932,7 +1385,7 @@ def test_completed_resume_skips_collection_and_is_idempotent(
 
 @pytest.mark.parametrize(
     ("coordinator_stage", "expected_exit"),
-    (("", 76), ("wb_resume", 2)),
+    (("", 2), ("wb_resume", 2)),
 )
 def test_checkpoint_is_emitted_once_then_resume_failure_is_hard(
     tmp_path: Path,
@@ -967,6 +1420,11 @@ def test_checkpoint_is_emitted_once_then_resume_failure_is_hard(
             }
         ),
         encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline_launcher,
+        "validate_resumable_collection_state",
+        lambda **_kwargs: False,
     )
     monkeypatch.setattr(
         pipeline_launcher,

@@ -9,11 +9,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+COORDINATOR_LOCK_DIRECTORY = Path("/run/lock/parser-nightly-coordinator")
+
+
+def _require_host_lease_after_cutover() -> None:
+    if not os.path.lexists(COORDINATOR_LOCK_DIRECTORY):
+        return
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    from app.common.nightly_coordinator import (
+        require_official_live_entry_lease,
+    )
+
+    require_official_live_entry_lease(environment=os.environ)
 
 try:
     import duckdb
@@ -462,6 +478,7 @@ def print_json(data: Any) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _require_host_lease_after_cutover()
     parser = argparse.ArgumentParser(description="WB parser analytics warehouse MVP")
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
     subparsers = parser.add_subparsers(dest="command", required=True)

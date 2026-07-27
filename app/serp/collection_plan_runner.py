@@ -1557,6 +1557,7 @@ class CollectionPlanRunner:
         egress_hash_salt: bytes | None = None,
         sleeper: Callable[[float], None] = time_module.sleep,
         absolute_deadline_utc: datetime | None = None,
+        input_integrity_gate: Callable[[], None] | None = None,
     ) -> None:
         self.config = config
         self.plan_path = plan_path
@@ -1579,6 +1580,7 @@ class CollectionPlanRunner:
         self.egress_hash_salt = egress_hash_salt or secrets.token_bytes(32)
         self.sleeper = sleeper
         self.absolute_deadline_utc = absolute_deadline_utc
+        self.input_integrity_gate = input_integrity_gate or (lambda: None)
 
     def _configure_runtime_deadline(self, bundle: CollectionPlanBundle) -> None:
         window = bundle.collection_plan.runtime_window
@@ -1819,6 +1821,23 @@ class CollectionPlanRunner:
             ),
             "proxy_route_sha256": proxy_route_sha256,
         }
+        manifest_sha256 = os.getenv(
+            "PARSER_WB_COORDINATOR_INPUT_MANIFEST_SHA256",
+            "",
+        )
+        runtime_input_sha256 = os.getenv(
+            "PARSER_WB_COORDINATOR_RUNTIME_INPUT_SHA256", ""
+        )
+        if manifest_sha256 or runtime_input_sha256:
+            if (
+                not _SHA256_RE.fullmatch(manifest_sha256)
+                or not _SHA256_RE.fullmatch(runtime_input_sha256)
+            ):
+                raise CollectionPlanRunError(
+                    "runtime input provenance is invalid"
+                )
+            fingerprint["input_manifest_sha256"] = manifest_sha256
+            fingerprint["runtime_input_sha256"] = runtime_input_sha256
         fingerprint["fingerprint_sha256"] = _canonical_sha256(fingerprint)
         return fingerprint
 
@@ -2509,6 +2528,7 @@ class CollectionPlanRunner:
         bundle: CollectionPlanBundle,
         effective_plan_sha256: str,
         expected_refs: tuple[Mapping[str, Any], ...],
+        promote: bool = True,
     ) -> tuple[list[dict[str, Any]], set[str]]:
         records: list[dict[str, Any]] = []
         verified_ids: set[str] = set()
@@ -3011,8 +3031,9 @@ class CollectionPlanRunner:
                 paths=paths,
                 segment=segment,
             )
-        for segment in validated_segments:
-            self._promote_verified_segment(paths=paths, segment=segment)
+        if promote:
+            for segment in validated_segments:
+                self._promote_verified_segment(paths=paths, segment=segment)
         return records, verified_ids
 
     def _validate_verified_segment_artifacts(
@@ -3116,6 +3137,7 @@ class CollectionPlanRunner:
             stale_seconds=self.config.runtime.lock_stale_seconds,
             event_hook=self.lock_event_hook,
         ):
+            self.input_integrity_gate()
             bundle = self._load_bundle()
             self._validate_mode(bundle)
             if self._bundle_identity(bundle) != self._bundle_identity(initial_bundle):
@@ -3918,6 +3940,7 @@ class CollectionPlanRunner:
                 caught = exc
 
             if caught is None:
+                self.input_integrity_gate()
                 for region_manifest in manifest_regions:
                     products_all, pages_all = region_rows[region_manifest["region_id"]]
                     region_manifest["outputs"] = self._write_scope_outputs(
@@ -4070,6 +4093,7 @@ class CollectionPlanRunner:
             if not collection_complete:
                 raise CollectionPlanRunError("collection plan run is incomplete")
             try:
+                self.input_integrity_gate()
                 manifest["regional_latest"] = self._publish_regional_latest(
                     paths=paths,
                     bundle=bundle,
@@ -4092,6 +4116,7 @@ class CollectionPlanRunner:
             manifest["status"] = "success"
             manifest["complete"] = True
             manifest["error"] = None
+            self.input_integrity_gate()
             self._replace(paths.manifest_path, _json_bytes(manifest), final_manifest=True)
             return manifest
 
@@ -4533,6 +4558,7 @@ def run_collection_plan(
     egress_hash_salt: bytes | None = None,
     sleeper: Callable[[float], None] = time_module.sleep,
     absolute_deadline_utc: datetime | None = None,
+    input_integrity_gate: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     owned_transport = False
     active_transport = transport
@@ -4562,7 +4588,109 @@ def run_collection_plan(
             egress_hash_salt=egress_hash_salt,
             sleeper=sleeper,
             absolute_deadline_utc=absolute_deadline_utc,
+            input_integrity_gate=input_integrity_gate,
         ).run()
     finally:
         if owned_transport:
+            active_transport.close()
+
+
+def validate_resumable_collection_state(
+    *,
+    config: AppConfig,
+    plan_path: Path,
+    run_id: str,
+    transport: ScopedTransport | None = None,
+) -> bool:
+    active_transport: ScopedTransport | None = transport
+    owned_transport = transport is None
+    try:
+        if active_transport is None:
+            active_transport = RequestsScopedTransport.from_config(config)
+        runner = CollectionPlanRunner(
+            config=config,
+            plan_path=plan_path,
+            transport=active_transport,
+            no_publish=True,
+            resume_run_id=run_id,
+        )
+        bundle = runner._load_bundle()
+        runner._validate_mode(bundle)
+        paths = ScopedPaths.build(
+            project_root=config.project_root,
+            collection_plan_id=bundle.collection_plan.collection_plan_id,
+            run_id=runner.run_id,
+        )
+        manifest = _json_object_from_bytes(
+            _read_regular_bytes(
+                paths.manifest_path,
+                project_root=config.project_root,
+            ),
+            field="resume manifest",
+        )
+        snapshot = _json_object_from_bytes(
+            _read_regular_bytes(
+                paths.effective_plan_path,
+                project_root=config.project_root,
+            ),
+            field="effective plan",
+        )
+        if (
+            manifest.get("schema_version")
+            != RESUMABLE_MANIFEST_SCHEMA_VERSION
+            or manifest.get("run_id") != run_id
+            or manifest.get("collection_plan_id")
+            != bundle.collection_plan.collection_plan_id
+            or manifest.get("complete") is True
+            or manifest.get("status") == "success"
+            or manifest.get("transport_fingerprint")
+            != runner._transport_fingerprint()
+        ):
+            return False
+        effective_sha256 = canonical_effective_plan_sha256(snapshot)
+        if (
+            manifest.get("effective_plan_sha256") != effective_sha256
+            or snapshot.get("transport_fingerprint")
+            != runner._transport_fingerprint()
+        ):
+            return False
+        resume = manifest.get("resume")
+        refs = resume.get("segments") if isinstance(resume, dict) else None
+        if not isinstance(refs, list) or not refs:
+            return False
+        verified, verified_ids = runner._verified_segments(
+            paths=paths,
+            bundle=bundle,
+            effective_plan_sha256=effective_sha256,
+            expected_refs=tuple(refs),
+            promote=False,
+        )
+        discarded = runner._validate_discarded_segments(
+            value=resume.get("discarded_segments"),
+            bundle=bundle,
+            verified_segment_ids=verified_ids,
+        )
+        failed_segment = resume.get("failed_segment")
+        if failed_segment is not None and (
+            not discarded or failed_segment != discarded[-1]
+        ):
+            return False
+        expected_scopes = len(bundle.enabled_regions) * len(
+            bundle.enabled_queries
+        )
+        return (
+            len(verified) < expected_scopes
+            or manifest.get("status") == "publication_pending"
+        )
+    except (
+        CollectionPlanRunError,
+        CollectionPlanValidationError,
+        CriticalPipelineError,
+        OSError,
+        ValueError,
+        AttributeError,
+    ):
+        return False
+    finally:
+        if owned_transport and active_transport is not None:
             active_transport.close()

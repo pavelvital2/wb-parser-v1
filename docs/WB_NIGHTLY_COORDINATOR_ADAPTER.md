@@ -30,13 +30,21 @@ before loading `config/runtime.env` or starting parser work:
 2. validate or acquire the host locks in fixed order `guard -> validation`;
 3. inspect the quarantine marker while both locks are held;
 4. validate the exact four-region command and reject other plans;
-5. load the required runtime environment while retaining the validation FD;
-6. pass that FD to the four-region Python descendant.
+5. verify the versioned input manifest, then load and hash the effective
+   runtime inputs without exposing their values;
+6. recheck the absolute deadline immediately before process creation;
+7. pass both host-lock descriptors to a Linux subreaper supervisor, which
+   retains them until the process group and adopted descendants have exited.
 
 The coordinator owns the guard lock. Its inherited validation FD is checked
 against the coordinator ancestor process, secure lock inode and kernel lock.
-An official standalone invocation acquires both locks itself. Neither path
-unlinks, replaces or unlocks host lock files.
+An official standalone invocation acquires both locks itself. A wrapped shell
+entry validates the exact inherited guard and validation descriptors, their
+inode/owner/mode and quarantine state before runtime loading. The
+`PARSER_WB_LOCK_V3_WRAPPED` flag is routing metadata only and grants no
+authority. Neither path unlinks or replaces host lock files, and lease release
+closes descriptors without issuing `LOCK_UN` on a shared open-file
+description.
 
 The absolute coordinator deadline caps the existing plan deadline. It is
 passed to collection and downstream guards and never extends their local
@@ -58,10 +66,13 @@ Outcomes are:
 | `deferred` | 75 | local lock/start/deadline gate refused work |
 | `hard_failure` | 2 | no safe automatic resume is claimed |
 
-The immutable scoped collection `run_id` is used as `run_ref`. A checkpoint
-uses the same value as `resume_ref`. A completed collection is not fetched
-again on downstream resume. A failed coordinator resume does not request a
-third automatic resume.
+The immutable scoped collection `run_id` expected by the invocation is used as
+`run_ref`; child status cannot replace it. A checkpoint is emitted only for a
+strictly validated, non-empty resumable state with verified segment records
+and remaining collection or publication work. It uses the same value as
+`resume_ref`. Empty, corrupt, stale or wrong-run state is a hard failure. A
+completed collection is not fetched again on downstream resume. A failed
+coordinator resume does not request a third automatic resume.
 
 ## Official Entrants
 
@@ -98,15 +109,23 @@ current lock contour. Cutover must first install the root-owned secure lock
 directory and precreated lock files. Once that directory exists, failure to
 validate either lock or the quarantine path is fail-closed.
 
-Direct live `main.py run ...`, component aliases, `collection-plan`, and direct
-execution of the inner four-region Python launcher are also refused after the
-secure path appears unless they inherit the adapter validation FD. Use the
-reviewed wrappers; setting a marker environment variable without a valid held
-descriptor is insufficient.
+Direct live `main.py run ...`, component aliases, `cleanup`,
+`collection-plan`, `scripts/run_wb_collection_plan.py`, and direct execution
+of the inner four-region Python launcher are also refused after the secure path
+appears unless they inherit the complete adapter lease. Relative passthrough
+commands are canonicalized inside the project and must match the exact
+allowlist. Use the reviewed wrappers; setting a marker environment variable
+without valid held descriptors is insufficient.
 
-The contract checker verifies the active bootstrap source and hashes the
-wrapper, Python adapter, runtime loader, critical four-region modules, tracked
-config, plan, registry and query pack. It performs no network calls.
+The contract checker returns at most 32 direct coordinator roots, including
+the attested verifier and
+`config/wb/nightly_coordinator_adapter_inputs.json`. That versioned manifest
+contains the complete tracked Python/shell/config/query-pack graph and exact
+SHA-256 values. The adapter pins the manifest SHA per invocation and rechecks
+the graph and hash-only effective runtime inputs before each stage and
+immediately before scoped or downstream publication. Runtime values, cookies,
+headers and proxy URLs are never written to evidence. It performs no network
+calls.
 
 ## Cutover Gates
 

@@ -14,6 +14,11 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.common.nightly_coordinator import require_official_live_entry_lease
+
 DEFAULT_TMUX_SESSION = "wb_persistent_session"
 DEFAULT_PYTHON_BIN = "/home/Codex/agent-tools/parser_wb-python/bin/python"
 
@@ -391,6 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    require_official_live_entry_lease(environment=os.environ)
     args = build_parser().parse_args(argv)
     runner = resolve_path(args.runner)
     state_json = resolve_path(args.state_json)

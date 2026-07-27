@@ -14,9 +14,14 @@ LOCK_FILE="$PROJECT_DIR/state/locks/wb_cookie_renewal.flock"
 PRODUCTS_SELLERS_LOCK_FILE="$PROJECT_DIR/state/locks/products_sellers_daily.flock"
 LOG_FILE="$PROJECT_DIR/data/logs/wb_cookie_renewal.log"
 
-if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" \
-  && ( -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ) ]]; then
-  exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"
+if [[ -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ]]; then
+  if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" ]]; then
+    exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"
+  fi
+  if ! "$PYTHON_BIN" "$COORDINATOR_ADAPTER" entry-check; then
+    echo "WB host lock-v3 lease validation failed" >&2
+    exit 2
+  fi
 fi
 
 mkdir -p "$PROJECT_DIR/data/logs" "$PROJECT_DIR/state/locks"

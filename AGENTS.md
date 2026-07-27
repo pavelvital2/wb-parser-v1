@@ -447,6 +447,15 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   so they cannot clobber the inherited validation FD. Keep the plan and all
   four regions disabled until that separate cutover. Runbook:
   `docs/WB_NIGHTLY_COORDINATOR_ADAPTER.md`.
+- Coordinator lock-v3 authorization is descriptor-based, not flag-based.
+  `PARSER_WB_LOCK_V3_WRAPPED` only routes an already supervised descendant:
+  every official shell/Python live or cleanup entry must validate the exact
+  inherited guard and validation FD/inode/owner/mode plus quarantine before
+  runtime or network work. The parser-owned subreaper supervisor retains both
+  descriptors until all adopted descendants exit. The versioned input manifest
+  and hash-only runtime fingerprint are pinned per invocation and rechecked
+  before stages and publication; empty or corrupt scoped state must never be
+  advertised as resumable.
 - On 2026-07-14, `state/locks/pipeline.lock` recovery was hardened after an
   empty lock with no owner blocked the nightly retry path until
   `runtime.lock_stale_seconds`. A working lock must not be removed: active is

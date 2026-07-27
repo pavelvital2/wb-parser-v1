@@ -29,8 +29,19 @@ from app.common.proxy_required import (
 EXIT_OK = 0
 EXIT_SMOKE_FAILED = 20
 EXIT_REFRESH_FAILED = 21
+COORDINATOR_LOCK_DIRECTORY = Path("/run/lock/parser-nightly-coordinator")
 
 OK_KINDS = {"top_products", "nested_products", "nested_promo_products"}
+
+
+def _require_host_lease_after_cutover() -> None:
+    if not os.path.lexists(COORDINATOR_LOCK_DIRECTORY):
+        return
+    from app.common.nightly_coordinator import (
+        require_official_live_entry_lease,
+    )
+
+    require_official_live_entry_lease(environment=os.environ)
 
 
 def utc_now_iso() -> str:
@@ -602,6 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _require_host_lease_after_cutover()
     args = build_parser().parse_args(argv)
     config_path = resolve_path(args.config)
     config = load_config(config_path)

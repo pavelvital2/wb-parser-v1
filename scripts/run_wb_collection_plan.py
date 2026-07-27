@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.common.config import load_config
 from app.common.exceptions import ConfigValidationError, CriticalPipelineError
+from app.common.nightly_coordinator import require_official_live_entry_lease
 from app.serp.collection_plan import CollectionPlanValidationError
 from app.serp.collection_plan_runner import run_collection_plan
 from app.serp.regional_pilot import run_guarded_regional_pilot
@@ -35,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
+        require_official_live_entry_lease(environment=os.environ)
         config = load_config(args.config)
         plan_path = Path(args.plan_file)
         if not plan_path.is_absolute():

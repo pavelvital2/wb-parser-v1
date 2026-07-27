@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -25,12 +26,18 @@ from app.common.nightly_coordinator import (
     acquire_marketplace_collection_lease,
     descendant_lease_environment,
     load_required_runtime_environment,
+    require_official_live_entry_lease,
     write_terminal_result,
+)
+from app.common.nightly_attestation import (
+    capture_attested_environment,
+    verify_attested_environment,
 )
 
 
 PYTHON_BIN = Path("/home/Codex/agent-tools/parser_wb-python/bin/python")
 FOUR_REGION_SCRIPT = PROJECT_ROOT / "scripts/run_wb_four_region_nightly.py"
+SUPERVISOR = PROJECT_ROOT / "scripts/marketplace_lock_v3_supervisor.py"
 FOUR_REGION_PLAN = (
     "config/wb/collection_plans/shevron-four-regions-top1000-v2.json"
 )
@@ -58,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     four_region.add_argument("arguments", nargs=argparse.REMAINDER)
     passthrough = subparsers.add_parser("passthrough")
     passthrough.add_argument("arguments", nargs=argparse.REMAINDER)
+    subparsers.add_parser("entry-check")
     return parser
 
 
@@ -109,7 +117,16 @@ def _generated_run_ref(now: datetime) -> str:
     return now.astimezone(UTC).strftime("%Y%m%d_%H%M%SZ")
 
 
-def _read_status(fd: int) -> dict[str, Any] | None:
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _read_status(
+    fd: int,
+    *,
+    expected_run_ref: str,
+    invocation: CoordinatorInvocation,
+) -> dict[str, Any] | None:
     chunks: list[bytes] = []
     remaining = MAX_STATUS_BYTES + 1
     while remaining > 0:
@@ -143,7 +160,16 @@ def _read_status(fd: int) -> dict[str, Any] | None:
         or not isinstance(value.get("reason_code"), str)
         or not isinstance(value.get("report_refs"), list)
         or any(not isinstance(item, str) for item in value["report_refs"])
+        or value["run_ref"] != expected_run_ref
     ):
+        return None
+    if value["outcome"] == "checkpoint":
+        if (
+            invocation.phase != "initial"
+            or value["resume_ref"] != expected_run_ref
+        ):
+            return None
+    elif value["resume_ref"] != "":
         return None
     return value
 
@@ -160,15 +186,79 @@ def _terminate_child(child: subprocess.Popen[bytes]) -> None:
         child.wait(timeout=10)
 
 
+def _supervised_command(command: tuple[str, ...]) -> tuple[str, ...]:
+    if (
+        not SUPERVISOR.is_file()
+        or SUPERVISOR.is_symlink()
+        or not os.access(SUPERVISOR, os.X_OK)
+    ):
+        raise NightlyCoordinatorContractError(
+            "lock_v3_supervisor_unavailable",
+            outcome="hard_failure",
+        )
+    return (str(PYTHON_BIN), str(SUPERVISOR), "--", *command)
+
+
+def _prepare_supervisor_environment(
+    environment: dict[str, str],
+    *,
+    pass_fds: tuple[int, ...],
+) -> dict[str, str]:
+    result = dict(environment)
+    result["PARSER_WB_LOCK_V3_WRAPPED"] = "1"
+    result["PARSER_WB_SUPERVISOR_PASS_FDS"] = ",".join(
+        str(value) for value in sorted(set(pass_fds))
+    )
+    return result
+
+
+def _canonical_passthrough_target(value: str) -> Path:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = PROJECT_ROOT / candidate
+    try:
+        relative = candidate.relative_to(PROJECT_ROOT)
+    except ValueError as exc:
+        raise NightlyCoordinatorContractError(
+            "passthrough_target_invalid",
+            outcome="hard_failure",
+        ) from exc
+    current = PROJECT_ROOT
+    for part in relative.parts:
+        current /= part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise NightlyCoordinatorContractError(
+                "passthrough_target_invalid",
+                outcome="hard_failure",
+            ) from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise NightlyCoordinatorContractError(
+                "passthrough_target_invalid",
+                outcome="hard_failure",
+            )
+    resolved = candidate.resolve(strict=True)
+    if (
+        resolved not in OFFICIAL_PASSTHROUGH_TARGETS
+        or not resolved.is_file()
+    ):
+        raise NightlyCoordinatorContractError(
+            "passthrough_target_invalid",
+            outcome="hard_failure",
+        )
+    return resolved
+
+
 def _run_four_region(arguments: list[str]) -> int:
-    started = datetime.now(UTC)
+    started = _utc_now()
     lease = acquire_marketplace_collection_lease()
     terminal_committed = False
     writing_terminal = False
     try:
         invocation = lease.invocation
         _validate_four_region_command(arguments, invocation=invocation)
-        if invocation is not None and datetime.now(UTC) >= invocation.deadline_utc:
+        if invocation is not None and _utc_now() >= invocation.deadline_utc:
             raise NightlyCoordinatorContractError(
                 "absolute_deadline_reached_before_runtime",
                 outcome="deferred",
@@ -182,13 +272,8 @@ def _run_four_region(arguments: list[str]) -> int:
             project_root=PROJECT_ROOT,
             lease=lease,
         )
-        if invocation is not None and datetime.now(UTC) >= invocation.deadline_utc:
-            raise NightlyCoordinatorContractError(
-                "absolute_deadline_reached_before_spawn",
-                outcome="deferred",
-            )
-        child_env["PARSER_WB_LOCK_V3_WRAPPED"] = "1"
         child_env.update(descendant_lease_environment(lease))
+        child_env = capture_attested_environment(PROJECT_ROOT, child_env)
         run_ref = (
             invocation.resume_ref
             if invocation is not None and invocation.phase == "resume"
@@ -205,16 +290,36 @@ def _run_four_region(arguments: list[str]) -> int:
         try:
             os.set_inheritable(write_fd, True)
             child_env["PARSER_WB_ADAPTER_STATUS_FD"] = str(write_fd)
-            command = (str(PYTHON_BIN), str(FOUR_REGION_SCRIPT), *arguments)
+            pass_fds = (*lease.pass_fds, write_fd)
+            child_env = _prepare_supervisor_environment(
+                child_env,
+                pass_fds=pass_fds,
+            )
+            command = _supervised_command(
+                (str(PYTHON_BIN), str(FOUR_REGION_SCRIPT), *arguments)
+            )
             lease.assert_held()
+            verify_attested_environment(PROJECT_ROOT, child_env)
+            if (
+                invocation is not None
+                and _utc_now() >= invocation.deadline_utc
+            ):
+                raise NightlyCoordinatorContractError(
+                    "absolute_deadline_reached_before_spawn",
+                    outcome="deferred",
+                )
             child = subprocess.Popen(
                 command,
                 cwd=PROJECT_ROOT,
                 env=child_env,
                 stdin=subprocess.DEVNULL,
                 close_fds=True,
-                pass_fds=(*lease.pass_fds, write_fd),
+                pass_fds=pass_fds,
             )
+        except NightlyCoordinatorContractError:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise
         except OSError as exc:
             os.close(read_fd)
             os.close(write_fd)
@@ -229,7 +334,7 @@ def _run_four_region(arguments: list[str]) -> int:
             if invocation is not None:
                 timeout = max(
                     0.1,
-                    (invocation.deadline_utc - datetime.now(UTC)).total_seconds(),
+                    (invocation.deadline_utc - _utc_now()).total_seconds(),
                 )
             child_exit = child.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -237,7 +342,11 @@ def _run_four_region(arguments: list[str]) -> int:
             _terminate_child(child)
             child_exit = 2
         try:
-            status = _read_status(read_fd)
+            status = _read_status(
+                read_fd,
+                expected_run_ref=run_ref,
+                invocation=invocation,
+            )
         except OSError as exc:
             raise NightlyCoordinatorContractError(
                 "adapter_status_read_failed",
@@ -246,6 +355,7 @@ def _run_four_region(arguments: list[str]) -> int:
         finally:
             os.close(read_fd)
         lease.assert_held()
+        verify_attested_environment(PROJECT_ROOT, child_env)
         if invocation is None:
             return child_exit
         if timed_out:
@@ -261,7 +371,6 @@ def _run_four_region(arguments: list[str]) -> int:
         else:
             outcome = status["outcome"]
             reason_code = status["reason_code"]
-            run_ref = status["run_ref"]
             resume_ref = status["resume_ref"]
             report_refs = tuple(status["report_refs"])
             if child_exit != EXIT_BY_OUTCOME[outcome]:
@@ -269,7 +378,7 @@ def _run_four_region(arguments: list[str]) -> int:
                 reason_code = "child_exit_contract_mismatch"
                 resume_ref = ""
                 report_refs = ()
-        finished = datetime.now(UTC)
+        finished = _utc_now()
         writing_terminal = True
         exit_code = write_terminal_result(
             invocation=invocation,
@@ -302,7 +411,7 @@ def _run_four_region(arguments: list[str]) -> int:
                 resume_ref=(run_ref if exc.outcome == "checkpoint" else ""),
                 reason_code=exc.code,
                 started_at_utc=started,
-                finished_at_utc=datetime.now(UTC),
+                finished_at_utc=_utc_now(),
             )
             writing_terminal = False
             terminal_committed = True
@@ -325,26 +434,22 @@ def _run_passthrough(arguments: list[str]) -> int:
                 "coordinator_passthrough_forbidden",
                 outcome="hard_failure",
             )
-        target = Path(arguments[0])
-        if (
-            not target.is_absolute()
-            or target not in OFFICIAL_PASSTHROUGH_TARGETS
-        ):
-            raise NightlyCoordinatorContractError(
-                "passthrough_target_invalid",
-                outcome="hard_failure",
-            )
+        target = _canonical_passthrough_target(arguments[0])
         env = os.environ.copy()
-        env["PARSER_WB_LOCK_V3_WRAPPED"] = "1"
         env.update(descendant_lease_environment(lease))
+        pass_fds = lease.pass_fds
+        env = _prepare_supervisor_environment(env, pass_fds=pass_fds)
+        command = _supervised_command(
+            (str(target), *arguments[1:])
+        )
         lease.assert_held()
         try:
             child = subprocess.Popen(
-                tuple(arguments),
+                command,
                 cwd=PROJECT_ROOT,
                 env=env,
                 close_fds=True,
-                pass_fds=lease.pass_fds,
+                pass_fds=pass_fds,
             )
         except OSError as exc:
             raise NightlyCoordinatorContractError(
@@ -365,6 +470,9 @@ def main() -> int:
     try:
         args = build_parser().parse_args()
         arguments = _strip_separator(args.arguments)
+        if args.command == "entry-check":
+            require_official_live_entry_lease()
+            return 0
         if args.command == "four-region":
             return _run_four_region(arguments)
         return _run_passthrough(arguments)

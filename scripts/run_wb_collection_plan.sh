@@ -8,9 +8,14 @@ RUNTIME_LOADER="$PROJECT_DIR/scripts/wb_runtime_env.sh"
 COORDINATOR_ADAPTER="$PROJECT_DIR/scripts/wb_nightly_coordinator_adapter.py"
 COORDINATOR_LOCK_DIR="/run/lock/parser-nightly-coordinator"
 
-if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" \
-  && ( -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ) ]]; then
-  exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"
+if [[ -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ]]; then
+  if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" ]]; then
+    exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"
+  fi
+  if ! "$PYTHON_BIN" "$COORDINATOR_ADAPTER" entry-check; then
+    echo "WB host lock-v3 lease validation failed" >&2
+    exit 2
+  fi
 fi
 
 for argument in "$@"; do

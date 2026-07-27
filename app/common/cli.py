@@ -375,7 +375,7 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.command == "collection-plan" or args.command == "run" or (
+    if args.command in {"cleanup", "collection-plan", "run"} or (
         args.command in _RUN_TARGETS
     ):
         refusal_exit = _live_entry_refusal_exit()

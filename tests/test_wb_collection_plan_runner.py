@@ -17,7 +17,7 @@ import requests
 
 from app.common.cli import build_parser
 from app.common.config import load_config
-from app.common.exceptions import RunLockedError
+from app.common.exceptions import CriticalPipelineError, RunLockedError
 from app.common.run_lock import acquire_advisory_lock, acquire_run_lock
 from app.serp import collection_plan_runner as runner_module
 from app.serp.collection_plan import (
@@ -39,6 +39,7 @@ from app.serp.collection_plan_runner import (
     acquire_collection_plan_locks,
     parse_retry_after_delta,
     run_collection_plan,
+    validate_resumable_collection_state,
 )
 from scripts import run_wb_collection_plan as dedicated_launcher
 
@@ -521,6 +522,12 @@ def test_top1000_resume_repeats_only_unfinished_query_segment(
         / "shevron-moscow-rostov-top100-pilot-v1"
         / "latest.json"
     ).exists()
+    assert validate_resumable_collection_state(
+        config=config,
+        plan_path=plan_path,
+        run_id=RUN_ID,
+        transport=FakeTransport(),
+    )
 
     resumed = FakeTransport(egress_values=["198.51.100.20"] * 8)
     manifest = run_collection_plan(
@@ -555,7 +562,6 @@ def test_top1000_resume_repeats_only_unfinished_query_segment(
         "attempts": 65,
         "pages_ok": 64,
     }
-
     mart_path = (
         root
         / "data/marts/serp_scoped"
@@ -600,6 +606,46 @@ def test_top1000_resume_repeats_only_unfinished_query_segment(
         ref["egress"]["start"]["masked"] for ref in segment_refs
     } == {"203.0.x.x", "198.51.x.x"}
     assert resumed.egress_calls == 5
+
+
+def test_top1000_empty_checkpoint_is_not_resumable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    run_dir = (
+        root
+        / "state/wb_collection_plans"
+        / plan["collection_plan_id"]
+        / RUN_ID
+    )
+    run_dir.mkdir(parents=True)
+    _write_json(
+        run_dir / "manifest.json",
+        {
+            "schema_version": "wb_collection_plan_manifest_v2",
+            "run_id": RUN_ID,
+            "collection_plan_id": plan["collection_plan_id"],
+            "complete": False,
+            "status": "failed",
+            "resume": {
+                "segments": [],
+                "discarded_segments": [],
+                "failed_segment": None,
+            },
+        },
+    )
+    _write_json(run_dir / "effective_plan.json", {})
+    assert not validate_resumable_collection_state(
+        config=config,
+        plan_path=plan_path,
+        run_id=RUN_ID,
+        transport=FakeTransport(),
+    )
 
 
 def test_top1000_short_payload_records_attempt_without_canonical_page(
@@ -1183,6 +1229,43 @@ def test_top1000_dual_region_latest_visibility_is_atomic(
     assert resume_transport.resolve_calls == []
     assert resume_transport.search_calls == []
     assert resume_transport.egress_calls == 0
+
+
+def test_attested_input_mutation_before_latest_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    calls = 0
+
+    def integrity_gate() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise CollectionPlanRunError("attested input changed")
+
+    with pytest.raises(CollectionPlanRunError, match="attested input changed"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            input_integrity_gate=integrity_gate,
+        )
+    latest = (
+        root
+        / "state/wb_collection_plans"
+        / plan["collection_plan_id"]
+        / "latest.json"
+    )
+    assert not latest.exists()
 
 
 def test_top1000_resume_reconciles_crash_after_durable_latest_pointer(
@@ -1967,6 +2050,40 @@ def test_dedicated_launcher_handles_lock_contention_without_traceback(
     captured = capsys.readouterr()
     assert "collection plan lock is busy" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_dedicated_launcher_forged_wrapped_flag_fails_before_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("PARSER_WB_LOCK_V3_WRAPPED", "1")
+    monkeypatch.setattr(
+        dedicated_launcher,
+        "require_official_live_entry_lease",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            CriticalPipelineError("host lease invalid")
+        ),
+    )
+    monkeypatch.setattr(
+        dedicated_launcher,
+        "load_config",
+        lambda _path: pytest.fail("config must not load"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_wb_collection_plan.py",
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--plan-file",
+            str(tmp_path / "plan.json"),
+            "--no-publish",
+        ],
+    )
+    assert dedicated_launcher.main() == 1
+    assert "host lease invalid" in capsys.readouterr().err
 
 
 def test_dedicated_launcher_forwards_explicit_resume_run_id(

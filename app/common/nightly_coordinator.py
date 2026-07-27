@@ -70,8 +70,11 @@ COORDINATOR_ENV_KEYS = {
 DESCENDANT_LEASE_ENV_KEYS = {
     "PARSER_WB_LOCK_V3_CONTRACT",
     "PARSER_WB_LOCK_V3_GUARD_PATH",
+    "PARSER_WB_LOCK_V3_GUARD_FD",
     "PARSER_WB_LOCK_V3_VALIDATION_PATH",
     "PARSER_WB_LOCK_V3_VALIDATION_FD",
+    "PARSER_WB_LOCK_V3_VALIDATION_OWNER_PID",
+    "PARSER_WB_LOCK_V3_QUARANTINE_PATH",
 }
 QUARANTINE_KEYS = {
     "schema_version",
@@ -168,14 +171,15 @@ class HostLockPolicy:
 class MarketplaceCollectionLease(AbstractContextManager["MarketplaceCollectionLease"]):
     policy: HostLockPolicy
     invocation: CoordinatorInvocation | None
-    guard_fd: int | None
+    guard_fd: int
     validation_fd: int
     owns_guard: bool
     owns_validation: bool
+    quarantine_marker_path: Path
 
     @property
     def pass_fds(self) -> tuple[int, ...]:
-        return (self.validation_fd,)
+        return tuple(sorted({self.guard_fd, self.validation_fd}))
 
     def assert_held(self) -> None:
         self.policy.validate_directory()
@@ -191,10 +195,9 @@ class MarketplaceCollectionLease(AbstractContextManager["MarketplaceCollectionLe
             self.policy,
             code="coordinator_validation_lease_lost",
         )
-        if self.guard_fd is not None:
-            guard_info = os.fstat(self.guard_fd)
-            self.policy.validate_file(self.policy.guard_path, guard_info)
-            _assert_same_path_inode(self.policy.guard_path, guard_info, self.policy)
+        guard_info = os.fstat(self.guard_fd)
+        self.policy.validate_file(self.policy.guard_path, guard_info)
+        _assert_same_path_inode(self.policy.guard_path, guard_info, self.policy)
         _assert_externally_locked(
             self.policy.guard_path,
             self.policy,
@@ -203,9 +206,8 @@ class MarketplaceCollectionLease(AbstractContextManager["MarketplaceCollectionLe
 
     def __exit__(self, *_args: object) -> None:
         if self.owns_validation:
-            _unlock_close(self.validation_fd)
-        if self.owns_guard and self.guard_fd is not None:
-            _unlock_close(self.guard_fd)
+            _close_fd(self.validation_fd)
+        _close_fd(self.guard_fd)
 
 
 def _safe_id(value: str, field: str, *, allow_empty: bool = False) -> str:
@@ -498,11 +500,11 @@ def _lock_nonblocking(fd: int, *, code: str) -> None:
         raise NightlyCoordinatorContractError(code) from exc
 
 
-def _unlock_close(fd: int) -> None:
+def _close_fd(fd: int) -> None:
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
         os.close(fd)
+    except OSError:
+        pass
 
 
 def _marker_digest(payload: Mapping[str, Any]) -> str:
@@ -665,44 +667,61 @@ def acquire_marketplace_collection_lease(
     active_policy.validate_directory()
 
     if invocation is not None:
+        guard_fd = _open_lock(active_policy.guard_path, active_policy)
         try:
-            validation_fd = int(env["MARKETPLACE_COLLECTION_VALIDATION_FD"])
-            owner_pid = int(
-                env["MARKETPLACE_COLLECTION_VALIDATION_OWNER_PID"]
+            try:
+                validation_fd = int(
+                    env["MARKETPLACE_COLLECTION_VALIDATION_FD"]
+                )
+                owner_pid = int(
+                    env["MARKETPLACE_COLLECTION_VALIDATION_OWNER_PID"]
+                )
+            except ValueError as exc:
+                raise NightlyCoordinatorContractError(
+                    "coordinator_validation_lease_invalid",
+                    outcome="hard_failure",
+                ) from exc
+            if (
+                validation_fd < 3
+                or owner_pid < 2
+                or not Path(f"/proc/{owner_pid}").exists()
+            ):
+                raise NightlyCoordinatorContractError(
+                    "coordinator_validation_lease_invalid",
+                    outcome="hard_failure",
+                )
+            try:
+                info = os.fstat(validation_fd)
+            except OSError as exc:
+                raise NightlyCoordinatorContractError(
+                    "coordinator_validation_lease_invalid",
+                    outcome="hard_failure",
+                ) from exc
+            active_policy.validate_file(active_policy.validation_path, info)
+            _validate_inherited_validation_owner(
+                owner_pid=owner_pid,
+                validation_fd=validation_fd,
+                validation_info=info,
             )
-        except ValueError as exc:
-            raise NightlyCoordinatorContractError(
-                "coordinator_validation_lease_invalid",
-                outcome="hard_failure",
-            ) from exc
-        if validation_fd < 3 or owner_pid < 2 or not Path(f"/proc/{owner_pid}").exists():
-            raise NightlyCoordinatorContractError(
-                "coordinator_validation_lease_invalid",
-                outcome="hard_failure",
+            _assert_same_path_inode(
+                active_policy.validation_path,
+                info,
+                active_policy,
             )
-        try:
-            info = os.fstat(validation_fd)
-        except OSError as exc:
-            raise NightlyCoordinatorContractError(
-                "coordinator_validation_lease_invalid",
-                outcome="hard_failure",
-            ) from exc
-        active_policy.validate_file(active_policy.validation_path, info)
-        _validate_inherited_validation_owner(
-            owner_pid=owner_pid,
-            validation_fd=validation_fd,
-            validation_info=info,
-        )
-        _assert_same_path_inode(active_policy.validation_path, info, active_policy)
-        os.set_inheritable(validation_fd, True)
-        lease = MarketplaceCollectionLease(
-            policy=active_policy,
-            invocation=invocation,
-            guard_fd=None,
-            validation_fd=validation_fd,
-            owns_guard=False,
-            owns_validation=False,
-        )
+            os.set_inheritable(guard_fd, True)
+            os.set_inheritable(validation_fd, True)
+            lease = MarketplaceCollectionLease(
+                policy=active_policy,
+                invocation=invocation,
+                guard_fd=guard_fd,
+                validation_fd=validation_fd,
+                owns_guard=False,
+                owns_validation=False,
+                quarantine_marker_path=invocation.quarantine_marker_path,
+            )
+        except Exception:
+            _close_fd(guard_fd)
+            raise
     else:
         guard_fd = _open_lock(active_policy.guard_path, active_policy)
         try:
@@ -719,13 +738,15 @@ def acquire_marketplace_collection_lease(
                     validation_fd,
                     code="shared_marketplace_validation_busy",
                 )
+                os.set_inheritable(guard_fd, True)
                 os.set_inheritable(validation_fd, True)
             except Exception:
                 os.close(validation_fd)
                 raise
         except Exception:
-            _unlock_close(guard_fd)
+            _close_fd(guard_fd)
             raise
+        marker_path = quarantine_marker_path or QUARANTINE_MARKER_PATH
         lease = MarketplaceCollectionLease(
             policy=active_policy,
             invocation=None,
@@ -733,6 +754,7 @@ def acquire_marketplace_collection_lease(
             validation_fd=validation_fd,
             owns_guard=True,
             owns_validation=True,
+            quarantine_marker_path=marker_path,
         )
     try:
         lease.assert_held()
@@ -761,8 +783,13 @@ def descendant_lease_environment(
     return {
         "PARSER_WB_LOCK_V3_CONTRACT": LOCK_CONTRACT_VERSION,
         "PARSER_WB_LOCK_V3_GUARD_PATH": str(lease.policy.guard_path),
+        "PARSER_WB_LOCK_V3_GUARD_FD": str(lease.guard_fd),
         "PARSER_WB_LOCK_V3_VALIDATION_PATH": str(lease.policy.validation_path),
         "PARSER_WB_LOCK_V3_VALIDATION_FD": str(lease.validation_fd),
+        "PARSER_WB_LOCK_V3_VALIDATION_OWNER_PID": str(os.getpid()),
+        "PARSER_WB_LOCK_V3_QUARANTINE_PATH": str(
+            lease.quarantine_marker_path
+        ),
     }
 
 
@@ -772,9 +799,15 @@ def validate_descendant_marketplace_lease(
     policy: HostLockPolicy | None = None,
 ) -> int:
     env = environment if environment is not None else os.environ
-    if {key for key in DESCENDANT_LEASE_ENV_KEYS if key in env} != (
-        DESCENDANT_LEASE_ENV_KEYS
-    ):
+    present_keys = {
+        key for key in DESCENDANT_LEASE_ENV_KEYS if key in env
+    }
+    if not present_keys:
+        raise NightlyCoordinatorContractError(
+            "official_live_entry_requires_lock_v3",
+            outcome="deferred",
+        )
+    if present_keys != DESCENDANT_LEASE_ENV_KEYS:
         raise NightlyCoordinatorContractError(
             "descendant_validation_lease_incomplete",
             outcome="hard_failure",
@@ -792,20 +825,46 @@ def validate_descendant_marketplace_lease(
             outcome="hard_failure",
         )
     try:
+        guard_fd = int(env["PARSER_WB_LOCK_V3_GUARD_FD"])
         validation_fd = int(env["PARSER_WB_LOCK_V3_VALIDATION_FD"])
+        owner_pid = int(
+            env["PARSER_WB_LOCK_V3_VALIDATION_OWNER_PID"]
+        )
+        guard_info = os.fstat(guard_fd)
         validation_info = os.fstat(validation_fd)
     except (ValueError, OSError) as exc:
         raise NightlyCoordinatorContractError(
             "descendant_validation_lease_invalid",
             outcome="hard_failure",
         ) from exc
-    if validation_fd < 3:
+    if (
+        guard_fd < 3
+        or validation_fd < 3
+        or guard_fd == validation_fd
+        or owner_pid < 2
+    ):
         raise NightlyCoordinatorContractError(
             "descendant_validation_lease_invalid",
             outcome="hard_failure",
         )
     active_policy.validate_directory()
+    active_policy.validate_file(active_policy.guard_path, guard_info)
     active_policy.validate_file(active_policy.validation_path, validation_info)
+    _validate_inherited_validation_owner(
+        owner_pid=owner_pid,
+        validation_fd=guard_fd,
+        validation_info=guard_info,
+    )
+    _validate_inherited_validation_owner(
+        owner_pid=owner_pid,
+        validation_fd=validation_fd,
+        validation_info=validation_info,
+    )
+    _assert_same_path_inode(
+        active_policy.guard_path,
+        guard_info,
+        active_policy,
+    )
     _assert_same_path_inode(
         active_policy.validation_path,
         validation_info,
@@ -821,6 +880,24 @@ def validate_descendant_marketplace_lease(
         active_policy,
         code="descendant_guard_lock_lost",
     )
+    invocation = coordinator_invocation_from_environment(env)
+    marker_path = Path(env["PARSER_WB_LOCK_V3_QUARANTINE_PATH"])
+    expected_marker_path = (
+        invocation.quarantine_marker_path
+        if invocation is not None
+        else (
+            QUARANTINE_MARKER_PATH
+            if policy is None
+            else marker_path
+        )
+    )
+    if marker_path != expected_marker_path:
+        raise NightlyCoordinatorContractError(
+            "descendant_quarantine_path_invalid",
+            outcome="hard_failure",
+        )
+    _validate_quarantine(invocation, marker_path=marker_path)
+    os.set_inheritable(guard_fd, True)
     os.set_inheritable(validation_fd, True)
     return validation_fd
 
@@ -834,11 +911,6 @@ def require_official_live_entry_lease(
     active_policy = policy or HostLockPolicy.production()
     if not os.path.lexists(active_policy.directory):
         return None
-    if env.get("PARSER_WB_LOCK_V3_WRAPPED") != "1":
-        raise NightlyCoordinatorContractError(
-            "official_live_entry_requires_lock_v3",
-            outcome="deferred",
-        )
     return validate_descendant_marketplace_lease(
         environment=env,
         policy=active_policy,

@@ -20,9 +20,14 @@ RUN_STAMP="$(date +%Y%m%d_%H%M%S%z)"
 SERP_MAX_ATTEMPTS="${PARSER_WB_SERP_MAX_ATTEMPTS:-2}"
 SERP_RETRY_SLEEP_SECONDS="${PARSER_WB_SERP_RETRY_SLEEP_SECONDS:-3600}"
 
-if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" \
-  && ( -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ) ]]; then
-  exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"
+if [[ -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ]]; then
+  if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" ]]; then
+    exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"
+  fi
+  if ! "$PYTHON_BIN" "$COORDINATOR_ADAPTER" entry-check; then
+    echo "WB host lock-v3 lease validation failed" >&2
+    exit 2
+  fi
 fi
 
 notify_on_exit() {
