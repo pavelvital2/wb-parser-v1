@@ -15,7 +15,7 @@ from .runtime_env import (
 )
 
 
-MANIFEST_SCHEMA_VERSION = "wb_nightly_coordinator_input_manifest_v2"
+MANIFEST_SCHEMA_VERSION = "wb_nightly_coordinator_input_manifest_v3"
 MANIFEST_RELATIVE_PATH = Path(
     "config/wb/nightly_coordinator_adapter_inputs.json"
 )
@@ -209,8 +209,6 @@ def _dependency_tree_contract(root: Path) -> dict[str, object]:
             if stat.S_ISLNK(info.st_mode):
                 _fail("coordinator_python_dependencies_unsafe")
             if stat.S_ISDIR(info.st_mode):
-                if entry.name == "__pycache__":
-                    continue
                 if info.st_uid != os.geteuid() or info.st_mode & 0o022:
                     _fail("coordinator_python_dependencies_unsafe")
                 directory_count += 1
@@ -229,8 +227,6 @@ def _dependency_tree_contract(root: Path) -> dict[str, object]:
                 or info.st_nlink != 1
             ):
                 _fail("coordinator_python_dependencies_unsafe")
-            if relative.suffix in {".pyc", ".pyo"}:
-                continue
             flags = os.O_RDONLY | os.O_CLOEXEC
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
@@ -267,7 +263,8 @@ def _dependency_tree_contract(root: Path) -> dict[str, object]:
                 (
                     f"F\0{relative.as_posix()}\0{before.st_uid}\0"
                     f"{before.st_gid}\0{stat.S_IMODE(before.st_mode):o}\0"
-                    f"{before.st_size}\0{_sha256(payload)}\0"
+                    f"{before.st_nlink}\0{before.st_size}\0"
+                    f"{_sha256(payload)}\0"
                 ).encode("utf-8")
             )
 

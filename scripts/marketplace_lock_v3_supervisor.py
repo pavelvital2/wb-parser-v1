@@ -30,6 +30,14 @@ class ProcessStat:
     starttime: int
 
 
+class PidfdCapabilityError(RuntimeError):
+    pass
+
+
+class PidfdSignalError(RuntimeError):
+    pass
+
+
 def _fail(message: str) -> int:
     print(f"WB lock-v3 supervisor: {message}", file=sys.stderr)
     return 2
@@ -157,32 +165,56 @@ def _current_identity(pid: int) -> ProcessIdentity | None:
     return ProcessIdentity(pid=pid, starttime=process.starttime)
 
 
+def _require_pidfd_capability() -> None:
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        raise PidfdCapabilityError("pidfd capability is unavailable")
+    pid = os.getpid()
+    expected = _current_identity(pid)
+    if expected is None:
+        raise PidfdCapabilityError("supervisor identity is unavailable")
+    try:
+        pidfd = pidfd_open(pid, 0)
+    except OSError as exc:
+        raise PidfdCapabilityError("pidfd capability check failed") from exc
+    try:
+        if _current_identity(pid) != expected:
+            raise PidfdCapabilityError(
+                "supervisor identity changed during pidfd check"
+            )
+        pidfd_send_signal(pidfd, 0, None, 0)
+    except OSError as exc:
+        raise PidfdCapabilityError("pidfd capability check failed") from exc
+    finally:
+        os.close(pidfd)
+
+
 def _signal_identity(identity: ProcessIdentity, signum: int) -> bool:
     if _current_identity(identity.pid) != identity:
         return False
     pidfd_open = getattr(os, "pidfd_open", None)
     pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
-    if pidfd_open is not None and pidfd_send_signal is not None:
-        try:
-            pidfd = pidfd_open(identity.pid, 0)
-        except (OSError, ProcessLookupError):
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        raise PidfdSignalError("pidfd capability became unavailable")
+    try:
+        pidfd = pidfd_open(identity.pid, 0)
+    except OSError as exc:
+        if _current_identity(identity.pid) != identity:
+            return False
+        raise PidfdSignalError("pidfd open failed") from exc
+    try:
+        if _current_identity(identity.pid) != identity:
             return False
         try:
+            pidfd_send_signal(pidfd, signum, None, 0)
+        except OSError as exc:
             if _current_identity(identity.pid) != identity:
                 return False
-            pidfd_send_signal(pidfd, signum, None, 0)
-            return True
-        except (OSError, ProcessLookupError):
-            return False
-        finally:
-            os.close(pidfd)
-    if _current_identity(identity.pid) != identity:
-        return False
-    try:
-        os.kill(identity.pid, signum)
-    except ProcessLookupError:
-        return False
-    return True
+            raise PidfdSignalError("pidfd signal failed") from exc
+        return True
+    finally:
+        os.close(pidfd)
 
 
 def _reap_children() -> None:
@@ -209,8 +241,22 @@ def _terminate_owned(
         )
 
     active = remaining()
+    signal_failed = False
     for identity in active:
-        _signal_identity(identity, signal.SIGTERM)
+        try:
+            _signal_identity(identity, signal.SIGTERM)
+        except PidfdSignalError:
+            signal_failed = True
+            break
+    if signal_failed:
+        while active:
+            time.sleep(POLL_SECONDS)
+            active = _refresh_owned(
+                active,
+                supervisor_pid=supervisor_pid,
+                baseline_children=baseline_children,
+            )
+        return False
     deadline = time.monotonic() + TERM_GRACE_SECONDS
     while time.monotonic() < deadline:
         active = _refresh_owned(
@@ -222,7 +268,20 @@ def _terminate_owned(
             return True
         time.sleep(POLL_SECONDS)
     for identity in active:
-        _signal_identity(identity, signal.SIGKILL)
+        try:
+            _signal_identity(identity, signal.SIGKILL)
+        except PidfdSignalError:
+            signal_failed = True
+            break
+    if signal_failed:
+        while active:
+            time.sleep(POLL_SECONDS)
+            active = _refresh_owned(
+                active,
+                supervisor_pid=supervisor_pid,
+                baseline_children=baseline_children,
+            )
+        return False
     deadline = time.monotonic() + TERM_GRACE_SECONDS
     while time.monotonic() < deadline:
         active = _refresh_owned(
@@ -248,6 +307,10 @@ def main() -> int:
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
         return _fail("cannot enable child subreaper")
+    try:
+        _require_pidfd_capability()
+    except PidfdCapabilityError as exc:
+        return _fail(str(exc))
 
     supervisor_pid = os.getpid()
     initial_table = _process_table()

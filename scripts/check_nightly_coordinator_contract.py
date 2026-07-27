@@ -1,4 +1,4 @@
-#!/home/Codex/agent-tools/parser_wb-python/bin/python
+#!/home/Codex/agent-tools/parser_wb-python/bin/python -B
 from __future__ import annotations
 
 import hashlib
@@ -183,6 +183,7 @@ def _validate_sources() -> list[dict[str, str]]:
         "wb_nightly_coordinator_adapter.py" not in adapter_source
         or "four-region" not in adapter_source
         or "run_wb_collection_plan.sh" in adapter_source
+        or "export PYTHONDONTWRITEBYTECODE=1" not in adapter_source
     ):
         raise CheckError("adapter target is invalid")
     plan_bytes = _read_safe(PLAN)
@@ -280,7 +281,7 @@ def _validate_sources() -> list[dict[str, str]]:
             PROJECT_ROOT / "scripts/check_nightly_coordinator_contract.py",
             executable=True,
         ).startswith(
-            b"#!/home/Codex/agent-tools/parser_wb-python/bin/python\n"
+            b"#!/home/Codex/agent-tools/parser_wb-python/bin/python -B\n"
         )
         or
         'source "$runtime_env_file"' in runtime_shell_source
@@ -294,6 +295,10 @@ def _validate_sources() -> list[dict[str, str]]:
         or "APPROVED_PYTHON_BIN" not in attestation_source
         or "APPROVED_SITE_PACKAGES" not in attestation_source
         or "coordinator_python_runtime_mismatch" not in attestation_source
+        or 'entry.name == "__pycache__"' in attestation_source
+        or 'relative.suffix in {".pyc", ".pyo"}' in attestation_source
+        or 'result["PYTHONDONTWRITEBYTECODE"] = "1"'
+        not in adapter_python_source
     ):
         raise CheckError("runtime loading/attestation contract mismatch")
     passthrough_source = adapter_python_source[
@@ -314,8 +319,10 @@ def _validate_sources() -> list[dict[str, str]]:
         "ProcessIdentity" not in supervisor_source
         or "starttime" not in supervisor_source
         or "pidfd_open" not in supervisor_source
+        or "_require_pidfd_capability()" not in supervisor_source
         or "_refresh_owned(" not in supervisor_source
         or "killpg" in supervisor_source
+        or "os.kill(" in supervisor_source
     ):
         raise CheckError("supervisor process identity contract mismatch")
     if (
@@ -325,7 +332,9 @@ def _validate_sources() -> list[dict[str, str]]:
         or "integrity_gate()" not in durable_source
         or "source_integrity_gate()" not in durable_source
         or 'event_hook("after_rename", path)' not in durable_source
-        or "_same_inode(committed, temp_info)" not in durable_source
+        or "_published_target_matches(" not in durable_source
+        or "publication_durable" not in durable_source
+        or "durable atomic publication has cleanup debt" not in durable_source
         or "require_absent=True" not in coordinator_source
         or "integrity_gate=integrity_gate" not in coordinator_source
         or "integrity_gate=integrity_gate" not in scoped_source
@@ -458,6 +467,8 @@ def _validate_sources() -> list[dict[str, str]]:
         if (
             bootstrap_index < 0
             or exec_index <= bootstrap_index
+            or source.find("export PYTHONDONTWRITEBYTECODE=1")
+            < 0
             or source.find(
                 '"$PYTHON_BIN" "$COORDINATOR_ADAPTER" entry-check'
             )

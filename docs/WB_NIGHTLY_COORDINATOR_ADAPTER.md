@@ -136,7 +136,11 @@ the attested verifier and
 contains the complete tracked Python/shell/config/query-pack graph and exact
 SHA-256 values, `requirements.txt`, the exact centralized Python executable
 path/version/hash, and a deterministic digest of the approved installed
-site-packages tree. The adapter pins the manifest SHA per invocation and
+site-packages tree. Installed `__pycache__`, `.pyc`, and `.pyo` entries are
+included with their bytes, type, owner, mode, and link-count constraints;
+addition, removal, or mutation invalidates the manifest. Coordinator children
+run with `PYTHONDONTWRITEBYTECODE=1`, so execution cannot rewrite the attested
+bytecode tree. The adapter pins the manifest SHA per invocation and
 rechecks the graph, Python/dependencies and hash-only effective runtime inputs
 before each stage and inside every durable publication writer. The coordinator
 path never shell-sources `runtime.env`; the strict parser accepts only reviewed
@@ -149,9 +153,12 @@ perform no network calls.
 The subreaper does not use a numeric process-group ID as ownership evidence.
 It parses `/proc/<pid>/stat` after the closing command-name parenthesis, pins
 each process by `(pid, starttime)`, discovers descendants and adopted children,
-and rechecks identity before signalling, using pidfd where available. A reused
-PID or PGID therefore cannot redirect a termination signal, while the host-lock
-FDs remain held until the last owned descendant exits.
+and rechecks identity before signalling. Working `pidfd_open` and
+`pidfd_send_signal` are mandatory and are tested before child spawn; there is
+no numeric-PID signal fallback. A reused PID or PGID therefore cannot redirect
+a termination signal. If pidfd signalling fails for a still-matching identity,
+the supervisor fails closed and retains the host-lock FDs until every owned
+descendant terminates without an unsafe signal.
 
 The activation checker has an absolute approved-Python shebang and is invoked
 directly by the coordinator. It therefore runs with
@@ -172,12 +179,30 @@ proves that the committed leaf is the same inode with the exact encoded bytes
 and one link. Copy publication also retains and rechecks the source FD,
 pathname identity and bytes before and after commit. Input attestation runs
 inside the writer immediately before commit and again during post-commit
-verification. A transient hardlink backup restores the prior trusted
-publication if a post-rename integrity check fails; it is removed only after a
-fully verified commit. A failed pre-commit check or partial temporary write
-cannot replace the prior publication. The stricter no-group-write rule applies
-to influencing inputs; existing runtime outputs created under the host
-`umask 0002` are safely replaced with writer-selected modes.
+verification. A transient hardlink backup remains durable through all
+publication-critical fsync and proof steps. Rollback is allowed only while the
+target is still the exact inode and bytes published by that writer. A later
+cooperative writer is never overwritten by compensation from an earlier
+writer. Backup cleanup happens after durable success; an unlink or
+cleanup-fsync failure is reported as maintenance debt and does not turn an
+already durable commit into a false publication failure. A failed pre-commit
+check or partial temporary write cannot replace the prior publication. The
+stricter no-group-write rule applies to influencing inputs; existing runtime
+outputs created under the host `umask 0002` are safely replaced with
+writer-selected modes.
+
+## Operational Threat Model
+
+The application-level guarantee assumes cooperative official writers running
+under the same Unix UID and serialized by the validated host lease. FD
+anchoring, exact-byte proofs, CAS-safe rollback, and pidfd identity checks are
+still required inside that model.
+
+A malicious file owner, arbitrary same-UID process outside the official
+entrypoints, or privileged/root/sudo actor is outside this application-level
+guarantee. Protecting against that actor requires a separate deployment stage
+with a dedicated OS service user and service/filesystem isolation. The current
+contract must not be described as protection against such an actor.
 
 After lock-v3 cutover, WebUI config/upload mutations require the same validated
 lease and WebUI collection actions use `scripts/run_wb_live_component.sh`.

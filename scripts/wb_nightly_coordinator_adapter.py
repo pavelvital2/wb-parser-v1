@@ -206,6 +206,7 @@ def _prepare_supervisor_environment(
     pass_fds: tuple[int, ...],
 ) -> dict[str, str]:
     result = dict(environment)
+    result["PYTHONDONTWRITEBYTECODE"] = "1"
     result["PARSER_WB_LOCK_V3_WRAPPED"] = "1"
     result["PARSER_WB_SUPERVISOR_PASS_FDS"] = ",".join(
         str(value) for value in sorted(set(pass_fds))

@@ -1135,6 +1135,11 @@ def test_legacy_nightly_wrapper_diff_is_only_lock_v3_bootstrap_and_safe_fd() -> 
         PROJECT_ROOT / "scripts/run_products_sellers_daily.sh"
     ).read_text(encoding="utf-8")
     source = source.replace(
+        "export PYTHONDONTWRITEBYTECODE=1\n",
+        "",
+        1,
+    )
+    source = source.replace(
         'COORDINATOR_ADAPTER="$PROJECT_DIR/scripts/'
         'wb_nightly_coordinator_adapter.py"\n'
         'COORDINATOR_LOCK_DIR="/run/lock/parser-nightly-coordinator"\n',

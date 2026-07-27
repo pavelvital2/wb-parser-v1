@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 PROJECT_DIR="${PARSER_WB_PROJECT_DIR:-/home/pavel/projects/parser_wb}"
 PYTHON_BIN="${PARSER_WB_PYTHON_BIN:-/home/Codex/agent-tools/parser_wb-python/bin/python}"

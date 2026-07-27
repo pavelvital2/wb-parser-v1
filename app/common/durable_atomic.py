@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import stat
 import uuid
@@ -10,6 +11,7 @@ from typing import Callable
 
 IntegrityGate = Callable[[], None]
 WriteEventHook = Callable[[str, Path], None]
+LOGGER = logging.getLogger(__name__)
 
 
 class DurableAtomicWriteError(RuntimeError):
@@ -205,6 +207,56 @@ def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
+def _published_target_matches(
+    directory_fd: int,
+    name: str,
+    temp_fd: int,
+    *,
+    temp_info: os.stat_result,
+    payload: bytes,
+    mode: int,
+) -> bool:
+    try:
+        target_info = _target_info(directory_fd, name)
+        open_payload, open_info = _read_open_fd(
+            temp_fd,
+            max_bytes=len(payload),
+        )
+    except (OSError, DurableAtomicWriteError):
+        return False
+    return bool(
+        target_info is not None
+        and _same_inode(target_info, temp_info)
+        and _same_inode(open_info, temp_info)
+        and target_info.st_nlink == 1
+        and open_info.st_nlink == 1
+        and stat.S_IMODE(target_info.st_mode) == mode
+        and open_payload == payload
+    )
+
+
+def _cleanup_backup(
+    directory_fd: int,
+    backup_name: str,
+    *,
+    event_hook: WriteEventHook | None,
+    path: Path,
+) -> bool:
+    try:
+        if event_hook is not None:
+            event_hook("before_backup_cleanup", path)
+        os.unlink(backup_name, dir_fd=directory_fd)
+        if event_hook is not None:
+            event_hook("backup_unlinked", path)
+        os.fsync(directory_fd)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        LOGGER.warning("durable atomic publication has cleanup debt")
+        return False
+    return True
+
+
 def durable_atomic_replace(
     path: Path,
     payload: bytes,
@@ -228,6 +280,7 @@ def durable_atomic_replace(
     temp_created = False
     backup_created = False
     renamed = False
+    publication_durable = False
     temp_fd = -1
     temp_info: os.stat_result | None = None
     initial: os.stat_result | None = None
@@ -341,6 +394,7 @@ def durable_atomic_replace(
                 raise DurableAtomicWriteError(
                     "atomic target changed before commit"
                 )
+            os.fsync(directory_fd)
         if source_integrity_gate is not None:
             source_integrity_gate()
         _verify_open_path(
@@ -367,47 +421,77 @@ def durable_atomic_replace(
             integrity_gate()
         if source_integrity_gate is not None:
             source_integrity_gate()
-        committed = _target_info(directory_fd, path.name)
-        temp_payload, open_temp_info = _read_open_fd(
+        if not _published_target_matches(
+            directory_fd,
+            path.name,
             temp_fd,
-            max_bytes=len(payload),
-        )
-        if (
-            committed is None
-            or not _same_inode(committed, temp_info)
-            or not _same_inode(open_temp_info, temp_info)
-            or committed.st_nlink != 1
-            or open_temp_info.st_nlink != 1
-            or temp_payload != payload
+            temp_info=temp_info,
+            payload=payload,
+            mode=mode,
         ):
             raise DurableAtomicWriteError(
                 "atomic committed target identity mismatch"
             )
         if event_hook is not None:
             event_hook("directory_fsynced", path)
-        verified, info = _read_target(
-            directory_fd,
-            path.name,
-            max_bytes=len(payload),
-        )
-        if (
-            verified != payload
-            or stat.S_IMODE(info.st_mode) != mode
-        ):
-            raise DurableAtomicWriteError(
-                "atomic target verification failed"
-            )
         if integrity_gate is not None:
             integrity_gate()
         if source_integrity_gate is not None:
             source_integrity_gate()
+        if event_hook is not None:
+            event_hook("before_final_proof", path)
+        if not _published_target_matches(
+            directory_fd,
+            path.name,
+            temp_fd,
+            temp_info=temp_info,
+            payload=payload,
+            mode=mode,
+        ):
+            raise DurableAtomicWriteError(
+                "atomic final target proof failed"
+            )
+        if event_hook is not None:
+            event_hook("publication_proved", path)
+        if integrity_gate is not None:
+            integrity_gate()
+        if source_integrity_gate is not None:
+            source_integrity_gate()
+        if not _published_target_matches(
+            directory_fd,
+            path.name,
+            temp_fd,
+            temp_info=temp_info,
+            payload=payload,
+            mode=mode,
+        ):
+            raise DurableAtomicWriteError(
+                "atomic target changed after proof"
+            )
+        publication_durable = True
         if backup_created:
-            os.unlink(backup_name, dir_fd=directory_fd)
-            backup_created = False
-            os.fsync(directory_fd)
+            backup_created = not _cleanup_backup(
+                directory_fd,
+                backup_name,
+                event_hook=event_hook,
+                path=path,
+            )
         return hashlib.sha256(payload).hexdigest()
     except BaseException:
-        if renamed:
+        rollback_error: BaseException | None = None
+        if (
+            renamed
+            and not publication_durable
+            and temp_info is not None
+            and _published_target_matches(
+                directory_fd,
+                path.name,
+                temp_fd,
+                temp_info=temp_info,
+                payload=payload,
+                mode=mode,
+            )
+        ):
             try:
                 if backup_created:
                     os.rename(
@@ -423,24 +507,27 @@ def durable_atomic_replace(
                         initial is None
                         or restored is None
                         or not _same_inode(restored, initial)
+                        or restored.st_nlink != 1
                     ):
                         raise DurableAtomicWriteError(
                             "atomic rollback verification failed"
                         )
-                else:
-                    current = _target_info(directory_fd, path.name)
-                    if (
-                        initial is None
-                        and current is not None
-                        and temp_info is not None
-                        and _same_inode(current, temp_info)
-                    ):
-                        os.unlink(path.name, dir_fd=directory_fd)
-                        os.fsync(directory_fd)
-            except BaseException as rollback_error:
-                raise DurableAtomicWriteError(
-                    "atomic publication rollback failed"
-                ) from rollback_error
+                elif initial is None:
+                    os.unlink(path.name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+            except BaseException as exc:
+                rollback_error = exc
+        if backup_created:
+            backup_created = not _cleanup_backup(
+                directory_fd,
+                backup_name,
+                event_hook=None,
+                path=path,
+            )
+        if rollback_error is not None:
+            raise DurableAtomicWriteError(
+                "atomic publication rollback failed"
+            ) from rollback_error
         raise
     finally:
         if temp_fd >= 0:
@@ -448,11 +535,6 @@ def durable_atomic_replace(
         if temp_created:
             try:
                 os.unlink(temp_name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
-        if backup_created:
-            try:
-                os.unlink(backup_name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
         os.close(directory_fd)

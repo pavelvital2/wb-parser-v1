@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import py_compile
 import re
 import shutil
 import signal
@@ -356,7 +357,7 @@ def test_exact_checker_command_uses_approved_python_with_restricted_path(
 
     command = project / "scripts/check_nightly_coordinator_contract.py"
     assert command.read_bytes().splitlines()[0] == (
-        b"#!/home/Codex/agent-tools/parser_wb-python/bin/python"
+        b"#!/home/Codex/agent-tools/parser_wb-python/bin/python -B"
     )
     environment = _checker_environment(stage)
     environment.update(
@@ -416,6 +417,7 @@ def test_all_official_shell_entrants_gate_before_runtime_and_preserve_fds() -> N
             if (index := source.find(token)) >= 0
         ]
         assert adapter_exec < entry_check
+        assert source.index("export PYTHONDONTWRITEBYTECODE=1") < adapter_exec
         assert all(entry_check < index for index in runtime_indices)
         assert re.search(r"exec [0-9]+>", source) is None
         assert re.search(r"flock (?:-n |-u )?[0-9]+(?:\\s|$)", source) is None
@@ -899,6 +901,7 @@ def test_adapter_passes_validation_fd_to_collection_descendant(
             (
                 "import json, os, sys",
                 "os.fstat(int(os.environ['TEST_VALIDATION_FD']))",
+                "assert os.environ['PYTHONDONTWRITEBYTECODE'] == '1'",
                 "payload = {",
                 f"  'schema_version': {contract.ADAPTER_STATUS_SCHEMA_VERSION!r},",
                 "  'outcome': 'success',",
@@ -1224,17 +1227,152 @@ def test_supervisor_does_not_signal_reused_pid_or_process_group(
         "_current_identity",
         lambda pid: identities.get(pid),
     )
-    monkeypatch.setattr(supervisor.os, "pidfd_open", None)
-    monkeypatch.setattr(supervisor.signal, "pidfd_send_signal", None)
+    monkeypatch.setattr(supervisor.os, "pidfd_open", lambda pid, _flags: pid + 500)
+    monkeypatch.setattr(
+        supervisor.signal,
+        "pidfd_send_signal",
+        lambda pidfd, signum, _siginfo, _flags: signaled.append(
+            (pidfd, signum)
+        ),
+    )
+    monkeypatch.setattr(supervisor.os, "close", lambda _fd: None)
     monkeypatch.setattr(
         supervisor.os,
         "kill",
-        lambda pid, signum: signaled.append((pid, signum)),
+        lambda _pid, _signum: pytest.fail("numeric PID signal is forbidden"),
     )
     assert supervisor._signal_identity(descendant, signal.SIGTERM) is True
-    assert signaled == [(101, signal.SIGTERM)]
+    assert signaled == [(601, signal.SIGTERM)]
     assert supervisor._signal_identity(leader, signal.SIGTERM) is False
-    assert signaled == [(101, signal.SIGTERM)]
+    assert signaled == [(601, signal.SIGTERM)]
+
+
+def test_supervisor_requires_pidfd_before_child_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(supervisor.sys, "argv", ["supervisor", "--", "child"])
+    monkeypatch.setattr(supervisor, "_inherited_fds", lambda: (3, 4))
+    monkeypatch.setattr(
+        supervisor.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            prctl=lambda *_args: 0
+        ),
+    )
+    monkeypatch.setattr(supervisor.os, "pidfd_open", None)
+    monkeypatch.setattr(
+        supervisor.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "child must not spawn without pidfd"
+        ),
+    )
+    assert supervisor.main() == 2
+
+
+def test_supervisor_pidfd_send_capability_fails_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid = os.getpid()
+    identity = supervisor.ProcessIdentity(pid=pid, starttime=456)
+    monkeypatch.setattr(
+        supervisor,
+        "_current_identity",
+        lambda current_pid: identity if current_pid == pid else None,
+    )
+    monkeypatch.setattr(
+        supervisor.os,
+        "pidfd_open",
+        lambda _pid, _flags: 999,
+    )
+    monkeypatch.setattr(supervisor.os, "close", lambda _fd: None)
+    monkeypatch.setattr(
+        supervisor.signal,
+        "pidfd_send_signal",
+        lambda *_args: (_ for _ in ()).throw(OSError("denied")),
+    )
+    with pytest.raises(
+        supervisor.PidfdCapabilityError,
+        match="capability check failed",
+    ):
+        supervisor._require_pidfd_capability()
+
+
+def test_supervisor_pidfd_failure_never_signals_unpinned_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = supervisor.ProcessIdentity(pid=123, starttime=456)
+    monkeypatch.setattr(
+        supervisor,
+        "_current_identity",
+        lambda _pid: identity,
+    )
+    monkeypatch.setattr(
+        supervisor.os,
+        "pidfd_open",
+        lambda _pid, _flags: (_ for _ in ()).throw(OSError("denied")),
+    )
+    monkeypatch.setattr(
+        supervisor.os,
+        "kill",
+        lambda _pid, _signum: pytest.fail("numeric PID signal is forbidden"),
+    )
+    with pytest.raises(supervisor.PidfdSignalError, match="pidfd open"):
+        supervisor._signal_identity(identity, signal.SIGTERM)
+
+    identities = iter((identity, None))
+    monkeypatch.setattr(
+        supervisor,
+        "_current_identity",
+        lambda _pid: next(identities),
+    )
+    assert supervisor._signal_identity(identity, signal.SIGTERM) is False
+
+    monkeypatch.setattr(
+        supervisor,
+        "_current_identity",
+        lambda _pid: identity,
+    )
+    monkeypatch.setattr(
+        supervisor.os,
+        "pidfd_open",
+        lambda _pid, _flags: 999,
+    )
+    monkeypatch.setattr(supervisor.os, "close", lambda _fd: None)
+    monkeypatch.setattr(
+        supervisor.signal,
+        "pidfd_send_signal",
+        lambda *_args: (_ for _ in ()).throw(OSError("denied")),
+    )
+    with pytest.raises(supervisor.PidfdSignalError, match="pidfd signal"):
+        supervisor._signal_identity(identity, signal.SIGTERM)
+
+
+def test_supervisor_retains_lease_until_descendant_exits_after_pidfd_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = supervisor.ProcessIdentity(pid=123, starttime=456)
+    refreshes = iter(({identity}, {identity}, set()))
+    monkeypatch.setattr(
+        supervisor,
+        "_refresh_owned",
+        lambda *_args, **_kwargs: next(refreshes),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_signal_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            supervisor.PidfdSignalError("pidfd signal failed")
+        ),
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(supervisor.time, "sleep", sleeps.append)
+    assert supervisor._terminate_owned(
+        {identity},
+        supervisor_pid=50,
+        baseline_children=set(),
+    ) is False
+    assert len(sleeps) == 2
 
 
 def test_supervisor_waits_for_detached_adopted_descendant_with_complex_comm(
@@ -1541,6 +1679,65 @@ def test_dependency_tree_drift_invalidates_pinned_manifest(
         attestation.verify_input_manifest(project)
 
 
+@pytest.mark.parametrize("operation", ("add", "remove", "change"))
+def test_dependency_attestation_pins_timestamp_valid_bytecode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    project = tmp_path / "project"
+    for relative in ("app", "scripts", "config"):
+        shutil.copytree(PROJECT_ROOT / relative, project / relative)
+    shutil.copy2(PROJECT_ROOT / "main.py", project / "main.py")
+    shutil.copy2(PROJECT_ROOT / "requirements.txt", project / "requirements.txt")
+    dependencies = tmp_path / "site-packages"
+    dependencies.mkdir()
+    source = dependencies / "approved.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    bytecode = dependencies / "__pycache__/approved.pyc"
+    bytecode.parent.mkdir()
+    py_compile.compile(str(source), cfile=str(bytecode), doraise=True)
+    _remove_group_world_write(project)
+    _remove_group_world_write(dependencies)
+    monkeypatch.setattr(
+        attestation,
+        "APPROVED_SITE_PACKAGES",
+        dependencies,
+    )
+    manifest_path = project / attestation.MANIFEST_RELATIVE_PATH
+    manifest_path.write_text(
+        json.dumps(
+            attestation.build_input_manifest(project),
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.chmod(0o644)
+    assert len(attestation.verify_input_manifest(project)) == 64
+    if operation == "add":
+        injected_source = tmp_path / "injected.py"
+        injected_source.write_text("VALUE = 2\n", encoding="utf-8")
+        py_compile.compile(
+            str(injected_source),
+            cfile=str(bytecode.parent / "injected.pyc"),
+            doraise=True,
+        )
+    elif operation == "remove":
+        bytecode.unlink()
+    else:
+        payload = bytearray(bytecode.read_bytes())
+        payload[-1] ^= 1
+        bytecode.write_bytes(payload)
+    _remove_group_world_write(dependencies)
+    with pytest.raises(
+        contract.NightlyCoordinatorContractError,
+        match="coordinator_python_runtime_mismatch",
+    ):
+        attestation.verify_input_manifest(project)
+
+
 def test_strict_runtime_loader_rejects_shell_expression_without_spawn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1741,8 +1938,96 @@ def test_durable_writer_pins_temp_and_target_identity_through_commit(
             b"candidate\n",
             event_hook=mutate_committed_leaf,
         )
-    assert target.read_bytes() == b"trusted\n"
+    assert target.read_bytes() == b"late-substitute\n"
     assert target.stat().st_nlink == 1
+
+
+def test_durable_writer_cas_rollback_and_cleanup_debt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    target = tmp_path / "latest.json"
+    target.write_bytes(b"trusted\n")
+
+    def second_writer(event: str, path: Path) -> None:
+        if event == "after_rename":
+            replacement = tmp_path / "second-writer.json"
+            replacement.write_bytes(b"newer\n")
+            os.replace(replacement, path)
+
+    with pytest.raises(durable_atomic.DurableAtomicWriteError):
+        durable_atomic.durable_atomic_replace(
+            target,
+            b"candidate\n",
+            event_hook=second_writer,
+        )
+    assert target.read_bytes() == b"newer\n"
+
+    target.write_bytes(b"trusted\n")
+
+    def swap_after_proof(event: str, path: Path) -> None:
+        if event == "publication_proved":
+            replacement = tmp_path / "post-proof.json"
+            replacement.write_bytes(b"newest\n")
+            os.replace(replacement, path)
+
+    with pytest.raises(
+        durable_atomic.DurableAtomicWriteError,
+        match="changed after proof",
+    ):
+        durable_atomic.durable_atomic_replace(
+            target,
+            b"candidate\n",
+            event_hook=swap_after_proof,
+        )
+    assert target.read_bytes() == b"newest\n"
+
+    target.write_bytes(b"trusted\n")
+    original_unlink = durable_atomic.os.unlink
+
+    def fail_backup_unlink(
+        path: str,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if path.endswith(".rollback"):
+            raise OSError("cleanup unavailable")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(durable_atomic.os, "unlink", fail_backup_unlink)
+    caplog.set_level("WARNING")
+    digest = durable_atomic.durable_atomic_replace(target, b"durable\n")
+    assert digest == hashlib.sha256(b"durable\n").hexdigest()
+    assert target.read_bytes() == b"durable\n"
+    assert "cleanup debt" in caplog.text
+
+
+def test_durable_writer_cleanup_fsync_failure_is_not_publication_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    target = tmp_path / "latest.json"
+    target.write_bytes(b"trusted\n")
+    original_fsync = durable_atomic.os.fsync
+    directory_fsync_calls = 0
+
+    def fail_cleanup_fsync(fd: int) -> None:
+        nonlocal directory_fsync_calls
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode):
+            directory_fsync_calls += 1
+            if directory_fsync_calls == 3:
+                raise OSError("cleanup fsync unavailable")
+        original_fsync(fd)
+
+    monkeypatch.setattr(durable_atomic.os, "fsync", fail_cleanup_fsync)
+    caplog.set_level("WARNING")
+    digest = durable_atomic.durable_atomic_replace(target, b"durable\n")
+    assert digest == hashlib.sha256(b"durable\n").hexdigest()
+    assert target.read_bytes() == b"durable\n"
+    assert "cleanup debt" in caplog.text
 
 
 def test_durable_copy_pins_source_before_and_after_commit(
