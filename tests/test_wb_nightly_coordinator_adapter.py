@@ -241,6 +241,14 @@ def _checker_environment(stage: str) -> dict[str, str]:
     }
 
 
+def _remove_group_world_write(root: Path) -> None:
+    for path in (root, *root.rglob("*")):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            continue
+        path.chmod(stat.S_IMODE(info.st_mode) & ~0o022)
+
+
 @pytest.mark.parametrize(
     ("stage", "phase"),
     (("wb_initial", "initial"), ("wb_resume", "resume")),
@@ -252,6 +260,16 @@ def test_checker_dry_run_is_exact_and_no_network(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(os, "environ", _checker_environment(stage))
+    monkeypatch.setattr(
+        checker,
+        "_read_safe",
+        lambda path, **_kwargs: path.read_bytes(),
+    )
+    monkeypatch.setattr(
+        checker,
+        "verify_input_manifest",
+        lambda _root: "a" * 64,
+    )
 
     def network_forbidden(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("contract checker must not use network")
@@ -285,6 +303,97 @@ def test_checker_dry_run_is_exact_and_no_network(
         *checker.COORDINATOR_DISABLED_ENTRYPOINTS,
     ):
         assert f"scripts/{name}" in manifest["files"]
+
+
+@pytest.mark.parametrize("stage", ("wb_initial", "wb_resume"))
+def test_exact_checker_command_uses_approved_python_with_restricted_path(
+    stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    for relative in ("app", "scripts", "config"):
+        shutil.copytree(PROJECT_ROOT / relative, project / relative)
+    shutil.copy2(PROJECT_ROOT / "main.py", project / "main.py")
+    shutil.copy2(PROJECT_ROOT / "requirements.txt", project / "requirements.txt")
+    dependencies = tmp_path / "site-packages"
+    dependencies.mkdir()
+    (dependencies / "approved.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    attestation_source = project / "app/common/nightly_attestation.py"
+    source = attestation_source.read_text(encoding="utf-8")
+    source = re.sub(
+        r'APPROVED_SITE_PACKAGES = Path\(\n'
+        r'\s*"/home/Codex/agent-tools/parser_wb-python/lib/python3\.14/'
+        r'site-packages"\n'
+        r'\)',
+        f'APPROVED_SITE_PACKAGES = Path({str(dependencies)!r})',
+        source,
+        count=1,
+    )
+    attestation_source.write_text(source, encoding="utf-8")
+    _remove_group_world_write(project)
+    _remove_group_world_write(dependencies)
+    monkeypatch.setattr(
+        attestation,
+        "APPROVED_SITE_PACKAGES",
+        dependencies,
+    )
+    manifest_path = project / attestation.MANIFEST_RELATIVE_PATH
+    manifest_path.write_text(
+        json.dumps(
+            attestation.build_input_manifest(project),
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.chmod(0o644)
+
+    command = project / "scripts/check_nightly_coordinator_contract.py"
+    assert command.read_bytes().splitlines()[0] == (
+        b"#!/home/Codex/agent-tools/parser_wb-python/bin/python"
+    )
+    environment = _checker_environment(stage)
+    environment.update(
+        {
+            "PATH": "/usr/bin:/bin",
+            "HOME": os.environ.get("HOME", "/home/pavel"),
+        }
+    )
+    completed = subprocess.run(
+        [str(command)],
+        cwd=project,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["ok"] is True
+    assert payload["stage"] == stage
+    assert payload["network_used"] is False
+
+    rejected_environment = dict(environment)
+    rejected_environment[
+        "MARKETPLACE_COORDINATOR_CHECK_COMMAND_SHA256"
+    ] = "0" * 64
+    rejected = subprocess.run(
+        [str(command)],
+        cwd=project,
+        env=rejected_environment,
+        text=True,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    assert rejected.returncode == 2
+    assert "Traceback" not in rejected.stderr
 
 
 def test_all_official_shell_entrants_gate_before_runtime_and_preserve_fds() -> None:
@@ -1208,6 +1317,7 @@ def test_input_manifest_detects_omission_and_mutation(
     dependencies = tmp_path / "site-packages"
     dependencies.mkdir()
     (dependencies / "approved.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _remove_group_world_write(tmp_path)
     monkeypatch.setattr(
         attestation,
         "APPROVED_SITE_PACKAGES",
@@ -1326,6 +1436,8 @@ def test_dependency_tree_drift_invalidates_pinned_manifest(
     dependencies.mkdir()
     dependency = dependencies / "approved.py"
     dependency.write_text("VALUE = 1\n", encoding="utf-8")
+    _remove_group_world_write(project)
+    _remove_group_world_write(dependencies)
     monkeypatch.setattr(
         attestation,
         "APPROVED_SITE_PACKAGES",
@@ -1343,6 +1455,21 @@ def test_dependency_tree_drift_invalidates_pinned_manifest(
     )
     manifest_path.chmod(0o644)
     assert len(attestation.verify_input_manifest(project)) == 64
+    dependency.chmod(0o664)
+    with pytest.raises(
+        contract.NightlyCoordinatorContractError,
+        match="coordinator_python_dependencies_unsafe",
+    ):
+        attestation.verify_input_manifest(project)
+    dependency.chmod(0o644)
+    tracked_module = project / "app/common/paths.py"
+    tracked_module.chmod(0o664)
+    with pytest.raises(
+        contract.NightlyCoordinatorContractError,
+        match="coordinator_input_metadata_invalid",
+    ):
+        attestation.verify_input_manifest(project)
+    tracked_module.chmod(0o644)
     dependency.write_text("VALUE = 2\n", encoding="utf-8")
     with pytest.raises(
         contract.NightlyCoordinatorContractError,
@@ -1426,6 +1553,92 @@ def test_durable_atomic_writer_refuses_symlink_race_and_partial_write(
     monkeypatch.setattr(durable_atomic.os, "fsync", fail_first_fsync)
     with pytest.raises(OSError, match="injected fsync failure"):
         durable_atomic.durable_atomic_replace(target, b"partial\n")
+    assert target.read_bytes() == b"stable\n"
+    assert not list(tmp_path.glob(".latest.json.*.tmp"))
+
+
+def test_durable_atomic_writer_rejects_ancestor_exchange_and_hardlinks(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "publication"
+    parent.mkdir()
+    target = parent / "latest.json"
+    target.write_bytes(b"old\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    detached = tmp_path / "detached"
+
+    def exchange_ancestor(event: str, _path: Path) -> None:
+        if event == "before_target_recheck":
+            parent.rename(detached)
+            parent.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(
+        durable_atomic.DurableAtomicWriteError,
+        match="parent changed",
+    ):
+        durable_atomic.durable_atomic_replace(
+            target,
+            b"new\n",
+            event_hook=exchange_ancestor,
+        )
+    assert not (outside / "latest.json").exists()
+    assert (detached / "latest.json").read_bytes() == b"old\n"
+
+    parent.unlink()
+    detached.rename(parent)
+    linked_target = parent / "linked.json"
+    linked_alias = parent / "linked-alias.json"
+    linked_target.write_bytes(b"linked\n")
+    os.link(linked_target, linked_alias)
+    with pytest.raises(
+        durable_atomic.DurableAtomicWriteError,
+        match="target is unsafe",
+    ):
+        durable_atomic.durable_atomic_replace(
+            linked_target,
+            b"replacement\n",
+        )
+    assert linked_alias.read_bytes() == b"linked\n"
+
+    source = parent / "source.csv"
+    source_alias = parent / "source-alias.csv"
+    destination = parent / "destination.csv"
+    source.write_bytes(b"source\n")
+    os.link(source, source_alias)
+    with pytest.raises(
+        durable_atomic.DurableAtomicWriteError,
+        match="target is unsafe",
+    ):
+        durable_atomic.durable_atomic_copy(source, destination)
+    assert not destination.exists()
+
+
+def test_durable_publication_attests_immediately_before_commit(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "latest.json"
+    target.write_bytes(b"stable\n")
+    gate_calls = 0
+
+    def changed_input() -> None:
+        nonlocal gate_calls
+        gate_calls += 1
+        raise contract.NightlyCoordinatorContractError(
+            "coordinator_attested_input_changed",
+            outcome="hard_failure",
+        )
+
+    with pytest.raises(
+        contract.NightlyCoordinatorContractError,
+        match="coordinator_attested_input_changed",
+    ):
+        durable_atomic.durable_atomic_replace(
+            target,
+            b"untrusted\n",
+            integrity_gate=changed_input,
+        )
+    assert gate_calls == 1
     assert target.read_bytes() == b"stable\n"
     assert not list(tmp_path.glob(".latest.json.*.tmp"))
 

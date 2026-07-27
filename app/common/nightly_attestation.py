@@ -100,7 +100,8 @@ def _safe_read(
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != os.geteuid()
-            or info.st_mode & 0o002
+            or info.st_mode & 0o022
+            or info.st_nlink != 1
             or (exact_mode is not None and stat.S_IMODE(info.st_mode) != exact_mode)
             or not 0 < info.st_size <= MAX_INPUT_BYTES
         ):
@@ -186,7 +187,7 @@ def _dependency_tree_contract(root: Path) -> dict[str, object]:
         stat.S_ISLNK(root_info.st_mode)
         or not stat.S_ISDIR(root_info.st_mode)
         or root_info.st_uid != os.geteuid()
-        or root_info.st_mode & 0o002
+        or root_info.st_mode & 0o022
     ):
         _fail("coordinator_python_dependencies_unsafe")
     digest = hashlib.sha256()
@@ -210,7 +211,7 @@ def _dependency_tree_contract(root: Path) -> dict[str, object]:
             if stat.S_ISDIR(info.st_mode):
                 if entry.name == "__pycache__":
                     continue
-                if info.st_uid != os.geteuid() or info.st_mode & 0o002:
+                if info.st_uid != os.geteuid() or info.st_mode & 0o022:
                     _fail("coordinator_python_dependencies_unsafe")
                 directory_count += 1
                 digest.update(
@@ -224,7 +225,8 @@ def _dependency_tree_contract(root: Path) -> dict[str, object]:
             if (
                 not stat.S_ISREG(info.st_mode)
                 or info.st_uid != os.geteuid()
-                or info.st_mode & 0o002
+                or info.st_mode & 0o022
+                or info.st_nlink != 1
             ):
                 _fail("coordinator_python_dependencies_unsafe")
             if relative.suffix in {".pyc", ".pyo"}:

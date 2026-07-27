@@ -12,6 +12,7 @@ import yaml
 from app.common.config import AppConfig
 from app.common.durable_atomic import durable_atomic_replace
 from app.common.logging_setup import get_logger
+from app.common.nightly_attestation import integrity_gate
 from app.common.nightly_coordinator import require_official_live_entry_lease
 
 
@@ -205,11 +206,16 @@ class WebUIServices:
             if content and not content.endswith("\n"):
                 content += "\n"
 
-        mode = p.stat().st_mode & 0o777 if p.exists() else 0o600
+        mode = (
+            (p.stat().st_mode & 0o777) & ~0o022
+            if p.exists()
+            else 0o600
+        )
         durable_atomic_replace(
             p,
             content.encode("utf-8"),
             mode=mode,
+            integrity_gate=integrity_gate(self.config.project_root),
         )
 
     def save_wordstat_upload(self, filename: str, payload: bytes) -> Path:
@@ -231,6 +237,7 @@ class WebUIServices:
             payload,
             mode=0o600,
             require_absent=True,
+            integrity_gate=integrity_gate(self.config.project_root),
         )
         return target
 

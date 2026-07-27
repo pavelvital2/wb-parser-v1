@@ -95,6 +95,15 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   use this as permission to stage secrets: keep `state/`, `data/warehouse/`,
   `data/logs/`, cookies, `runtime.env`, request headers, browser
   `storage_state`, and handoff scratch files out of git.
+- After coordinator cutover, every parser publication writer must use
+  `app/common/durable_atomic.py`: same-directory temp, no-follow and single-link
+  target/source policy, file and directory fsync, atomic rename, and attestation
+  inside the writer immediately before commit. This includes legacy latest
+  copies, seller exports, run reports, WB warehouse manifests, and warehouse
+  refresh state. Tracked/runtime/dependency inputs that influence coordinator
+  execution must be owner-controlled and neither group- nor world-writable.
+  The activation checker is executed directly with its absolute approved-Python
+  shebang; do not replace it with `/usr/bin/env python3`.
 - Before changing WB proxy/cookie/header runtime or processing a fresh browser
   Copy-as-CURL export, read `docs/WB_ACCESS_COOKIE_RUNBOOK.md`. It records the
   current direct-3proxy + Opera-derived headers contour, safe smoke checks, and

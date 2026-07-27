@@ -50,6 +50,7 @@ def _target_info(directory_fd: int, name: str) -> os.stat_result | None:
         not stat.S_ISREG(info.st_mode)
         or info.st_uid != os.geteuid()
         or info.st_mode & 0o002
+        or info.st_nlink != 1
     ):
         raise DurableAtomicWriteError("atomic target is unsafe")
     return info
@@ -70,6 +71,34 @@ def _identity(info: os.stat_result | None) -> tuple[int, ...] | None:
     )
 
 
+def _directory_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_uid,
+        info.st_gid,
+        stat.S_IMODE(info.st_mode),
+    )
+
+
+def _assert_directory_path(path: Path, expected: os.stat_result) -> None:
+    try:
+        verification_fd = _directory_fd(path)
+    except OSError as exc:
+        raise DurableAtomicWriteError(
+            "atomic parent changed during commit"
+        ) from exc
+    try:
+        if _directory_identity(os.fstat(verification_fd)) != (
+            _directory_identity(expected)
+        ):
+            raise DurableAtomicWriteError(
+                "atomic parent changed during commit"
+            )
+    finally:
+        os.close(verification_fd)
+
+
 def _read_target(
     directory_fd: int,
     name: str,
@@ -86,6 +115,7 @@ def _read_target(
             not stat.S_ISREG(before.st_mode)
             or before.st_uid != os.geteuid()
             or before.st_mode & 0o002
+            or before.st_nlink != 1
             or before.st_size > max_bytes
         ):
             raise DurableAtomicWriteError("atomic target verification failed")
@@ -129,6 +159,7 @@ def durable_atomic_replace(
     ):
         raise DurableAtomicWriteError("atomic target is invalid")
     directory_fd = _directory_fd(path.parent)
+    directory_info = os.fstat(directory_fd)
     temp_name = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     temp_created = False
     try:
@@ -142,6 +173,14 @@ def durable_atomic_replace(
         temp_created = True
         try:
             os.fchmod(temp_fd, mode)
+            temp_info = os.fstat(temp_fd)
+            if (
+                not stat.S_ISREG(temp_info.st_mode)
+                or temp_info.st_uid != os.geteuid()
+                or temp_info.st_nlink != 1
+                or temp_info.st_mode & 0o022
+            ):
+                raise DurableAtomicWriteError("atomic temp is unsafe")
             view = memoryview(payload)
             while view:
                 written = os.write(temp_fd, view)
@@ -160,6 +199,7 @@ def durable_atomic_replace(
             integrity_gate()
         if event_hook is not None:
             event_hook("before_target_recheck", path)
+        _assert_directory_path(path.parent, directory_info)
         current = _target_info(directory_fd, path.name)
         if (
             (require_absent and current is not None)
@@ -178,6 +218,7 @@ def durable_atomic_replace(
         if event_hook is not None:
             event_hook("replaced", path)
         os.fsync(directory_fd)
+        _assert_directory_path(path.parent, directory_info)
         if event_hook is not None:
             event_hook("directory_fsynced", path)
         verified, info = _read_target(
@@ -200,3 +241,46 @@ def durable_atomic_replace(
             except FileNotFoundError:
                 pass
         os.close(directory_fd)
+
+
+def durable_atomic_copy(
+    source_path: Path,
+    target_path: Path,
+    *,
+    mode: int = 0o644,
+    integrity_gate: IntegrityGate | None = None,
+    event_hook: WriteEventHook | None = None,
+    max_bytes: int = 512 * 1024 * 1024,
+) -> str:
+    if (
+        not source_path.is_absolute()
+        or source_path.name in {"", ".", ".."}
+        or max_bytes < 1
+    ):
+        raise DurableAtomicWriteError("atomic source is invalid")
+    source_dir_fd = _directory_fd(source_path.parent)
+    try:
+        source_info = _target_info(source_dir_fd, source_path.name)
+        if (
+            source_info is None
+            or source_info.st_size > max_bytes
+        ):
+            raise DurableAtomicWriteError("atomic source is unsafe")
+        payload, verified_info = _read_target(
+            source_dir_fd,
+            source_path.name,
+            max_bytes=max_bytes,
+        )
+        if _identity(source_info) != _identity(verified_info):
+            raise DurableAtomicWriteError(
+                "atomic source changed during verification"
+            )
+    finally:
+        os.close(source_dir_fd)
+    return durable_atomic_replace(
+        target_path,
+        payload,
+        mode=mode,
+        integrity_gate=integrity_gate,
+        event_hook=event_hook,
+    )

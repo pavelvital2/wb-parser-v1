@@ -138,6 +138,27 @@ effective `WB_COOKIE_FILE` must resolve to the canonical ignored
 cookies, headers and proxy URLs are never written to evidence. The checks
 perform no network calls.
 
+The activation checker has an absolute approved-Python shebang and is invoked
+directly by the coordinator. It therefore runs with
+`PATH=/usr/bin:/bin` without selecting a different system Python. All tracked
+influencing files, the resolved Python binary and every retained dependency
+file/directory must be parser-owned and neither group- nor world-writable.
+The exact checker command is:
+
+```text
+/home/pavel/projects/parser_wb/scripts/check_nightly_coordinator_contract.py
+```
+
+Latest outputs, run reports, warehouse manifests and warehouse refresh state
+use the shared durable atomic writer. It rejects symlink ancestors/leaves,
+world-writable paths and hardlinked leaves, fsyncs the same-directory temporary
+file and containing directory, reruns input attestation inside the writer
+immediately before the atomic rename, and verifies the committed bytes. A
+failed pre-commit check or partial temporary write cannot replace the prior
+publication. The stricter no-group-write rule applies to influencing inputs;
+existing runtime outputs created under the host `umask 0002` are safely
+replaced with writer-selected modes.
+
 After lock-v3 cutover, WebUI config/upload mutations require the same validated
 lease and WebUI collection actions use `scripts/run_wb_live_component.sh`.
 Without a valid descendant lease they fail closed. Read-only `doctor`, `runs`

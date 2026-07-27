@@ -74,7 +74,7 @@ write_state() {
 
   finished_at="$(date --iso-8601=seconds)"
   latest_path="$STATE_DIR/latest.json"
-  history_path="$HISTORY_DIR/warehouse_refresh_$(date -u +%Y%m%dT%H%M%SZ).json"
+  history_path="$HISTORY_DIR/warehouse_refresh_$(date -u +%Y%m%dT%H%M%S%NZ)_${BASHPID}.json"
 
   STATUS="$status" \
   REASON="$reason" \
@@ -96,7 +96,15 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
+
+project_root = Path(os.environ["PROJECT_DIR"]).resolve()
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from app.common.durable_atomic import durable_atomic_replace
+from app.common.nightly_attestation import integrity_gate
 
 
 def load_json(value: str) -> dict:
@@ -140,11 +148,22 @@ payload = {
 
 latest = Path(os.environ["LATEST_PATH"])
 history = Path(os.environ["HISTORY_PATH"])
-latest.parent.mkdir(parents=True, exist_ok=True)
-history.parent.mkdir(parents=True, exist_ok=True)
 text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-latest.write_text(text, encoding="utf-8")
-history.write_text(text, encoding="utf-8")
+encoded = text.encode("utf-8")
+gate = integrity_gate(project_root)
+durable_atomic_replace(
+    history.absolute(),
+    encoded,
+    mode=0o644,
+    require_absent=True,
+    integrity_gate=gate,
+)
+durable_atomic_replace(
+    latest.absolute(),
+    encoded,
+    mode=0o644,
+    integrity_gate=gate,
+)
 print(text, end="")
 PY
 }

@@ -470,8 +470,10 @@ class SerpEngine:
             latest_mart = self.config.paths.publish_latest_output(layer="marts", component=COMPONENT_SERP, source_path=mart_products_path, filename=self.mart_products_name)
             latest_pages = self.config.paths.publish_latest_output(layer="raw", component=COMPONENT_SERP, source_path=pages_index_path, filename=self.pages_index_name)
 
-            sellers_input_export.parent.mkdir(parents=True, exist_ok=True)
-            sellers_input_export.write_bytes(mart_products_path.read_bytes())
+            self.config.paths.publish_output_copy(
+                source_path=mart_products_path,
+                target_path=sellers_input_export,
+            )
 
             preview_export_path = self._write_products_preview_export(mart_products_path)
         else:
@@ -1496,6 +1498,12 @@ class SerpEngine:
 
     def _write_products_preview_export(self, mart_products_path: Path) -> Path:
         preview_path = self.config.paths.EXPORTS_DIR / "products_daily_preview.csv"
+        run_preview_path = self.config.paths.output_path(
+            layer="marts",
+            component=COMPONENT_SERP,
+            run_id=self.ctx.run_id,
+            filename="products_daily_preview.csv",
+        )
         preview_fields = [
             "query",
             "page",
@@ -1525,7 +1533,11 @@ class SerpEngine:
                 mapped[col] = "" if value is None else value
             preview_rows.append(mapped)
 
-        write_csv_rows(preview_path, preview_rows, preview_fields)
+        write_csv_rows(run_preview_path, preview_rows, preview_fields)
+        self.config.paths.publish_output_copy(
+            source_path=run_preview_path,
+            target_path=preview_path,
+        )
         return preview_path
     def _fields(self) -> tuple[list[str], list[str], list[str], list[str]]:
         product_fields = [

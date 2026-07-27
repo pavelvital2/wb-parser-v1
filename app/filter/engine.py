@@ -630,8 +630,10 @@ class FilterEngine:
         run_queries_path.write_text("\n".join(queries_lines) + ("\n" if queries_lines else ""), encoding="utf-8")
 
         export_queries = self.config.paths.EXPORTS_DIR / queries_name
-        export_queries.parent.mkdir(parents=True, exist_ok=True)
-        export_queries.write_text("\n".join(queries_lines) + ("\n" if queries_lines else ""), encoding="utf-8")
+        self.config.paths.publish_output_copy(
+            source_path=run_queries_path,
+            target_path=export_queries,
+        )
 
         latest_raw = self.config.paths.publish_latest_output(layer="raw", component=COMPONENT_FILTER, source_path=raw_path, filename=raw_name)
         latest_debug = self.config.paths.publish_latest_output(layer="staging", component=COMPONENT_FILTER, source_path=debug_path, filename=debug_name)
@@ -648,4 +650,3 @@ class FilterEngine:
             "latest_top_queries_path": str(latest_top),
             "latest_queries_txt_path": str(latest_queries),
         }
-

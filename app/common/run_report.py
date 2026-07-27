@@ -5,6 +5,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .durable_atomic import durable_atomic_replace
+from .nightly_attestation import integrity_gate
+
 
 def _to_dt(value: str) -> datetime | None:
     try:
@@ -41,21 +44,29 @@ def write_run_report(
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     report_path = reports_dir / f"{run_id}.json"
-    temp_path = reports_dir / f"{run_id}.tmp"
-
     safe_payload = _safe_jsonable(payload)
     safe_payload["duration_seconds"] = _duration_seconds(
         str(safe_payload.get("started_at_utc", "")),
         str(safe_payload.get("finished_at_utc", "")),
     )
 
-    temp_path.write_text(json.dumps(safe_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(report_path)
+    encoded = (
+        json.dumps(safe_payload, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+    gate = integrity_gate(state_dir.parent)
+    durable_atomic_replace(
+        report_path.absolute(),
+        encoded,
+        mode=0o644,
+        integrity_gate=gate,
+    )
 
     latest_path = reports_dir / "latest.json"
-    latest_temp_path = reports_dir / "latest.tmp"
-    latest_temp_path.write_text(report_path.read_text(encoding="utf-8"), encoding="utf-8")
-    latest_temp_path.replace(latest_path)
+    durable_atomic_replace(
+        latest_path.absolute(),
+        encoded,
+        mode=0o644,
+        integrity_gate=gate,
+    )
 
     return report_path
-

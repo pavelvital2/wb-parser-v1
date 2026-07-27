@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/Codex/agent-tools/parser_wb-python/bin/python
 from __future__ import annotations
 
 import hashlib
@@ -123,12 +123,12 @@ def _read_safe(path: Path, *, executable: bool = False, mode: int = 0o644) -> by
     try:
         info = os.fstat(fd)
         expected_mode = 0o755 if executable else mode
-        allowed_modes = {expected_mode, expected_mode | 0o020}
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != os.geteuid()
-            or stat.S_IMODE(info.st_mode) not in allowed_modes
-            or info.st_mode & 0o002
+            or stat.S_IMODE(info.st_mode) != expected_mode
+            or info.st_mode & 0o022
+            or info.st_nlink != 1
             or info.st_size <= 0
             or info.st_size > 32 * 1024 * 1024
         ):
@@ -220,6 +220,26 @@ def _validate_sources() -> list[dict[str, str]]:
     durable_source = _read_safe(
         PROJECT_ROOT / "app/common/durable_atomic.py",
     ).decode("utf-8")
+    paths_source = _read_safe(
+        PROJECT_ROOT / "app/common/paths.py",
+    ).decode("utf-8-sig")
+    run_report_source = _read_safe(
+        PROJECT_ROOT / "app/common/run_report.py",
+    ).decode("utf-8-sig")
+    filter_source = _read_safe(
+        PROJECT_ROOT / "app/filter/engine.py",
+    ).decode("utf-8-sig")
+    serp_source = _read_safe(
+        PROJECT_ROOT / "app/serp/engine.py",
+    ).decode("utf-8-sig")
+    legacy_warehouse_source = _read_safe(
+        PROJECT_ROOT / "scripts/wb_warehouse.py",
+        executable=True,
+    ).decode("utf-8")
+    warehouse_refresh_source = _read_safe(
+        PROJECT_ROOT / "scripts/run_wb_warehouse_refresh.sh",
+        executable=True,
+    ).decode("utf-8")
     coordinator_source = _read_safe(
         PROJECT_ROOT / "app/common/nightly_coordinator.py",
     ).decode("utf-8")
@@ -249,6 +269,13 @@ def _validate_sources() -> list[dict[str, str]]:
     ):
         raise CheckError("runtime attestation manifest contract mismatch")
     if (
+        not _read_safe(
+            PROJECT_ROOT / "scripts/check_nightly_coordinator_contract.py",
+            executable=True,
+        ).startswith(
+            b"#!/home/Codex/agent-tools/parser_wb-python/bin/python\n"
+        )
+        or
         'source "$runtime_env_file"' in runtime_shell_source
         or ". \"$runtime_env_file\"" in runtime_shell_source
         or "wb_runtime_env.py" not in runtime_shell_source
@@ -273,12 +300,27 @@ def _validate_sources() -> list[dict[str, str]]:
         or "integrity_gate=lease.integrity_gate" not in downstream_source
         or warehouse_source.count("integrity_gate()") < 2
         or "integrity_gate=input_integrity_gate" not in downstream_source
+        or "durable_atomic_copy(" not in paths_source
+        or "shutil.copy" in paths_source
+        or run_report_source.count("durable_atomic_replace(") != 2
+        or ".write_text(" in run_report_source
+        or "publish_output_copy(" not in filter_source
+        or serp_source.count("publish_output_copy(") < 2
+        or legacy_warehouse_source.count("durable_atomic_replace(") != 2
+        or "latest.write_text(" in legacy_warehouse_source
+        or warehouse_refresh_source.count("durable_atomic_replace(") != 2
+        or "latest.write_text(" in warehouse_refresh_source
+        or "history.write_text(" in warehouse_refresh_source
     ):
         raise CheckError("durable publication contract mismatch")
     if (
         "db.init_schema()" in webui_app_source
         or webui_services_source.count(
             "require_official_live_entry_lease()"
+        )
+        < 2
+        or webui_services_source.count(
+            "integrity_gate=integrity_gate(self.config.project_root)"
         )
         < 2
         or "run_wb_live_component.sh" not in webui_services_source
