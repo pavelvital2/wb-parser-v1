@@ -3,11 +3,16 @@ set -Eeuo pipefail
 
 PROJECT_DIR="/home/pavel/projects/parser_wb"
 PYTHON_BIN="/home/Codex/agent-tools/parser_wb-python/bin/python"
+COORDINATOR_LOCK_DIR="/run/lock/parser-nightly-coordinator"
 RUNTIME_ENV_FILE="$PROJECT_DIR/config/runtime.env"
 RUNTIME_LOADER="$PROJECT_DIR/scripts/wb_runtime_env.sh"
 WATCHDOG_SCRIPT="$PROJECT_DIR/scripts/wb_persistent_session_watchdog.py"
 LOCK_FILE="$PROJECT_DIR/state/locks/wb_persistent_watchdog.flock"
 LOG_FILE="$PROJECT_DIR/data/logs/wb_persistent_watchdog.log"
+
+if [[ -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ]]; then
+  exit 0
+fi
 
 mkdir -p "$PROJECT_DIR/data/logs" "$PROJECT_DIR/state/locks"
 exec >> "$LOG_FILE" 2>&1

@@ -2,7 +2,9 @@
 
 import argparse
 import json
+import os
 import sqlite3
+import sys
 from pathlib import Path
 
 from .cleanup import cleanup_runtime_files
@@ -23,6 +25,24 @@ from .state_db import StateDB
 
 
 _RUN_TARGETS = [COMPONENT_SUGGEST, COMPONENT_FILTER, COMPONENT_SERP, COMPONENT_SELLERS, PIPELINE_DAILY, PIPELINE_MONTHLY]
+_COORDINATOR_LOCK_DIRECTORY = Path("/run/lock/parser-nightly-coordinator")
+
+
+def _live_entry_refusal_exit() -> int | None:
+    if not os.path.lexists(_COORDINATOR_LOCK_DIRECTORY):
+        return None
+    from .nightly_coordinator import (
+        EXIT_BY_OUTCOME,
+        NightlyCoordinatorContractError,
+        require_official_live_entry_lease,
+    )
+
+    try:
+        require_official_live_entry_lease(environment=os.environ)
+    except NightlyCoordinatorContractError as exc:
+        print("WB live entry refused by host lock contract", file=sys.stderr)
+        return EXIT_BY_OUTCOME.get(exc.outcome, 2)
+    return None
 
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
@@ -354,6 +374,13 @@ def cmd_collection_plan(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.command == "collection-plan" or args.command == "run" or (
+        args.command in _RUN_TARGETS
+    ):
+        refusal_exit = _live_entry_refusal_exit()
+        if refusal_exit is not None:
+            return refusal_exit
 
     if args.command in {"doctor", "validate"}:
         return cmd_doctor(args.config)

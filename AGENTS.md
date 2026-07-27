@@ -427,6 +427,26 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   non-zero, then starts sellers only after a successful SERP. Current defaults:
   `PARSER_WB_SERP_MAX_ATTEMPTS=2` and
   `PARSER_WB_SERP_RETRY_SLEEP_SECONDS=3600`.
+- The future four-region nightly coordinator target is fixed to
+  `scripts/run_wb_four_region_nightly.sh` plus
+  `config/wb/collection_plans/shevron-four-regions-top1000-v2.json`; legacy
+  two-region plans are not fallbacks. The parser-owned adapter uses
+  `marketplace_parser_result_v3`, retains the inherited
+  `marketplace_collection_lock_v3` validation FD, checks unsafe-cleanup
+  quarantine while holding `guard -> validation`, and caps all work by the
+  coordinator absolute deadline. Official collection wrappers enter the same
+  lock/quarantine adapter once the secure coordinator lock directory is
+  installed at the reviewed cutover. Cookie renewal, nightly access preflight
+  and the manual access/warehouse refresh tools are also lock-v3 passthrough
+  entrants. The
+  persistent browser session fails closed and its watchdog is a no-op after
+  that path appears, because a long-lived browser must not retain or bypass the
+  shared collection lease. Direct live `main.py` and inner-launcher calls then
+  fail closed unless they retain a validated adapter FD; use the reviewed
+  wrappers. Local shell locks in wrapped entrants must use dynamic descriptors
+  so they cannot clobber the inherited validation FD. Keep the plan and all
+  four regions disabled until that separate cutover. Runbook:
+  `docs/WB_NIGHTLY_COORDINATOR_ADAPTER.md`.
 - On 2026-07-14, `state/locks/pipeline.lock` recovery was hardened after an
   empty lock with no owner blocked the nightly retry path until
   `runtime.lock_stale_seconds`. A working lock must not be removed: active is

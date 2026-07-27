@@ -2178,6 +2178,7 @@ def run_four_region_downstream(
     warehouse_ingest: Callable[..., dict[str, Any]] = ingest_regional_run,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     execution_mode: str = PRE_CUTOVER_DOWNSTREAM_MODE,
+    absolute_deadline_utc: datetime | None = None,
 ) -> dict[str, Any]:
     paths = ScopedPaths.build(
         project_root=config.project_root,
@@ -2216,6 +2217,7 @@ def run_four_region_downstream(
             runtime_window,
             resume=True,
             now=now,
+            absolute_deadline_utc=absolute_deadline_utc,
         )
         stage = "lock_acquisition"
         with acquire_collection_plan_locks(

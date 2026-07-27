@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+from typing import Any
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEPLOYED_PROJECT_ROOT = Path("/home/pavel/projects/parser_wb")
+ADAPTER = PROJECT_ROOT / "scripts/run_wb_four_region_nightly.sh"
+PLAN = (
+    PROJECT_ROOT
+    / "config/wb/collection_plans/shevron-four-regions-top1000-v2.json"
+)
+REGISTRY = PROJECT_ROOT / "config/wb/regions.json"
+QUERY_PACK = (
+    PROJECT_ROOT
+    / "config/wb/query_packs/shevron-core/2026-07-26.1.json"
+)
+TRACKED_CONFIG = PROJECT_ROOT / "config/config.yaml"
+ATTESTED_RUNTIME_SOURCES = (
+    PROJECT_ROOT / "main.py",
+    PROJECT_ROOT / "app/common/cli.py",
+    PROJECT_ROOT / "app/common/nightly_coordinator.py",
+    PROJECT_ROOT / "app/serp/collection_plan_runner.py",
+    PROJECT_ROOT / "app/serp/four_region_nightly.py",
+    PROJECT_ROOT / "scripts/wb_nightly_coordinator_adapter.py",
+)
+ATTESTED_RUNTIME_EXECUTABLES = (
+    PROJECT_ROOT / "scripts/run_wb_four_region_nightly.py",
+    PROJECT_ROOT / "scripts/wb_runtime_env.sh",
+)
+RESULT_SCHEMA = "marketplace_parser_result_v3"
+LOCK_CONTRACT = "marketplace_collection_lock_v3"
+QUARANTINE_CONTRACT = "marketplace_collection_quarantine_v1"
+CHECK_SCHEMA = "parser_coordinator_contract_check_v2"
+QUARANTINE_PATH = (
+    "/var/lib/parser-nightly-coordinator/unsafe-cleanup-quarantine.json"
+)
+FOUR_REGIONS = (
+    "moscow",
+    "rostov-on-don",
+    "novosibirsk",
+    "kazan",
+)
+OFFICIAL_ENTRYPOINTS = (
+    "run_products_sellers_daily.sh",
+    "run_wb_collection_plan.sh",
+    "run_wb_guarded_regional_pilot.sh",
+    "run_wb_live_component.sh",
+    "run_wb_cookie_renewal.sh",
+    "run_wb_nightly_preflight.sh",
+    "run_wb_access_tool.sh",
+    "run_wb_warehouse_refresh.sh",
+)
+COORDINATOR_DISABLED_ENTRYPOINTS = (
+    "run_wb_persistent_session.sh",
+    "run_wb_persistent_watchdog.sh",
+)
+
+
+class CheckError(RuntimeError):
+    pass
+
+
+def _sha256(encoded: bytes) -> str:
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _command_sha256(command: tuple[str, ...]) -> str:
+    return _sha256(
+        json.dumps(
+            list(command),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _read_safe(path: Path, *, executable: bool = False, mode: int = 0o644) -> bytes:
+    if not path.is_absolute():
+        raise CheckError("unsafe input path")
+    current = Path(path.anchor)
+    for part in path.parts[1:-1]:
+        current /= part
+        if stat.S_ISLNK(current.lstat().st_mode):
+            raise CheckError("symlink ancestor")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        expected_mode = 0o755 if executable else mode
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != expected_mode
+            or info.st_mode & 0o022
+            or info.st_size <= 0
+            or info.st_size > 32 * 1024 * 1024
+        ):
+            raise CheckError("unsafe input file")
+        encoded = b""
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                raise CheckError("input changed while reading")
+            encoded += chunk
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise CheckError("input grew while reading")
+    finally:
+        os.close(fd)
+    return encoded
+
+
+def _json_object(encoded: bytes, field: str) -> dict[str, Any]:
+    try:
+        value = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CheckError(f"{field} is invalid") from exc
+    if not isinstance(value, dict):
+        raise CheckError(f"{field} is invalid")
+    return value
+
+
+def _configured_command(stage: str) -> tuple[str, ...]:
+    base = (
+        str(DEPLOYED_PROJECT_ROOT / "scripts/run_wb_four_region_nightly.sh"),
+        "--plan-file",
+        "config/wb/collection_plans/shevron-four-regions-top1000-v2.json",
+        "--no-publish",
+    )
+    if stage == "wb_initial":
+        return base
+    if stage == "wb_resume":
+        return (*base, "--resume-run-id", "{resume_ref}")
+    raise CheckError("unsupported stage")
+
+
+def _validate_sources() -> list[dict[str, str]]:
+    adapter_source = _read_safe(ADAPTER, executable=True).decode("utf-8")
+    if (
+        "wb_nightly_coordinator_adapter.py" not in adapter_source
+        or "four-region" not in adapter_source
+        or "run_wb_collection_plan.sh" in adapter_source
+    ):
+        raise CheckError("adapter target is invalid")
+    plan_bytes = _read_safe(PLAN)
+    registry_bytes = _read_safe(REGISTRY)
+    pack_bytes = _read_safe(QUERY_PACK)
+    plan = _json_object(plan_bytes, "plan")
+    registry = _json_object(registry_bytes, "registry")
+    pack = _json_object(pack_bytes, "query pack")
+    cli_source = _read_safe(PROJECT_ROOT / "app/common/cli.py").decode("utf-8-sig")
+    inner_source = _read_safe(
+        PROJECT_ROOT / "scripts/run_wb_four_region_nightly.py",
+        executable=True,
+    ).decode("utf-8")
+    if (
+        "require_official_live_entry_lease(environment=os.environ)"
+        not in cli_source
+        or "require_official_live_entry_lease()" not in inner_source
+    ):
+        raise CheckError("direct live entry lock contract mismatch")
+    if (
+        plan.get("schema_version") != "wb_collection_plan_v2"
+        or plan.get("collection_plan_id")
+        != "shevron-four-regions-top1000-v2"
+        or plan.get("enabled") is not False
+        or plan.get("query_pack_file")
+        != "config/wb/query_packs/shevron-core/2026-07-26.1.json"
+        or plan.get("region_set") != list(FOUR_REGIONS)
+        or plan.get("depth") != 1000
+        or plan.get("publication_mode") != "none"
+        or plan.get("sellers_mode") != "disabled"
+        or plan.get("proxy_rotation_mode") != "disabled"
+    ):
+        raise CheckError("plan contract mismatch")
+    queries = pack.get("queries")
+    if (
+        pack.get("query_pack_id") != "shevron-core"
+        or pack.get("version") != "2026-07-26.1"
+        or pack.get("enabled") is not True
+        or not isinstance(queries, list)
+        or len(queries) != 30
+        or any(
+            not isinstance(item, dict)
+            or item.get("enabled") is not True
+            or not isinstance(item.get("query_id"), str)
+            or not isinstance(item.get("text"), str)
+            for item in queries
+        )
+        or len({item["query_id"] for item in queries}) != 30
+    ):
+        raise CheckError("query pack contract mismatch")
+    region_entries = {
+        item.get("region_id"): item
+        for item in registry.get("regions", [])
+        if isinstance(item, dict)
+    }
+    if set(FOUR_REGIONS) - set(region_entries) or any(
+        region_entries[region_id].get("enabled") is not False
+        or region_entries[region_id].get("resolver") != "wb_geo_xinfo"
+        for region_id in FOUR_REGIONS
+    ):
+        raise CheckError("region registry contract mismatch")
+    official_sources: list[tuple[Path, bytes]] = []
+    for name in OFFICIAL_ENTRYPOINTS:
+        path = PROJECT_ROOT / "scripts" / name
+        source_bytes = _read_safe(
+            path,
+            executable=True,
+            mode=0o755,
+        )
+        source = source_bytes.decode("utf-8")
+        bootstrap = (
+            'if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" \\\n'
+            '  && ( -e "$COORDINATOR_LOCK_DIR" '
+            '|| -L "$COORDINATOR_LOCK_DIR" ) ]]; then'
+        )
+        bootstrap_index = source.find(bootstrap)
+        exec_index = source.find(
+            'exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"'
+        )
+        if (
+            bootstrap_index < 0
+            or exec_index <= bootstrap_index
+            or source.find(
+                'COORDINATOR_LOCK_DIR="/run/lock/parser-nightly-coordinator"'
+            )
+            < 0
+        ):
+            raise CheckError("official entrypoint contract mismatch")
+        for unsafe_before_lock in (
+            'source "$RUNTIME_LOADER"',
+            "wb_load_required_runtime_env",
+        ):
+            index = source.find(unsafe_before_lock)
+            if 0 <= index < exec_index:
+                raise CheckError("official entrypoint lock order mismatch")
+        official_sources.append((path, source_bytes))
+    disabled_sources: list[tuple[Path, bytes]] = []
+    for name in COORDINATOR_DISABLED_ENTRYPOINTS:
+        path = PROJECT_ROOT / "scripts" / name
+        source_bytes = _read_safe(path, executable=True, mode=0o755)
+        source = source_bytes.decode("utf-8")
+        refusal = (
+            'if [[ -e "$COORDINATOR_LOCK_DIR" '
+            '|| -L "$COORDINATOR_LOCK_DIR" ]]; then'
+        )
+        refusal_index = source.find(refusal)
+        if (
+            refusal_index < 0
+            or source.find(
+                'COORDINATOR_LOCK_DIR="/run/lock/parser-nightly-coordinator"'
+            )
+            < 0
+        ):
+            raise CheckError("disabled entrypoint contract mismatch")
+        for unsafe_before_refusal in (
+            "mkdir -p",
+            'source "$RUNTIME_LOADER"',
+            "wb_load_required_runtime_env",
+        ):
+            index = source.find(unsafe_before_refusal)
+            if 0 <= index < refusal_index:
+                raise CheckError("disabled entrypoint lock order mismatch")
+        disabled_sources.append((path, source_bytes))
+
+    tracked_inputs = [
+        (PLAN, plan_bytes),
+        (REGISTRY, registry_bytes),
+        (QUERY_PACK, pack_bytes),
+        (TRACKED_CONFIG, _read_safe(TRACKED_CONFIG)),
+    ]
+    tracked_inputs.extend(
+        (path, _read_safe(path)) for path in ATTESTED_RUNTIME_SOURCES
+    )
+    tracked_inputs.extend(
+        (path, _read_safe(path, executable=True))
+        for path in ATTESTED_RUNTIME_EXECUTABLES
+    )
+    tracked_inputs.extend(official_sources)
+    tracked_inputs.extend(disabled_sources)
+    return [
+        {"path": str(PLAN), "sha256": _sha256(plan_bytes)},
+        *[
+            {"path": str(path), "sha256": _sha256(encoded)}
+            for path, encoded in tracked_inputs
+            if path != PLAN
+        ],
+    ]
+
+
+def main() -> int:
+    try:
+        if os.getenv("MARKETPLACE_COORDINATOR_CONTRACT_CHECK") != "1":
+            raise CheckError("contract check mode is required")
+        stage = os.environ["MARKETPLACE_COORDINATOR_CHECK_STAGE"]
+        phase = os.environ["MARKETPLACE_COORDINATOR_CHECK_PHASE"]
+        expected_phase = {
+            "wb_initial": "initial",
+            "wb_resume": "resume",
+        }.get(stage)
+        if phase != expected_phase:
+            raise CheckError("stage phase mismatch")
+        if (
+            os.getenv("MARKETPLACE_COORDINATOR_EXPECTED_RESULT_SCHEMA")
+            != RESULT_SCHEMA
+            or os.getenv("MARKETPLACE_COORDINATOR_EXPECTED_LOCK_CONTRACT")
+            != LOCK_CONTRACT
+            or os.getenv(
+                "MARKETPLACE_COORDINATOR_EXPECTED_QUARANTINE_CONTRACT"
+            )
+            != QUARANTINE_CONTRACT
+            or os.getenv("MARKETPLACE_COORDINATOR_QUARANTINE_MARKER_PATH")
+            != QUARANTINE_PATH
+        ):
+            raise CheckError("expected contract mismatch")
+        command_sha256 = _command_sha256(_configured_command(stage))
+        if (
+            os.getenv("MARKETPLACE_COORDINATOR_CHECK_COMMAND_SHA256")
+            != command_sha256
+        ):
+            raise CheckError("configured command hash mismatch")
+        adapter_bytes = _read_safe(ADAPTER, executable=True)
+        inputs = _validate_sources()
+        payload = {
+            "schema_version": CHECK_SCHEMA,
+            "ok": True,
+            "parser": "wb",
+            "stage": stage,
+            "phase": phase,
+            "result_schema_version": RESULT_SCHEMA,
+            "lock_contract_version": LOCK_CONTRACT,
+            "quarantine_contract_version": QUARANTINE_CONTRACT,
+            "quarantine_marker_path": QUARANTINE_PATH,
+            "official_entrypoints_quarantine_checked": True,
+            "network_used": False,
+            "adapter_executable": str(ADAPTER),
+            "adapter_sha256": _sha256(adapter_bytes),
+            "adapter_command_sha256": command_sha256,
+            "inputs_verified": True,
+            "input_files": inputs,
+        }
+    except (CheckError, KeyError, OSError):
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "reason_code": "wb_coordinator_contract_check_failed",
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

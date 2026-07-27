@@ -420,6 +420,7 @@ class DeadlineGuard:
         *,
         resume: bool,
         now: Callable[[], datetime] = _default_now,
+        absolute_deadline_utc: datetime | None = None,
     ) -> "DeadlineGuard":
         current = now()
         if current.tzinfo is None:
@@ -453,6 +454,19 @@ class DeadlineGuard:
             + timedelta(seconds=window.max_invocation_runtime_seconds),
             cutoff,
         )
+        if absolute_deadline_utc is not None:
+            if (
+                absolute_deadline_utc.tzinfo is None
+                or absolute_deadline_utc.utcoffset()
+                != timezone.utc.utcoffset(absolute_deadline_utc)
+            ):
+                raise CollectionPlanRunError(
+                    "coordinator absolute deadline must be UTC"
+                )
+            invocation_deadline = min(
+                invocation_deadline,
+                absolute_deadline_utc.astimezone(MOSCOW_TZ),
+            )
         guard = cls(
             deadline_utc=invocation_deadline.astimezone(timezone.utc),
             now=now,
@@ -1542,6 +1556,7 @@ class CollectionPlanRunner:
         write_event_hook: WriteEventHook | None = None,
         egress_hash_salt: bytes | None = None,
         sleeper: Callable[[float], None] = time_module.sleep,
+        absolute_deadline_utc: datetime | None = None,
     ) -> None:
         self.config = config
         self.plan_path = plan_path
@@ -1563,6 +1578,7 @@ class CollectionPlanRunner:
         self.write_event_hook = write_event_hook
         self.egress_hash_salt = egress_hash_salt or secrets.token_bytes(32)
         self.sleeper = sleeper
+        self.absolute_deadline_utc = absolute_deadline_utc
 
     def _configure_runtime_deadline(self, bundle: CollectionPlanBundle) -> None:
         window = bundle.collection_plan.runtime_window
@@ -1571,6 +1587,7 @@ class CollectionPlanRunner:
                 window,
                 resume=self.resume,
                 now=self.now,
+                absolute_deadline_utc=self.absolute_deadline_utc,
             )
         setter = getattr(self.transport, "set_network_timeout_provider", None)
         if callable(setter):
@@ -4515,6 +4532,7 @@ def run_collection_plan(
     write_event_hook: WriteEventHook | None = None,
     egress_hash_salt: bytes | None = None,
     sleeper: Callable[[float], None] = time_module.sleep,
+    absolute_deadline_utc: datetime | None = None,
 ) -> dict[str, Any]:
     owned_transport = False
     active_transport = transport
@@ -4543,6 +4561,7 @@ def run_collection_plan(
             write_event_hook=write_event_hook,
             egress_hash_salt=egress_hash_salt,
             sleeper=sleeper,
+            absolute_deadline_utc=absolute_deadline_utc,
         ).run()
     finally:
         if owned_transport:

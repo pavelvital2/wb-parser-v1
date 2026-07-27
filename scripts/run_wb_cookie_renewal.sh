@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 PROJECT_DIR="/home/pavel/projects/parser_wb"
 PYTHON_BIN="/home/Codex/agent-tools/parser_wb-python/bin/python"
+COORDINATOR_ADAPTER="$PROJECT_DIR/scripts/wb_nightly_coordinator_adapter.py"
+COORDINATOR_LOCK_DIR="/run/lock/parser-nightly-coordinator"
 CONFIG_FILE="$PROJECT_DIR/config/config.yaml"
 COOKIE_FILE="$PROJECT_DIR/config/wb_cookie.txt"
 RUNTIME_ENV_FILE="$PROJECT_DIR/config/runtime.env"
@@ -12,20 +14,25 @@ LOCK_FILE="$PROJECT_DIR/state/locks/wb_cookie_renewal.flock"
 PRODUCTS_SELLERS_LOCK_FILE="$PROJECT_DIR/state/locks/products_sellers_daily.flock"
 LOG_FILE="$PROJECT_DIR/data/logs/wb_cookie_renewal.log"
 
+if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" \
+  && ( -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ) ]]; then
+  exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"
+fi
+
 mkdir -p "$PROJECT_DIR/data/logs" "$PROJECT_DIR/state/locks"
 
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
+exec {renewal_lock_fd}>"$LOCK_FILE"
+if ! flock -n "$renewal_lock_fd"; then
   echo "$(date --iso-8601=seconds) wb cookie renewal skipped: previous renewal is still active"
   exit 75
 fi
 
-exec 8>"$PRODUCTS_SELLERS_LOCK_FILE"
-if ! flock -n 8; then
+exec {collection_probe_fd}>"$PRODUCTS_SELLERS_LOCK_FILE"
+if ! flock -n "$collection_probe_fd"; then
   echo "$(date --iso-8601=seconds) wb cookie renewal skipped: products+sellers run is active"
   exit 0
 fi
-flock -u 8
+flock -u "$collection_probe_fd"
 
 cd "$PROJECT_DIR"
 
