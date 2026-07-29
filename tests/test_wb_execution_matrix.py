@@ -37,8 +37,8 @@ def test_production_matrix_pins_only_reviewed_shevron_pack() -> None:
         matrix_path=MATRIX_PATH,
     )
     assert matrix.execution_matrix_id == "four-region-nightly-v1"
-    assert matrix.enabled is False
-    assert matrix.enabled_entries == ()
+    assert matrix.enabled is True
+    assert matrix.enabled_entries == matrix.entries
     assert [
         (
             entry.execution_id,
@@ -56,6 +56,11 @@ def test_production_matrix_pins_only_reviewed_shevron_pack() -> None:
         )
     ]
     bundle = matrix.entries[0].bundle
+    assert bundle.collection_plan.enabled is True
+    assert all(region.enabled for region in bundle.enabled_regions)
+    assert bundle.collection_plan.publication_mode == "none"
+    assert bundle.collection_plan.sellers_mode == "disabled"
+    assert bundle.collection_plan.proxy_rotation_mode == "disabled"
     assert len(bundle.collection_plan.query_ids) == 30
     assert bundle.collection_plan.depth == 1000
     assert bundle.collection_plan.region_set == (
@@ -332,14 +337,21 @@ def test_matrix_runner_refuses_disabled_matrix_without_state(
     tmp_path: Path,
 ) -> None:
     root = _matrix_root(tmp_path)
+    matrix_path = (
+        root
+        / "config/wb/execution_matrices/"
+        "four-region-nightly-v1.json"
+    )
+    payload = json.loads(matrix_path.read_text(encoding="utf-8"))
+    payload["enabled"] = False
+    matrix_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     with pytest.raises(ExecutionMatrixRunError, match="disabled"):
         run_execution_matrix(
             config=SimpleNamespace(project_root=root),
-            matrix_path=(
-                root
-                / "config/wb/execution_matrices/"
-                "four-region-nightly-v1.json"
-            ),
+            matrix_path=matrix_path,
             matrix_run_id="20260728_211500Z",
             resume=False,
             execute_entry=lambda *_args: pytest.fail("must not execute"),

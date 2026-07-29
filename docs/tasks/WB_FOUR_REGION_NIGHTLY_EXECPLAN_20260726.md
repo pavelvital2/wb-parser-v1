@@ -49,9 +49,8 @@ separate activation flag and entries that bind an exact
 `query_pack_id + version` to an exact collection plan. Adding an approved
 pack/plan pair is a configuration operation: the strict loader accepts
 multiple enabled entries, rejects duplicate pack versions/plans/IDs and
-validates every referenced plan and pack. For the first cutover the matrix
-itself remains disabled and contains only the enabled
-`shevron-core@2026-07-26.1` entry; activation is a separate joint gate.
+validates every referenced plan and pack. Owner-approved activation enables the
+matrix with only the `shevron-core@2026-07-26.1` entry.
 
 The matrix is an executable orchestration contract, not only a validator.
 `scripts/run_wb_four_region_nightly.sh --matrix-file ... --no-publish`
@@ -65,7 +64,8 @@ sellers and regional warehouse stages succeed.
 ### Collection
 
 - New plan: `shevron-four-regions-top1000-v2`.
-- Plan and all four region entries remain disabled until an audited live gate.
+- The v2 plan and exact four region entries are enabled by the reviewed
+  activation-only change; diagnostic and two-region plans remain disabled.
 - Resolver output is recorded as resolved-and-sent evidence, not proof that
   WB applied a destination server-side.
 - Normal page/query pacing and request timeout come only from:
@@ -325,11 +325,20 @@ complete regional downstream generation.
 7. Add Telegram delivery from the approved preview contract.
 8. Replace the legacy cron only in a separate reviewed scheduling change.
 
+## Activation Evidence
+
+The successful guarded scoped pilot `20260726_142920Z` proves only the
+Moscow/Rostov request contour for three queries at depth 100: status success,
+6 pages and 600 products with constant egress evidence. It is not live proof
+for Novosibirsk or Kazan, and it is not proof that a full 1200-page run will
+complete in one invocation.
+
 ## Rollback
 
 - Keep the current cron and wrapper byte-identical until the final scheduling
   stage.
-- Keep all new plans/regions disabled by default.
+- Disable the exact matrix, v2 plan and four region flags together to close the
+  production contour; do not alter historical scoped or warehouse data.
 - A failed collection resumes by the same `run_id`; it never falls back to
   global publication.
 - A failed seller or warehouse stage leaves the previous regional downstream

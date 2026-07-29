@@ -2128,6 +2128,11 @@ def test_dedicated_launcher_handles_lock_contention_without_traceback(
         ],
     )
     monkeypatch.setattr(dedicated_launcher, "load_config", lambda _path: config)
+    monkeypatch.setattr(
+        dedicated_launcher,
+        "require_official_live_entry_lease",
+        lambda **_kwargs: None,
+    )
 
     def locked(**kwargs):
         raise RunLockedError("collection plan lock is busy")
@@ -2195,6 +2200,11 @@ def test_dedicated_launcher_forwards_explicit_resume_run_id(
         ],
     )
     monkeypatch.setattr(dedicated_launcher, "load_config", lambda _path: config)
+    monkeypatch.setattr(
+        dedicated_launcher,
+        "require_official_live_entry_lease",
+        lambda **_kwargs: None,
+    )
 
     def fake_run(**kwargs: Any) -> dict[str, Any]:
         captured.update(kwargs)

@@ -4,7 +4,7 @@
     {
       "region_id": "moscow",
       "region_name": "Москва",
-      "enabled": false,
+      "enabled": true,
       "resolver": "wb_geo_xinfo",
       "latitude": "55.6255780",
       "longitude": "37.6063916",
@@ -17,7 +17,7 @@
     {
       "region_id": "rostov-on-don",
       "region_name": "Ростов-на-Дону",
-      "enabled": false,
+      "enabled": true,
       "resolver": "wb_geo_xinfo",
       "latitude": "47.2222596",
       "longitude": "39.7198736",
@@ -30,7 +30,7 @@
     {
       "region_id": "novosibirsk",
       "region_name": "Новосибирск",
-      "enabled": false,
+      "enabled": true,
       "resolver": "wb_geo_xinfo",
       "latitude": "55.0289670",
       "longitude": "82.9216730",
@@ -43,7 +43,7 @@
     {
       "region_id": "kazan",
       "region_name": "Казань",
-      "enabled": false,
+      "enabled": true,
       "resolver": "wb_geo_xinfo",
       "latitude": "55.7961270",
       "longitude": "49.1064050",

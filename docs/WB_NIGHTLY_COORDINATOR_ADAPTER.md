@@ -9,10 +9,11 @@ scripts/run_wb_four_region_nightly.sh
 config/wb/execution_matrices/four-region-nightly-v1.json
 ```
 
-The Moscow/Rostov two-region plans are not coordinator fallbacks. The v2 plan
-and all four regions remain disabled until a separate reviewed cutover. The
-matrix is independently disabled and currently contains only the approved
-`shevron-core@2026-07-26.1` entry.
+The Moscow/Rostov two-region plans are not coordinator fallbacks. Owner-approved
+activation enables only the v2 plan, its four regions and the matrix containing
+the approved `shevron-core@2026-07-26.1` entry. The coordinator command remains
+the exact matrix command with `--no-publish`; diagnostic and legacy two-region
+plans remain disabled.
 
 The coordinator contract versions are:
 
@@ -239,6 +240,22 @@ Without a valid descendant lease they fail closed. Read-only `doctor`, `runs`
 and WebUI run listing open SQLite in read-only/query-only mode and must not
 create directories or migrate schema implicitly.
 
+## Activation State
+
+The tracked activation contract is:
+
+- matrix `four-region-nightly-v1`: enabled;
+- plan `shevron-four-regions-top1000-v2`: enabled;
+- regions, in order: `moscow`, `rostov-on-don`, `novosibirsk`, `kazan`;
+- query pack: `shevron-core@2026-07-26.1`, 30 queries;
+- maximum depth: 1000;
+- per-entry publication: `none`;
+- sellers and proxy rotation inside the collection plan: disabled.
+
+The successful scoped pilot `20260726_142920Z` is evidence only for Moscow and
+Rostov-on-Don: 6 pages, 600 products and verified constant egress. There is no
+live collection proof for Novosibirsk or Kazan in this activation commit.
+
 ## Cutover Gates
 
 Before coordinator activation:
@@ -246,12 +263,12 @@ Before coordinator activation:
 1. install the secure lock layout from the coordinator repository;
 2. set executable wrappers/checker to `0755` and attested data/Python files to
    non-group-writable parser-owned modes (the plan target is `0644`);
-3. verify the v2 plan and all four regions are still disabled;
+3. verify only the reviewed matrix, v2 plan and exact four regions are enabled;
 4. run both initial and resume contract checks from the deployed parser path;
 5. run the parser and coordinator full suites in the approved maintenance
    window;
 6. perform the separate owner-reviewed cron/systemd cutover.
 
-This implementation does not change cron, enable flags, runtime secrets,
-cookies, request headers, proxy settings, global latest, sellers or warehouse
-data.
+This activation changes only the reviewed tracked enable flags and their
+attestation. It does not change cron, runtime secrets, cookies, request headers,
+proxy settings, global latest, sellers or warehouse data.

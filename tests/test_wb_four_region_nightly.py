@@ -699,14 +699,14 @@ def test_variable_length_segments_complete_and_resume_repeats_only_failed_query(
     assert result["totals"]["products_ok"] == 287
 
 
-def test_tracked_four_region_plan_is_exact_and_disabled() -> None:
+def test_tracked_four_region_plan_is_exact_and_enabled() -> None:
     bundle = load_collection_plan_bundle(
         project_root=PROJECT_ROOT,
         plan_path=PROJECT_ROOT / PLAN_RELATIVE,
         region_registry_path=PROJECT_ROOT / REGISTRY_RELATIVE,
     )
     validate_four_region_bundle(bundle)
-    assert bundle.collection_plan.enabled is False
+    assert bundle.collection_plan.enabled is True
     assert bundle.collection_plan.region_set == FOUR_REGION_IDS
     assert len(bundle.collection_plan.query_ids) == 30
     assert bundle.collection_plan.query_ids == tuple(
@@ -719,7 +719,10 @@ def test_tracked_four_region_plan_is_exact_and_disabled() -> None:
         == REVIEWED_FOUR_REGION_RUNTIME_WINDOW
     )
     registry = {region.region_id: region for region in bundle.region_registry.regions}
-    assert all(registry[region_id].enabled is False for region_id in FOUR_REGION_IDS)
+    assert all(registry[region_id].enabled is True for region_id in FOUR_REGION_IDS)
+    assert bundle.collection_plan.publication_mode == "none"
+    assert bundle.collection_plan.sellers_mode == "disabled"
+    assert bundle.collection_plan.proxy_rotation_mode == "disabled"
 
 
 def test_bounded_1200_page_plan_starts_just_after_window(

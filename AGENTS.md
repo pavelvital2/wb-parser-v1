@@ -170,8 +170,10 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   `config/wb/execution_matrices/four-region-nightly-v1.json`. Its activation
   flag is independent from plan/region flags. Matrix entries bind an exact
   query-pack ID/version to an exact plan; duplicate pack versions, plans or
-  execution IDs fail closed. Keep the matrix disabled until the joint
-  coordinator cutover gate.
+  execution IDs fail closed. The owner-approved activation enables this matrix,
+  `shevron-four-regions-top1000-v2`, and exactly `moscow`, `rostov-on-don`,
+  `novosibirsk`, `kazan`; the only matrix entry is
+  `shevron-core@2026-07-26.1`.
 - The official four-region coordinator command uses that execution matrix,
   not a hard-coded plan argument. Its durable state is under
   `state/wb_execution_matrices/`; resume must skip completed entries and the
@@ -376,8 +378,9 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   The launcher loads the required runtime before Python starts. Query pack,
   region set and depth come only from the reviewed collection plan; outputs
   remain under `serp_scoped` and never publish global latest, sellers input,
-  run-report latest or Warehouse. Tracked regional plans and regions remain
-  disabled until a separate owner-approved enable change.
+  run-report latest or Warehouse. Diagnostic/manual plans remain disabled;
+  only the reviewed four-region v2 plan and its four registry entries are
+  enabled for the coordinator contour.
 - The manual production-size regional plan
   `config/wb/collection_plans/shevron-moscow-rostov-top1000-v1.json` remains
   disabled by default and covers all 30 `shevron-core` queries for Moscow and
@@ -477,7 +480,7 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   fail closed unless they retain a validated adapter FD; use the reviewed
   wrappers. Local shell locks in wrapped entrants must use dynamic descriptors
   so they cannot clobber the inherited validation FD. Keep the plan and all
-  four regions disabled until that separate cutover. Runbook:
+  four regions exact-match the owner-approved activation flags. Runbook:
   `docs/WB_NIGHTLY_COORDINATOR_ADAPTER.md`.
 - Coordinator lock-v3 authorization is descriptor-based, not flag-based.
   `PARSER_WB_LOCK_V3_WRAPPED` only routes an already supervised descendant:
