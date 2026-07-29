@@ -30,7 +30,13 @@ def install_scripts(project: Path) -> None:
     for name in ("wb_warehouse.py", "run_wb_warehouse_refresh.sh"):
         source = root / "scripts" / name
         target = scripts_dir / name
-        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        text = source.read_text(encoding="utf-8")
+        isolated_lock = project / "coordinator-lock-not-present"
+        text = text.replace(
+            "/run/lock/parser-nightly-coordinator",
+            str(isolated_lock),
+        )
+        target.write_text(text, encoding="utf-8")
         target.chmod(0o755)
 
 
@@ -178,3 +184,74 @@ def test_wb_warehouse_refresh_wrapper_skips_failed_latest_report(tmp_path: Path)
     assert state["reason"] == "latest_report_not_success"
     assert state["run_report"]["run_id"] == "failed_run"
     assert not (project / "data/warehouse/wb/wb.duckdb").exists()
+
+
+def test_wb_warehouse_wrapper_routes_official_legacy_migration_mode(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path
+    install_scripts(project)
+    write(
+        project / "scripts/wb_warehouse.py",
+        "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+    )
+    env = {
+        **os.environ,
+        "PARSER_WB_PROJECT_DIR": str(project),
+        "PARSER_WB_PYTHON_BIN": sys.executable,
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(project / "scripts/run_wb_warehouse_refresh.sh"),
+            "--migrate-legacy-yaroslavl",
+            "--dry-run",
+        ],
+        cwd=project,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        "--project-root",
+        str(project),
+        "migrate-legacy-yaroslavl",
+        "--dry-run",
+    ]
+    assert not (project / "state/wb_warehouse/latest.json").exists()
+
+
+def test_wb_warehouse_wrapper_rejects_ambiguous_legacy_migration_mode(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path
+    install_scripts(project)
+    env = {
+        **os.environ,
+        "PARSER_WB_PROJECT_DIR": str(project),
+        "PARSER_WB_PYTHON_BIN": sys.executable,
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(project / "scripts/run_wb_warehouse_refresh.sh"),
+            "--migrate-legacy-yaroslavl",
+            "--dry-run",
+            "--apply",
+        ],
+        cwd=project,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+
+    assert result.returncode == 2
+    assert "requires exactly one" in result.stderr

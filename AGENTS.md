@@ -542,6 +542,14 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   row with a non-empty `supplier_id`; all-missing products retain their first
   row and increment `missing_supplier_products`. The position bridge remains
   unchanged.
+  The only supported standalone legacy migration path is
+  `scripts/run_wb_warehouse_refresh.sh --migrate-legacy-yaroslavl` with exactly
+  one of `--dry-run`, `--apply` or `--check`. It acquires daily, pipeline,
+  warehouse-refresh and collection-plan locks in that order, reads the global
+  warehouse only through read-only DuckDB attachment, validates a bounded
+  staging database and atomically publishes only
+  `data/warehouse/wb_regional/wb_regional.duckdb`. Do not run ad-hoc SQL
+  against the production regional database.
   Before final cutover, four-region downstream uses the explicit
   `pre_cutover_legacy_nightly_protected_v1` mode. It must reject protected or
   insufficient-clearance starts before acquiring any shared lock; changing

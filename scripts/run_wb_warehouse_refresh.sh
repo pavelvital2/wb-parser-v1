@@ -15,6 +15,9 @@ STATE_DIR="$PROJECT_DIR/state/wb_warehouse"
 HISTORY_DIR="$STATE_DIR/history"
 DRY_RUN=0
 CHECK_ONLY=0
+MIGRATE_LEGACY=0
+MIGRATION_APPLY=0
+MIGRATION_CHECK=0
 STARTED_AT="$(date --iso-8601=seconds)"
 
 if [[ -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ]]; then
@@ -29,9 +32,15 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run_wb_warehouse_refresh.sh [--dry-run] [--check-only]
+Usage:
+  scripts/run_wb_warehouse_refresh.sh [--dry-run] [--check-only]
+  scripts/run_wb_warehouse_refresh.sh --migrate-legacy-yaroslavl --dry-run
+  scripts/run_wb_warehouse_refresh.sh --migrate-legacy-yaroslavl --apply
+  scripts/run_wb_warehouse_refresh.sh --migrate-legacy-yaroslavl --check
 
 Safely refreshes the WB warehouse after a successful products+sellers run.
+The migration mode reads the global warehouse and publishes only the separate
+regional warehouse after lock, integrity and staging checks.
 EOF
 }
 
@@ -42,6 +51,15 @@ while (($#)); do
       ;;
     --check-only)
       CHECK_ONLY=1
+      ;;
+    --migrate-legacy-yaroslavl)
+      MIGRATE_LEGACY=1
+      ;;
+    --apply)
+      MIGRATION_APPLY=1
+      ;;
+    --check)
+      MIGRATION_CHECK=1
       ;;
     -h|--help)
       usage
@@ -55,6 +73,36 @@ while (($#)); do
   esac
   shift
 done
+
+if [[ "$MIGRATE_LEGACY" == "1" ]]; then
+  if [[ "$CHECK_ONLY" == "1" ]] \
+    || ((DRY_RUN + MIGRATION_APPLY + MIGRATION_CHECK != 1)); then
+    echo "migration mode requires exactly one of --dry-run, --apply or --check" >&2
+    usage >&2
+    exit 2
+  fi
+  if [[ ! -x "$PYTHON_BIN" || ! -r "$WAREHOUSE_SCRIPT" ]]; then
+    echo "WB regional warehouse migration prerequisites are unavailable" >&2
+    exit 2
+  fi
+  cd "$PROJECT_DIR"
+  if [[ "$MIGRATION_CHECK" == "1" ]]; then
+    exec "$PYTHON_BIN" "$WAREHOUSE_SCRIPT" \
+      --project-root "$PROJECT_DIR" check-legacy-yaroslavl
+  fi
+  migration_mode="--dry-run"
+  if [[ "$MIGRATION_APPLY" == "1" ]]; then
+    migration_mode="--apply"
+  fi
+  exec "$PYTHON_BIN" "$WAREHOUSE_SCRIPT" \
+    --project-root "$PROJECT_DIR" migrate-legacy-yaroslavl "$migration_mode"
+fi
+
+if [[ "$MIGRATION_APPLY" == "1" || "$MIGRATION_CHECK" == "1" ]]; then
+  echo "--apply and --check require --migrate-legacy-yaroslavl" >&2
+  usage >&2
+  exit 2
+fi
 
 mkdir -p "$PROJECT_DIR/data/logs" "$PROJECT_DIR/state/locks" "$STATE_DIR" "$HISTORY_DIR"
 

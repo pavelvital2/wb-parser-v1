@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 import time
-from contextlib import contextmanager
+import uuid
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -15,6 +17,8 @@ from typing import Any, Callable
 import duckdb
 
 from app.common.exceptions import CriticalPipelineError
+from app.common.run_lock import acquire_run_lock
+from app.serp.collection_plan_runner import acquire_advisory_lock
 
 
 REGIONAL_WAREHOUSE_SCHEMA = "wb_regional_warehouse_v3"
@@ -26,6 +30,8 @@ DUCKDB_MEMORY_LIMIT = "1GiB"
 DUCKDB_MEMORY_LIMIT_SETTING = "1.0 GiB"
 DUCKDB_MAX_THREADS = 2
 STALE_TEMP_SECONDS = 24 * 60 * 60
+LEGACY_MIGRATION_LOCK_TARGET = "wb-legacy-yaroslavl-migration"
+LEGACY_MIGRATION_STALE_SECONDS = 6 * 60 * 60
 REGIONAL_RUN_QUALITY_HASH_FIELDS = (
     "run_id",
     "run_date",
@@ -1085,6 +1091,543 @@ def migrate_legacy_yaroslavl(
         "inserted_run_quality": inserted_run_quality,
         "revision_id": revision_id,
     }
+
+
+def _safe_regular_snapshot(path: Path) -> dict[str, int | str]:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise CriticalPipelineError(
+            "legacy migration database path is unsafe"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_mode & 0o002
+            or before.st_nlink != 1
+        ):
+            raise CriticalPipelineError(
+                "legacy migration database metadata is unsafe"
+            )
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(descriptor)
+        identity = (
+            "device",
+            "inode",
+            "owner_uid",
+            "mode",
+            "size",
+            "mtime_ns",
+            "ctime_ns",
+        )
+        before_values = (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            stat.S_IMODE(before.st_mode),
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_values = (
+            after.st_dev,
+            after.st_ino,
+            after.st_uid,
+            stat.S_IMODE(after.st_mode),
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_values != after_values or size != before.st_size:
+            raise CriticalPipelineError(
+                "legacy migration database changed while hashing"
+            )
+        return {
+            **dict(zip(identity, before_values, strict=True)),
+            "sha256": digest.hexdigest(),
+        }
+    finally:
+        os.close(descriptor)
+
+
+def _same_snapshot(
+    left: dict[str, int | str],
+    right: dict[str, int | str],
+) -> bool:
+    return left == right
+
+
+def _safe_regional_warehouse_directory(
+    project_root: Path,
+    *,
+    create: bool = True,
+) -> Path:
+    project_root = project_root.resolve(strict=True)
+    warehouse_root = project_root / "data/warehouse"
+    target = warehouse_root / "wb_regional"
+    current = project_root
+    for part in target.relative_to(project_root).parts:
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            if not create:
+                raise CriticalPipelineError(
+                    "regional warehouse directory is unavailable"
+                ) from None
+            current.mkdir(mode=0o755)
+            _fsync_directory(current.parent)
+            info = current.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o002
+        ):
+            raise CriticalPipelineError(
+                "regional warehouse directory is unsafe"
+            )
+    return target
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _copy_database(source: Path, target: Path) -> None:
+    source_snapshot = _safe_regular_snapshot(source)
+    source_descriptor = os.open(
+        source,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
+    target_descriptor = os.open(
+        target,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(target_descriptor, view)
+                if written <= 0:
+                    raise CriticalPipelineError(
+                        "regional warehouse staging copy failed"
+                    )
+                view = view[written:]
+        os.fsync(target_descriptor)
+    finally:
+        os.close(target_descriptor)
+        os.close(source_descriptor)
+    if not _same_snapshot(source_snapshot, _safe_regular_snapshot(source)):
+        raise CriticalPipelineError(
+            "regional warehouse source changed during staging copy"
+        )
+
+
+def _legacy_database_check(
+    database_path: Path,
+) -> dict[str, Any]:
+    if not database_path.is_file() or database_path.is_symlink():
+        raise CriticalPipelineError(
+            "regional warehouse database is unavailable"
+        )
+    connection = duckdb.connect(str(database_path), read_only=True)
+    try:
+        required_tables = {
+            "regional_query_positions",
+            "regional_seller_snapshots",
+            "regional_run_quality",
+            "regional_query_quality",
+            "regional_query_generations",
+            "regional_ingestions",
+            "legacy_sync_revisions",
+        }
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'main'"
+            ).fetchall()
+        }
+        if not required_tables.issubset(tables):
+            raise CriticalPipelineError(
+                "regional warehouse schema is incomplete"
+            )
+        positions = int(
+            connection.execute(
+                "SELECT count(*) FROM regional_query_positions "
+                "WHERE region_provenance = ?",
+                [LEGACY_REGION_PROVENANCE],
+            ).fetchone()[0]
+        )
+        sellers = int(
+            connection.execute(
+                "SELECT count(*) FROM regional_seller_snapshots "
+                "WHERE region_provenance = ?",
+                [LEGACY_REGION_PROVENANCE],
+            ).fetchone()[0]
+        )
+        run_quality = int(
+            connection.execute(
+                "SELECT count(*) FROM regional_run_quality "
+                "WHERE region_provenance = ?",
+                [LEGACY_REGION_PROVENANCE],
+            ).fetchone()[0]
+        )
+        invalid_regions = int(
+            connection.execute(
+                """
+                SELECT
+                    (SELECT count(*) FROM regional_query_positions
+                     WHERE region_id IS NULL OR trim(region_id) = ''
+                        OR region_name IS NULL OR trim(region_name) = ''
+                        OR displayed_region IS NULL
+                        OR trim(displayed_region) = '')
+                  + (SELECT count(*) FROM regional_seller_snapshots
+                     WHERE region_id IS NULL OR trim(region_id) = ''
+                        OR region_name IS NULL OR trim(region_name) = '')
+                  + (SELECT count(*) FROM regional_run_quality
+                     WHERE region_id IS NULL OR trim(region_id) = '')
+                """
+            ).fetchone()[0]
+        )
+        legacy_dimensions = connection.execute(
+            """
+            SELECT DISTINCT marketplace, region_id, region_name,
+                            displayed_region, region_provenance,
+                            collection_plan_id, query_pack_id,
+                            query_pack_version, query_group
+            FROM regional_query_positions
+            WHERE region_provenance = ?
+            ORDER BY ALL
+            """,
+            [LEGACY_REGION_PROVENANCE],
+        ).fetchall()
+        seller_legacy_dimensions = connection.execute(
+            """
+            SELECT DISTINCT region_id, region_name, region_provenance
+            FROM regional_seller_snapshots
+            WHERE region_provenance = ?
+            ORDER BY ALL
+            """,
+            [LEGACY_REGION_PROVENANCE],
+        ).fetchall()
+        run_quality_legacy_dimensions = connection.execute(
+            """
+            SELECT DISTINCT region_id, region_provenance,
+                            collection_plan_id, query_pack_id,
+                            query_pack_version
+            FROM regional_run_quality
+            WHERE region_provenance = ?
+            ORDER BY ALL
+            """,
+            [LEGACY_REGION_PROVENANCE],
+        ).fetchall()
+        expected_dimensions = [
+            (
+                "wb",
+                LEGACY_REGION_ID,
+                LEGACY_REGION_NAME,
+                LEGACY_REGION_NAME,
+                LEGACY_REGION_PROVENANCE,
+                "legacy-global",
+                "legacy-global",
+                "legacy",
+                "legacy-global",
+            )
+        ]
+        expected_seller_dimensions = [
+            (
+                LEGACY_REGION_ID,
+                LEGACY_REGION_NAME,
+                LEGACY_REGION_PROVENANCE,
+            )
+        ]
+        expected_run_quality_dimensions = [
+            (
+                LEGACY_REGION_ID,
+                LEGACY_REGION_PROVENANCE,
+                "legacy-global",
+                "legacy-global",
+                "legacy",
+            )
+        ]
+        if (
+            invalid_regions
+            or (positions > 0 and legacy_dimensions != expected_dimensions)
+            or (
+                sellers > 0
+                and seller_legacy_dimensions
+                != expected_seller_dimensions
+            )
+            or (
+                run_quality > 0
+                and run_quality_legacy_dimensions
+                != expected_run_quality_dimensions
+            )
+        ):
+            raise CriticalPipelineError(
+                "regional warehouse legacy dimensions are invalid"
+            )
+        return {
+            "status": "ok",
+            "database_path": str(database_path),
+            "positions": positions,
+            "sellers": sellers,
+            "run_quality": run_quality,
+            "invalid_region_rows": invalid_regions,
+            "legacy_dimensions": [
+                {
+                    "marketplace": row[0],
+                    "region_id": row[1],
+                    "region_name": row[2],
+                    "displayed_region": row[3],
+                    "region_provenance": row[4],
+                    "collection_plan_id": row[5],
+                    "query_pack_id": row[6],
+                    "query_pack_version": row[7],
+                    "query_group": row[8],
+                }
+                for row in legacy_dimensions
+            ],
+            "seller_legacy_dimensions": [
+                {
+                    "region_id": row[0],
+                    "region_name": row[1],
+                    "region_provenance": row[2],
+                }
+                for row in seller_legacy_dimensions
+            ],
+            "run_quality_legacy_dimensions": [
+                {
+                    "region_id": row[0],
+                    "region_provenance": row[1],
+                    "collection_plan_id": row[2],
+                    "query_pack_id": row[3],
+                    "query_pack_version": row[4],
+                }
+                for row in run_quality_legacy_dimensions
+            ],
+            "api_source_schema_compatible": True,
+        }
+    finally:
+        connection.close()
+
+
+def check_legacy_yaroslavl_database(
+    *,
+    project_root: Path,
+) -> dict[str, Any]:
+    project_root = project_root.resolve(strict=True)
+    warehouse_dir = _safe_regional_warehouse_directory(
+        project_root,
+        create=False,
+    )
+    database_path = warehouse_dir / "wb_regional.duckdb"
+    _safe_regular_snapshot(database_path)
+    return _legacy_database_check(database_path)
+
+
+@contextmanager
+def acquire_legacy_yaroslavl_migration_locks(
+    *,
+    project_root: Path,
+    run_id: str,
+    stale_seconds: int = LEGACY_MIGRATION_STALE_SECONDS,
+):
+    lock_dir = project_root / "state/locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as stack:
+        stack.enter_context(
+            acquire_advisory_lock(
+                lock_dir / "products_sellers_daily.flock"
+            )
+        )
+        stack.enter_context(
+            acquire_run_lock(
+                state_dir=project_root / "state",
+                target=LEGACY_MIGRATION_LOCK_TARGET,
+                run_id=run_id,
+                enabled=True,
+                stale_seconds=stale_seconds,
+                guard_blocking=False,
+            )
+        )
+        stack.enter_context(
+            acquire_advisory_lock(
+                lock_dir / "wb_warehouse_refresh.flock"
+            )
+        )
+        stack.enter_context(
+            acquire_advisory_lock(
+                lock_dir / "wb_collection_plan.flock"
+            )
+        )
+        yield
+
+
+def migrate_legacy_yaroslavl_database(
+    *,
+    project_root: Path,
+    apply: bool,
+    run_id: str,
+    stale_seconds: int = LEGACY_MIGRATION_STALE_SECONDS,
+    integrity_gate: Callable[[], None] = lambda: None,
+    event_hook: Callable[[str, Path], None] | None = None,
+) -> dict[str, Any]:
+    project_root = project_root.resolve(strict=True)
+    source_path = project_root / "data/warehouse/wb/wb.duckdb"
+    if not source_path.is_file() or source_path.is_symlink():
+        raise CriticalPipelineError(
+            "legacy WB warehouse source is unavailable"
+        )
+    with acquire_legacy_yaroslavl_migration_locks(
+        project_root=project_root,
+        run_id=run_id,
+        stale_seconds=stale_seconds,
+    ):
+        source_snapshot = _safe_regular_snapshot(source_path)
+        warehouse_dir = _safe_regional_warehouse_directory(project_root)
+        target_path = warehouse_dir / "wb_regional.duckdb"
+        target_exists = os.path.lexists(target_path)
+        target_snapshot = (
+            _safe_regular_snapshot(target_path)
+            if target_exists
+            else None
+        )
+        candidate_path = (
+            warehouse_dir
+            / f".wb-regional-yaroslavl-{uuid.uuid4().hex}.duckdb"
+        )
+
+        def verify_source() -> None:
+            integrity_gate()
+            if not _same_snapshot(
+                source_snapshot,
+                _safe_regular_snapshot(source_path),
+            ):
+                raise CriticalPipelineError(
+                    "legacy WB warehouse source changed during migration"
+                )
+
+        try:
+            if target_snapshot is not None:
+                _copy_database(target_path, candidate_path)
+            with bounded_regional_connection(
+                project_root=project_root,
+                database_path=candidate_path,
+            ) as connection:
+                _create_schema(connection)
+                migration = migrate_legacy_yaroslavl(
+                    project_root=project_root,
+                    connection=connection,
+                    integrity_gate=verify_source,
+                )
+            os.chmod(candidate_path, 0o644)
+            candidate_descriptor = os.open(
+                candidate_path,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(candidate_descriptor)
+            finally:
+                os.close(candidate_descriptor)
+            candidate_snapshot = _safe_regular_snapshot(candidate_path)
+            check = _legacy_database_check(candidate_path)
+            if (
+                check["positions"] != migration["positions"]
+                or check["sellers"] != migration["sellers"]
+                or check["run_quality"] != migration["run_quality"]
+            ):
+                raise CriticalPipelineError(
+                    "regional warehouse migration verification mismatch"
+                )
+            result = {
+                "schema_version": "wb_legacy_yaroslavl_migration_v1",
+                "mode": "apply" if apply else "dry_run",
+                "status": migration["status"],
+                "source": {
+                    "sha256": source_snapshot["sha256"],
+                    "size": source_snapshot["size"],
+                },
+                "target": {
+                    "sha256": candidate_snapshot["sha256"],
+                    "size": candidate_snapshot["size"],
+                },
+                "migration": migration,
+                "check": {
+                    key: value
+                    for key, value in check.items()
+                    if key != "database_path"
+                },
+                "publication": "not_requested",
+            }
+            if not apply:
+                return result
+            if target_snapshot is not None and migration["status"] == "no_changes":
+                result["target"] = {
+                    "sha256": target_snapshot["sha256"],
+                    "size": target_snapshot["size"],
+                }
+                result["publication"] = "no_changes"
+                return result
+            verify_source()
+            current_target_exists = os.path.lexists(target_path)
+            current_target = (
+                _safe_regular_snapshot(target_path)
+                if current_target_exists
+                else None
+            )
+            if current_target != target_snapshot:
+                raise CriticalPipelineError(
+                    "regional warehouse target changed during migration"
+                )
+            if event_hook is not None:
+                event_hook("before_publish", target_path)
+            os.replace(candidate_path, target_path)
+            _fsync_directory(warehouse_dir)
+            published = _safe_regular_snapshot(target_path)
+            if (
+                published["sha256"] != candidate_snapshot["sha256"]
+                or published["size"] != candidate_snapshot["size"]
+            ):
+                raise CriticalPipelineError(
+                    "regional warehouse atomic publication verification failed"
+                )
+            if event_hook is not None:
+                event_hook("after_publish", target_path)
+            result["publication"] = "published"
+            return result
+        finally:
+            try:
+                candidate_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def ingest_regional_run(
