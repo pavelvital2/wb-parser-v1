@@ -1,0 +1,14 @@
+{
+  "schema_version": "wb_query_pack_execution_matrix_v1",
+  "execution_matrix_id": "four-region-nightly-v1",
+  "enabled": false,
+  "entries": [
+    {
+      "execution_id": "shevron-core-four-regions-top1000",
+      "enabled": true,
+      "plan_file": "config/wb/collection_plans/shevron-four-regions-top1000-v2.json",
+      "query_pack_id": "shevron-core",
+      "query_pack_version": "2026-07-26.1"
+    }
+  ]
+}

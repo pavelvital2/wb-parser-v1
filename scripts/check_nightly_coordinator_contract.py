@@ -25,6 +25,10 @@ PLAN = (
     PROJECT_ROOT
     / "config/wb/collection_plans/shevron-four-regions-top1000-v2.json"
 )
+MATRIX = (
+    PROJECT_ROOT
+    / "config/wb/execution_matrices/four-region-nightly-v1.json"
+)
 REGISTRY = PROJECT_ROOT / "config/wb/regions.json"
 QUERY_PACK = (
     PROJECT_ROOT
@@ -47,6 +51,7 @@ DIRECT_ATTESTATION_ROOTS = (
     PROJECT_ROOT / "scripts/wb_runtime_env.sh",
     PROJECT_ROOT / "scripts/run_wb_four_region_nightly.py",
     ADAPTER,
+    MATRIX,
     PLAN,
     REGISTRY,
     QUERY_PACK,
@@ -161,8 +166,8 @@ def _json_object(encoded: bytes, field: str) -> dict[str, Any]:
 def _configured_command(stage: str) -> tuple[str, ...]:
     base = (
         str(DEPLOYED_PROJECT_ROOT / "scripts/run_wb_four_region_nightly.sh"),
-        "--plan-file",
-        "config/wb/collection_plans/shevron-four-regions-top1000-v2.json",
+        "--matrix-file",
+        "config/wb/execution_matrices/four-region-nightly-v1.json",
         "--no-publish",
     )
     if stage == "wb_initial":
@@ -187,9 +192,11 @@ def _validate_sources() -> list[dict[str, str]]:
     ):
         raise CheckError("adapter target is invalid")
     plan_bytes = _read_safe(PLAN)
+    matrix_bytes = _read_safe(MATRIX)
     registry_bytes = _read_safe(REGISTRY)
     pack_bytes = _read_safe(QUERY_PACK)
     plan = _json_object(plan_bytes, "plan")
+    matrix = _json_object(matrix_bytes, "execution matrix")
     registry = _json_object(registry_bytes, "registry")
     pack = _json_object(pack_bytes, "query pack")
     cli_source = _read_safe(PROJECT_ROOT / "app/common/cli.py").decode("utf-8-sig")
@@ -256,6 +263,9 @@ def _validate_sources() -> list[dict[str, str]]:
     ).decode("utf-8")
     downstream_source = _read_safe(
         PROJECT_ROOT / "app/serp/four_region_nightly.py",
+    ).decode("utf-8")
+    matrix_runner_source = _read_safe(
+        PROJECT_ROOT / "app/serp/execution_matrix_runner.py",
     ).decode("utf-8")
     warehouse_source = _read_safe(
         PROJECT_ROOT / "app/warehouse/wb_regional.py",
@@ -351,6 +361,9 @@ def _validate_sources() -> list[dict[str, str]]:
         or "integrity_gate=lease.integrity_gate" not in downstream_source
         or warehouse_source.count("integrity_gate()") < 2
         or "integrity_gate=input_integrity_gate" not in downstream_source
+        or "run_execution_matrix(" not in inner_source
+        or "validate_completed_four_region_run" not in matrix_runner_source
+        or "durable_atomic_replace(" not in matrix_runner_source
         or "durable_atomic_copy(" not in paths_source
         or "shutil.copy" in paths_source
         or run_report_source.count("durable_atomic_replace(") != 2
@@ -415,6 +428,27 @@ def _validate_sources() -> list[dict[str, str]]:
         )
         if expected_guard not in source:
             raise CheckError("direct Python entrypoint contract mismatch")
+    if (
+        matrix.get("schema_version")
+        != "wb_query_pack_execution_matrix_v1"
+        or matrix.get("execution_matrix_id")
+        != "four-region-nightly-v1"
+        or matrix.get("enabled") is not False
+        or matrix.get("entries")
+        != [
+            {
+                "execution_id": "shevron-core-four-regions-top1000",
+                "enabled": True,
+                "plan_file": (
+                    "config/wb/collection_plans/"
+                    "shevron-four-regions-top1000-v2.json"
+                ),
+                "query_pack_id": "shevron-core",
+                "query_pack_version": "2026-07-26.1",
+            }
+        ]
+    ):
+        raise CheckError("execution matrix contract mismatch")
     if (
         plan.get("schema_version") != "wb_collection_plan_v2"
         or plan.get("collection_plan_id")

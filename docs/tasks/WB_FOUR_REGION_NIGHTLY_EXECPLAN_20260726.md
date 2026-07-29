@@ -43,6 +43,25 @@ greater than 500 it already provides:
 
 ## Target Contracts
 
+The versioned query-pack registry is projected through
+`config/wb/execution_matrices/four-region-nightly-v1.json`. The matrix has a
+separate activation flag and entries that bind an exact
+`query_pack_id + version` to an exact collection plan. Adding an approved
+pack/plan pair is a configuration operation: the strict loader accepts
+multiple enabled entries, rejects duplicate pack versions/plans/IDs and
+validates every referenced plan and pack. For the first cutover the matrix
+itself remains disabled and contains only the enabled
+`shevron-core@2026-07-26.1` entry; activation is a separate joint gate.
+
+The matrix is an executable orchestration contract, not only a validator.
+`scripts/run_wb_four_region_nightly.sh --matrix-file ... --no-publish`
+executes enabled entries serially through the existing one-plan pipeline.
+Durable matrix state pins source hashes and child run IDs, resumes the current
+entry without repeating completed entries, and rejects duplicate
+`date + marketplace + pack/version + region + query` generations. The
+matrix-level latest pointer is published only after all enabled entries,
+sellers and regional warehouse stages succeed.
+
 ### Collection
 
 - New plan: `shevron-four-regions-top1000-v2`.
@@ -184,6 +203,16 @@ and source provenance. `regional_seller_snapshots` likewise retains the legacy
 query/product counts and references. Row hashes cover all retained business
 fields.
 
+Every regional position fact also stores `marketplace=wb`,
+`displayed_region`, `region_name`, the exact query-pack ID/version and query
+group, run/date and absolute position. `displayed_region` is the reviewed
+region label associated with the destination sent by the client; it is not a
+claim that the search response echoed or independently verified the region.
+`regional_query_generations` enforces one generation per
+`marketplace + run_date + query_pack_id + query_pack_version + region_id +
+query_id`. A second run for the same daily scope fails closed and rolls back;
+idempotent replay of the exact already-ingested run remains a no-op.
+
 Run quality is warehouse-owned, not reconstructed by API readers from parser
 state. `regional_run_quality` stores one region/run fact with source hashes,
 actual/max query/page/position counts, status, timing, endpoint usage and
@@ -207,6 +236,8 @@ warehouse with:
 
 This preserves and labels historical data. `yaroslavl` is not a future
 collection region and is not included in the new four-region plan.
+Legacy position rows use `marketplace=wb` and
+`displayed_region=Ярославль`; raw source files are never rewritten.
 
 Legacy import is a transactional, set-based DuckDB `ATTACH`/`INSERT SELECT`
 sync. Stable keys and per-row SHA-256 values permit new legacy runs to append.

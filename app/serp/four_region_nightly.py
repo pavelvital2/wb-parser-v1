@@ -109,6 +109,75 @@ class FourRegionInputs:
 
 
 @dataclass(frozen=True, slots=True)
+class FourRegionPlanSpec:
+    collection_plan_id: str
+    region_ids: tuple[str, ...]
+    query_pack_id: str
+    query_pack_version: str
+    query_count: int
+    depth: int
+    pages_per_query: int
+    max_pages: int
+    max_positions: int
+
+    @classmethod
+    def from_bundle(
+        cls,
+        bundle: CollectionPlanBundle,
+    ) -> "FourRegionPlanSpec":
+        plan = bundle.collection_plan
+        if plan.region_set != FOUR_REGION_IDS:
+            raise CriticalPipelineError("four-region order mismatch")
+        if not plan.query_ids or plan.depth != 1000:
+            raise CriticalPipelineError(
+                "four-region query/depth contract mismatch"
+            )
+        if (
+            plan.publication_mode != "none"
+            or plan.sellers_mode != "disabled"
+            or plan.proxy_rotation_mode != "disabled"
+        ):
+            raise CriticalPipelineError(
+                "four-region isolation contract mismatch"
+            )
+        if plan.runtime_window is None:
+            raise CriticalPipelineError(
+                "four-region bounded runtime contract is missing"
+            )
+        if plan.runtime_window != REVIEWED_FOUR_REGION_RUNTIME_WINDOW:
+            raise CriticalPipelineError(
+                "four-region reviewed runtime contract mismatch"
+            )
+        pages_per_query = (plan.depth + 99) // 100
+        query_count = len(plan.query_ids)
+        return cls(
+            collection_plan_id=plan.collection_plan_id,
+            region_ids=plan.region_set,
+            query_pack_id=bundle.query_pack.query_pack_id,
+            query_pack_version=bundle.query_pack.version,
+            query_count=query_count,
+            depth=plan.depth,
+            pages_per_query=pages_per_query,
+            max_pages=len(plan.region_set) * query_count * pages_per_query,
+            max_positions=len(plan.region_set) * query_count * plan.depth,
+        )
+
+
+def _default_four_region_plan_spec() -> FourRegionPlanSpec:
+    return FourRegionPlanSpec(
+        collection_plan_id=FOUR_REGION_PLAN_ID,
+        region_ids=FOUR_REGION_IDS,
+        query_pack_id=FOUR_REGION_QUERY_PACK_ID,
+        query_pack_version=FOUR_REGION_QUERY_PACK_VERSION,
+        query_count=EXPECTED_QUERIES,
+        depth=1000,
+        pages_per_query=10,
+        max_pages=MAX_PAGES,
+        max_positions=MAX_POSITIONS,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class DownstreamExecutionContract:
     mode: str
     legacy_nightly_start_msk: str
@@ -189,6 +258,7 @@ class _AuthoritativeStateLease:
     state_path: Path
     latest_path: Path
     run_id: str
+    plan_spec: FourRegionPlanSpec
     prior_state_bytes: bytes | None
     prior_latest_bytes: bytes | None
     integrity_gate: Callable[[], None]
@@ -494,9 +564,11 @@ def _collection_lineage(
     *,
     config: AppConfig,
     bundle: CollectionPlanBundle,
+    plan_spec: FourRegionPlanSpec | None = None,
     paths: ScopedPaths,
     run_id: str,
 ) -> dict[str, Any]:
+    plan_spec = plan_spec or FourRegionPlanSpec.from_bundle(bundle)
     snapshot = _trusted_file_snapshot(paths.manifest_path)
     if snapshot is None:
         raise CriticalPipelineError("four-region collection manifest is missing")
@@ -513,7 +585,7 @@ def _collection_lineage(
     required = {
         "schema_version": RESUMABLE_MANIFEST_SCHEMA_VERSION,
         "run_id": run_id,
-        "collection_plan_id": FOUR_REGION_PLAN_ID,
+        "collection_plan_id": plan_spec.collection_plan_id,
         "query_pack_id": bundle.query_pack.query_pack_id,
         "query_pack_version": bundle.query_pack.version,
         "query_pack_sha256": bundle.query_pack_sha256,
@@ -569,7 +641,9 @@ def _validate_collection_lineage(
     *,
     project_root: Path,
     expected_run_id: str,
+    plan_spec: FourRegionPlanSpec | None = None,
 ) -> dict[str, Any]:
+    plan_spec = plan_spec or _default_four_region_plan_spec()
     if not isinstance(lineage, dict) or set(lineage) != {
         "schema_version",
         "collection_run_id",
@@ -592,8 +666,8 @@ def _validate_collection_lineage(
         lineage.get("schema_version") != DOWNSTREAM_LINEAGE_SCHEMA
         or lineage.get("collection_run_id") != expected_run_id
         or not _STATE_ID_RE.fullmatch(expected_run_id)
-        or lineage.get("query_pack_id") != FOUR_REGION_QUERY_PACK_ID
-        or lineage.get("query_pack_version") != FOUR_REGION_QUERY_PACK_VERSION
+        or lineage.get("query_pack_id") != plan_spec.query_pack_id
+        or lineage.get("query_pack_version") != plan_spec.query_pack_version
     ):
         raise CriticalPipelineError(
             "downstream collection lineage identity mismatch"
@@ -625,7 +699,7 @@ def _validate_collection_lineage(
         _strict_sha256(lineage.get(field), field=field)
     expected_manifest = (
         Path("state/wb_collection_plans")
-        / FOUR_REGION_PLAN_ID
+        / plan_spec.collection_plan_id
         / expected_run_id
         / "manifest.json"
     )
@@ -655,7 +729,7 @@ def _validate_collection_lineage(
     manifest_required = {
         "schema_version": RESUMABLE_MANIFEST_SCHEMA_VERSION,
         "run_id": expected_run_id,
-        "collection_plan_id": FOUR_REGION_PLAN_ID,
+        "collection_plan_id": plan_spec.collection_plan_id,
         "query_pack_id": lineage["query_pack_id"],
         "query_pack_version": lineage["query_pack_version"],
         "query_pack_sha256": lineage["query_pack_sha256"],
@@ -743,8 +817,10 @@ def _validate_completed_state_bytes(
     payload_bytes: bytes,
     *,
     project_root: Path,
+    plan_spec: FourRegionPlanSpec | None = None,
     expected_run_id: str | None = None,
 ) -> dict[str, Any]:
+    plan_spec = plan_spec or _default_four_region_plan_spec()
     try:
         payload = json.loads(payload_bytes)
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -781,7 +857,7 @@ def _validate_completed_state_bytes(
         or not _STATE_ID_RE.fullmatch(run_id)
         or (expected_run_id is not None and run_id != expected_run_id)
         or payload.get("schema_version") != DOWNSTREAM_SCHEMA
-        or payload.get("collection_plan_id") != FOUR_REGION_PLAN_ID
+        or payload.get("collection_plan_id") != plan_spec.collection_plan_id
         or payload.get("status") != "success"
         or payload.get("complete") is not True
         or payload.get("stage") != "complete"
@@ -796,6 +872,7 @@ def _validate_completed_state_bytes(
         payload.get("lineage"),
         project_root=project_root,
         expected_run_id=run_id,
+        plan_spec=plan_spec,
     )
     finished = _strict_utc(
         payload.get("finished_at_utc"),
@@ -811,10 +888,16 @@ def _validate_completed_state_bytes(
         )
 
     regions = payload.get("regions")
-    if not isinstance(regions, list) or len(regions) != len(FOUR_REGION_IDS):
+    if not isinstance(regions, list) or len(regions) != len(
+        plan_spec.region_ids
+    ):
         raise CriticalPipelineError("completed downstream regions are invalid")
     pages = positions = duplicates = 0
-    for expected_region, region in zip(FOUR_REGION_IDS, regions, strict=True):
+    for expected_region, region in zip(
+        plan_spec.region_ids,
+        regions,
+        strict=True,
+    ):
         if not isinstance(region, dict) or set(region) != {
             "region_id",
             "pages",
@@ -833,13 +916,13 @@ def _validate_completed_state_bytes(
             region.get("pages"),
             field="region pages",
             minimum=1,
-            maximum=EXPECTED_QUERIES * 10,
+            maximum=plan_spec.query_count * plan_spec.pages_per_query,
         )
         region_positions = _strict_int(
             region.get("positions"),
             field="region positions",
             minimum=1,
-            maximum=EXPECTED_QUERIES * 1000,
+            maximum=plan_spec.query_count * plan_spec.depth,
         )
         positions += region_positions
         region_duplicates = _strict_int(
@@ -848,7 +931,10 @@ def _validate_completed_state_bytes(
             maximum=region_positions,
         )
         duplicates += region_duplicates
-        if region.get("max_position_capacity") != EXPECTED_QUERIES * 1000:
+        if (
+            region.get("max_position_capacity")
+            != plan_spec.query_count * plan_spec.depth
+        ):
             raise CriticalPipelineError(
                 "completed downstream region capacity mismatch"
             )
@@ -884,7 +970,7 @@ def _validate_completed_state_bytes(
         totals.get("pages") != pages
         or totals.get("positions") != positions
         or totals.get("duplicate_product_positions") != duplicates
-        or totals.get("max_position_capacity") != MAX_POSITIONS
+        or totals.get("max_position_capacity") != plan_spec.max_positions
         or unique_suppliers + missing_suppliers > unique_products
     ):
         raise CriticalPipelineError(
@@ -923,19 +1009,19 @@ def _validate_completed_state_bytes(
     expected_artifact_paths = {
         "bridge_path": (
             Path("data/marts/wb_four_region")
-            / FOUR_REGION_PLAN_ID
+            / plan_spec.collection_plan_id
             / run_id
             / "regional_query_product_position_bridge.csv"
         ).as_posix(),
         "seller_input_path": (
             Path("data/marts/wb_four_region")
-            / FOUR_REGION_PLAN_ID
+            / plan_spec.collection_plan_id
             / run_id
             / "products_for_sellers.csv"
         ).as_posix(),
         "seller_output_path": (
             Path("data/marts/sellers_scoped")
-            / FOUR_REGION_PLAN_ID
+            / plan_spec.collection_plan_id
             / run_id
             / "sellers_daily.csv"
         ).as_posix(),
@@ -1022,7 +1108,9 @@ def _validate_latest_bytes(
     payload_bytes: bytes,
     *,
     project_root: Path,
+    plan_spec: FourRegionPlanSpec | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], bytes]:
+    plan_spec = plan_spec or _default_four_region_plan_spec()
     try:
         pointer = json.loads(payload_bytes)
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -1046,7 +1134,7 @@ def _validate_latest_bytes(
         raise CriticalPipelineError("downstream latest run identity is invalid")
     expected_path = (
         Path("state/wb_four_region_nightly")
-        / FOUR_REGION_PLAN_ID
+        / plan_spec.collection_plan_id
         / run_id
         / "state.json"
     )
@@ -1069,6 +1157,7 @@ def _validate_latest_bytes(
     state = _validate_completed_state_bytes(
         state_snapshot.payload,
         project_root=project_root,
+        plan_spec=plan_spec,
         expected_run_id=run_id,
     )
     if pointer.get("lineage") != state.get("lineage"):
@@ -1090,9 +1179,11 @@ def _begin_authoritative_state_transition(
     latest_path: Path,
     run_id: str,
     project_root: Path,
+    plan_spec: FourRegionPlanSpec | None = None,
     candidate_lineage: Mapping[str, Any],
     integrity_gate: Callable[[], None] = lambda: None,
 ) -> _AuthoritativeStateLease:
+    plan_spec = plan_spec or _default_four_region_plan_spec()
     _safe_state_parent(state_path, project_root=project_root)
     _safe_state_parent(latest_path, project_root=project_root)
     state_bytes = _optional_regular_bytes(state_path)
@@ -1101,6 +1192,7 @@ def _begin_authoritative_state_transition(
         candidate_lineage,
         project_root=project_root,
         expected_run_id=run_id,
+        plan_spec=plan_spec,
     )
     state_payload: dict[str, Any] | None = None
     completed_state = False
@@ -1120,7 +1212,7 @@ def _begin_authoritative_state_transition(
             state_payload.get("schema_version") != DOWNSTREAM_SCHEMA
             or state_payload.get("run_id") != run_id
             or state_payload.get("collection_plan_id")
-            != FOUR_REGION_PLAN_ID
+            != plan_spec.collection_plan_id
             or state_payload.get("status") not in {"failed", "success"}
             or type(state_payload.get("complete")) is not bool
             or (
@@ -1143,6 +1235,7 @@ def _begin_authoritative_state_transition(
             state_payload = _validate_completed_state_bytes(
                 state_bytes,
                 project_root=project_root,
+                plan_spec=plan_spec,
                 expected_run_id=run_id,
             )
             if state_payload["lineage"] != validated_candidate_lineage:
@@ -1156,6 +1249,7 @@ def _begin_authoritative_state_transition(
         latest_payload, latest_state, latest_state_bytes = _validate_latest_bytes(
             latest_bytes,
             project_root=project_root,
+            plan_spec=plan_spec,
         )
         if latest_payload["run_id"] == run_id:
             if not completed_state or latest_state_bytes != state_bytes:
@@ -1175,6 +1269,7 @@ def _begin_authoritative_state_transition(
         state_path=state_path,
         latest_path=latest_path,
         run_id=run_id,
+        plan_spec=plan_spec,
         prior_state_bytes=state_bytes,
         prior_latest_bytes=latest_bytes,
         integrity_gate=integrity_gate,
@@ -1206,7 +1301,8 @@ def _write_authoritative_state(
     if (
         payload.get("schema_version") != DOWNSTREAM_SCHEMA
         or payload.get("run_id") != lease.run_id
-        or payload.get("collection_plan_id") != FOUR_REGION_PLAN_ID
+        or payload.get("collection_plan_id")
+        != lease.plan_spec.collection_plan_id
         or payload.get("status") not in {"failed", "success"}
         or type(payload.get("complete")) is not bool
         or (
@@ -1252,6 +1348,7 @@ def _write_authoritative_state(
         _validate_completed_state_bytes(
             encoded,
             project_root=lease.project_root,
+            plan_spec=lease.plan_spec,
             expected_run_id=lease.run_id,
         )
         if payload.get("lineage") != lease.candidate_lineage:
@@ -1284,6 +1381,8 @@ def _write_authoritative_state(
         raise CriticalPipelineError(
             "downstream authoritative state verification failed"
         )
+
+
 def _write_authoritative_latest(
     lease: _AuthoritativeStateLease,
     payload: Mapping[str, Any],
@@ -1310,13 +1409,18 @@ def _write_authoritative_latest(
             raise CriticalPipelineError(
                 "downstream latest changed during same-run reconcile"
             )
-        _validate_latest_bytes(current or b"", project_root=lease.project_root)
+        _validate_latest_bytes(
+            current or b"",
+            project_root=lease.project_root,
+            plan_spec=lease.plan_spec,
+        )
         lease.latest_published = True
         return
     encoded = _json_bytes(payload)
     _validate_completed_state_bytes(
         lease.expected_state_bytes,
         project_root=lease.project_root,
+        plan_spec=lease.plan_spec,
         expected_run_id=lease.run_id,
     )
     _trusted_file_snapshot(
@@ -1333,6 +1437,7 @@ def _write_authoritative_latest(
             _validate_latest_bytes(
                 current,
                 project_root=lease.project_root,
+                plan_spec=lease.plan_spec,
             )
         )
         candidate_order = _lineage_order(lease.candidate_lineage or {})
@@ -1371,7 +1476,11 @@ def _write_authoritative_latest(
         raise CriticalPipelineError(
             "downstream publication transaction verification failed"
         )
-    _validate_latest_bytes(encoded, project_root=lease.project_root)
+    _validate_latest_bytes(
+        encoded,
+        project_root=lease.project_root,
+        plan_spec=lease.plan_spec,
+    )
     lease.latest_published = True
 
 
@@ -1380,25 +1489,42 @@ def _load_scoped_products(path: Path) -> list[dict[str, str]]:
         return [dict(row) for row in csv.DictReader(handle)]
 
 
-def validate_four_region_bundle(bundle: CollectionPlanBundle) -> None:
-    plan = bundle.collection_plan
-    if plan.collection_plan_id != FOUR_REGION_PLAN_ID:
-        raise CriticalPipelineError("unexpected four-region collection plan")
-    if (
-        bundle.query_pack.query_pack_id != FOUR_REGION_QUERY_PACK_ID
-        or bundle.query_pack.version != FOUR_REGION_QUERY_PACK_VERSION
-    ):
-        raise CriticalPipelineError("four-region query-pack contract mismatch")
-    if plan.region_set != FOUR_REGION_IDS:
-        raise CriticalPipelineError("four-region order mismatch")
-    if len(plan.query_ids) != EXPECTED_QUERIES or plan.depth != 1000:
-        raise CriticalPipelineError("four-region query/depth contract mismatch")
-    if plan.runtime_window is None:
-        raise CriticalPipelineError("four-region bounded runtime contract is missing")
-    if plan.runtime_window != REVIEWED_FOUR_REGION_RUNTIME_WINDOW:
+def validate_completed_four_region_run(
+    *,
+    config: AppConfig,
+    bundle: CollectionPlanBundle,
+    run_id: str,
+) -> dict[str, Any]:
+    plan_spec = validate_four_region_bundle(bundle)
+    state_path = (
+        config.project_root
+        / "state/wb_four_region_nightly"
+        / plan_spec.collection_plan_id
+        / run_id
+        / "state.json"
+    )
+    snapshot = _trusted_file_snapshot(state_path)
+    if snapshot is None:
         raise CriticalPipelineError(
-            "four-region reviewed runtime contract mismatch"
+            "completed four-region state is missing"
         )
+    state = _validate_completed_state_bytes(
+        snapshot.payload,
+        project_root=config.project_root,
+        plan_spec=plan_spec,
+        expected_run_id=run_id,
+    )
+    return {
+        "state": state,
+        "state_path": state_path.relative_to(config.project_root).as_posix(),
+        "state_sha256": snapshot.sha256,
+    }
+
+
+def validate_four_region_bundle(
+    bundle: CollectionPlanBundle,
+) -> FourRegionPlanSpec:
+    return FourRegionPlanSpec.from_bundle(bundle)
 
 
 def deterministic_seller_rows(
@@ -1442,7 +1568,7 @@ def build_four_region_inputs(
     bundle: CollectionPlanBundle,
     run_id: str,
 ) -> FourRegionInputs:
-    validate_four_region_bundle(bundle)
+    plan_spec = validate_four_region_bundle(bundle)
     paths = ScopedPaths.build(
         project_root=config.project_root,
         collection_plan_id=bundle.collection_plan.collection_plan_id,
@@ -1461,18 +1587,20 @@ def build_four_region_inputs(
     collection_lineage = _collection_lineage(
         config=config,
         bundle=bundle,
+        plan_spec=plan_spec,
         paths=paths,
         run_id=run_id,
     )
     totals = manifest.get("totals")
     if (
         not isinstance(totals, dict)
-        or totals.get("regions_ok") != 4
-        or totals.get("queries_ok") != len(FOUR_REGION_IDS) * EXPECTED_QUERIES
+        or totals.get("regions_ok") != len(plan_spec.region_ids)
+        or totals.get("queries_ok")
+        != len(plan_spec.region_ids) * plan_spec.query_count
         or type(totals.get("pages_ok")) is not int
-        or not 0 < totals["pages_ok"] <= MAX_PAGES
+        or not 0 < totals["pages_ok"] <= plan_spec.max_pages
         or type(totals.get("products_ok")) is not int
-        or not 0 < totals["products_ok"] <= MAX_POSITIONS
+        or not 0 < totals["products_ok"] <= plan_spec.max_positions
     ):
         raise CriticalPipelineError("four-region collection totals are invalid")
     resume = manifest.get("resume")
@@ -1486,7 +1614,7 @@ def build_four_region_inputs(
         scope = (str(ref.get("region_id", "")), str(ref.get("query_id", "")))
         completion = ref.get("completion")
         if (
-            scope[0] not in FOUR_REGION_IDS
+            scope[0] not in plan_spec.region_ids
             or scope[1] not in bundle.collection_plan.query_ids
             or scope in completion_by_scope
             or not isinstance(completion, dict)
@@ -1494,13 +1622,16 @@ def build_four_region_inputs(
         ):
             raise CriticalPipelineError("four-region segment completion is invalid")
         completion_by_scope[scope] = completion
-    if len(completion_by_scope) != len(FOUR_REGION_IDS) * EXPECTED_QUERIES:
+    if (
+        len(completion_by_scope)
+        != len(plan_spec.region_ids) * plan_spec.query_count
+    ):
         raise CriticalPipelineError("four-region query scopes are incomplete")
 
     latest = _json(paths.latest_path)
     if (
         latest.get("run_id") != run_id
-        or latest.get("collection_plan_id") != FOUR_REGION_PLAN_ID
+        or latest.get("collection_plan_id") != plan_spec.collection_plan_id
         or latest.get("effective_plan_sha256")
         != manifest.get("effective_plan_sha256")
     ):
@@ -1508,7 +1639,7 @@ def build_four_region_inputs(
     region_refs = latest.get("regions")
     if not isinstance(region_refs, list) or [
         item.get("region_id") for item in region_refs if isinstance(item, dict)
-    ] != list(FOUR_REGION_IDS):
+    ] != list(plan_spec.region_ids):
         raise CriticalPipelineError("four-region latest region order mismatch")
 
     query_order = {
@@ -1542,7 +1673,8 @@ def build_four_region_inputs(
         for row in region_rows:
             if (
                 row.get("run_id") != run_id
-                or row.get("collection_plan_id") != FOUR_REGION_PLAN_ID
+                or row.get("collection_plan_id")
+                != plan_spec.collection_plan_id
                 or row.get("region_id") != region_id
                 or row.get("query_id") not in query_order
             ):
@@ -1595,14 +1727,14 @@ def build_four_region_inputs(
                 for count in product_occurrences.values()
                 if count > 1
             ),
-            "max_position_capacity": EXPECTED_QUERIES * 1000,
+            "max_position_capacity": plan_spec.query_count * plan_spec.depth,
         }
 
     if len(rows) != totals["products_ok"]:
         raise CriticalPipelineError("four-region position total mismatch")
     seller_rows = deterministic_seller_rows(
         rows,
-        region_ids=FOUR_REGION_IDS,
+        region_ids=plan_spec.region_ids,
         query_ids=bundle.collection_plan.query_ids,
     )
     unique_suppliers = {
@@ -1618,7 +1750,7 @@ def build_four_region_inputs(
     output_root = (
         config.project_root
         / "data/marts/wb_four_region"
-        / FOUR_REGION_PLAN_ID
+        / plan_spec.collection_plan_id
         / run_id
     )
     bridge_path = output_root / "regional_query_product_position_bridge.csv"
@@ -1653,8 +1785,10 @@ def write_four_region_failure_attempt(
     lock_ownership: str = "not_acquired",
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     attempt_id: str | None = None,
+    plan_spec: FourRegionPlanSpec | None = None,
 ) -> dict[str, Any] | None:
     try:
+        spec = plan_spec or _default_four_region_plan_spec()
         if (
             not _STATE_ID_RE.fullmatch(run_id)
             or stage not in _ATTEMPT_STAGES
@@ -1674,7 +1808,7 @@ def write_four_region_failure_attempt(
         manifest_path = (
             config.project_root
             / "state/wb_collection_plans"
-            / FOUR_REGION_PLAN_ID
+            / spec.collection_plan_id
             / run_id
             / "manifest.json"
         )
@@ -1688,12 +1822,12 @@ def write_four_region_failure_attempt(
             item.get("region_id"): item
             for item in manifest.get("regions", [])
             if isinstance(item, dict)
-            and item.get("region_id") in FOUR_REGION_IDS
+            and item.get("region_id") in spec.region_ids
         }
         artifact_path = (
             config.project_root
             / "state/wb_four_region_nightly"
-            / FOUR_REGION_PLAN_ID
+            / spec.collection_plan_id
             / "attempts"
             / run_id
             / f"{effective_attempt_id}.json"
@@ -1702,7 +1836,7 @@ def write_four_region_failure_attempt(
             "schema_version": DOWNSTREAM_ATTEMPT_SCHEMA,
             "attempt_id": effective_attempt_id,
             "run_id": run_id,
-            "collection_plan_id": FOUR_REGION_PLAN_ID,
+            "collection_plan_id": spec.collection_plan_id,
             "status": "failed",
             "stage": stage,
             "created_at_utc": created_at.astimezone(UTC)
@@ -1733,7 +1867,7 @@ def write_four_region_failure_attempt(
                         )
                     ),
                 }
-                for region_id in FOUR_REGION_IDS
+                for region_id in spec.region_ids
             ],
             "totals": {
                 "pages": int(
@@ -1748,7 +1882,7 @@ def write_four_region_failure_attempt(
                         0,
                     )
                 ),
-                "max_position_capacity": MAX_POSITIONS,
+                "max_position_capacity": spec.max_positions,
             },
             "failure_reason": error.__class__.__name__,
             "artifact_path": artifact_path.relative_to(
@@ -1767,6 +1901,8 @@ def write_four_region_failure_attempt(
 
 def _input_state(
     inputs: FourRegionInputs | None,
+    *,
+    plan_spec: FourRegionPlanSpec,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if inputs is None:
         return [], {
@@ -1776,7 +1912,7 @@ def _input_state(
             "unique_suppliers": 0,
             "missing_supplier_products": None,
             "duplicate_product_positions": 0,
-            "max_position_capacity": MAX_POSITIONS,
+            "max_position_capacity": plan_spec.max_positions,
         }
     return (
         [
@@ -1785,7 +1921,7 @@ def _input_state(
                 "status": "success",
                 **inputs.region_counts[region_id],
             }
-            for region_id in FOUR_REGION_IDS
+            for region_id in plan_spec.region_ids
         ],
         {
             "pages": sum(
@@ -1799,7 +1935,7 @@ def _input_state(
             "duplicate_product_positions": (
                 inputs.duplicate_product_positions
             ),
-            "max_position_capacity": MAX_POSITIONS,
+            "max_position_capacity": plan_spec.max_positions,
         },
     )
 
@@ -1886,12 +2022,14 @@ def _run_locked_four_region_downstream(
     warehouse_ingest: Callable[..., dict[str, Any]],
     input_integrity_gate: Callable[[], None],
 ) -> dict[str, Any]:
+    plan_spec = validate_four_region_bundle(bundle)
     stage = "state_transition"
     try:
         input_integrity_gate()
         candidate_lineage = _collection_lineage(
             config=config,
             bundle=bundle,
+            plan_spec=plan_spec,
             paths=paths,
             run_id=run_id,
         )
@@ -1900,6 +2038,7 @@ def _run_locked_four_region_downstream(
             latest_path=latest_path,
             run_id=run_id,
             project_root=config.project_root,
+            plan_spec=plan_spec,
             candidate_lineage=candidate_lineage,
             integrity_gate=input_integrity_gate,
         )
@@ -1910,6 +2049,7 @@ def _run_locked_four_region_downstream(
             error=exc,
             stage=stage,
             lock_ownership="acquired",
+            plan_spec=plan_spec,
         )
         raise
 
@@ -1946,6 +2086,7 @@ def _run_locked_four_region_downstream(
                 error=exc,
                 stage=stage,
                 lock_ownership="acquired",
+                plan_spec=plan_spec,
             )
             raise
         finally:
@@ -1975,18 +2116,18 @@ def _run_locked_four_region_downstream(
             input_products_path=inputs.seller_input_path,
             raw_dir=config.project_root
             / "data/raw/sellers_scoped"
-            / FOUR_REGION_PLAN_ID
+            / plan_spec.collection_plan_id
             / run_id,
             staging_dir=config.project_root
             / "data/staging/sellers_scoped"
-            / FOUR_REGION_PLAN_ID
+            / plan_spec.collection_plan_id
             / run_id,
             mart_dir=config.project_root
             / "data/marts/sellers_scoped"
-            / FOUR_REGION_PLAN_ID
+            / plan_spec.collection_plan_id
             / run_id,
             checkpoint_component=(
-                f"sellers_regional:{FOUR_REGION_PLAN_ID}"
+                f"sellers_regional:{plan_spec.collection_plan_id}"
             ),
             request_timeout_provider=deadline.request_timeout,
         )
@@ -2028,7 +2169,7 @@ def _run_locked_four_region_downstream(
         warehouse_result = warehouse_ingest(
             project_root=config.project_root,
             run_id=run_id,
-            collection_plan_id=FOUR_REGION_PLAN_ID,
+            collection_plan_id=plan_spec.collection_plan_id,
             bridge_path=inputs.bridge_path,
             sellers_path=Path(
                 str(sellers_result["mart_sellers_path"])
@@ -2049,7 +2190,7 @@ def _run_locked_four_region_downstream(
         state = {
             "schema_version": DOWNSTREAM_SCHEMA,
             "run_id": run_id,
-            "collection_plan_id": FOUR_REGION_PLAN_ID,
+            "collection_plan_id": plan_spec.collection_plan_id,
             "status": "success",
             "complete": True,
             "stage": "complete",
@@ -2063,7 +2204,7 @@ def _run_locked_four_region_downstream(
                     "region_id": region_id,
                     **inputs.region_counts[region_id],
                 }
-                for region_id in FOUR_REGION_IDS
+                for region_id in plan_spec.region_ids
             ],
             "totals": {
                 "pages": sum(
@@ -2079,7 +2220,7 @@ def _run_locked_four_region_downstream(
                 "duplicate_product_positions": (
                     inputs.duplicate_product_positions
                 ),
-                "max_position_capacity": MAX_POSITIONS,
+                "max_position_capacity": plan_spec.max_positions,
             },
             "sellers": {
                 "status": "success",
@@ -2139,11 +2280,14 @@ def _run_locked_four_region_downstream(
         return state
     except Exception as exc:
         if not lease.state_written:
-            regions, totals = _input_state(inputs)
+            regions, totals = _input_state(
+                inputs,
+                plan_spec=plan_spec,
+            )
             failure = {
                 "schema_version": DOWNSTREAM_SCHEMA,
                 "run_id": run_id,
-                "collection_plan_id": FOUR_REGION_PLAN_ID,
+                "collection_plan_id": plan_spec.collection_plan_id,
                 "status": "failed",
                 "complete": False,
                 "stage": stage,
@@ -2179,6 +2323,7 @@ def _run_locked_four_region_downstream(
             error=exc,
             stage=stage,
             lock_ownership="acquired",
+            plan_spec=plan_spec,
         )
         raise
     finally:
@@ -2198,29 +2343,30 @@ def run_four_region_downstream(
     input_integrity_gate: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     integrity_gate = input_integrity_gate or (lambda: None)
-    paths = ScopedPaths.build(
-        project_root=config.project_root,
-        collection_plan_id=FOUR_REGION_PLAN_ID,
-        run_id=run_id,
-    )
-    state_dir = (
-        config.project_root
-        / "state/wb_four_region_nightly"
-        / FOUR_REGION_PLAN_ID
-        / run_id
-    )
-    state_path = state_dir / "state.json"
-    latest_path = state_dir.parent / "latest.json"
     execution_contract = DownstreamExecutionContract.pre_cutover()
     stage = "preflight"
     locks_owned = False
+    plan_spec: FourRegionPlanSpec | None = None
     try:
         bundle = load_collection_plan_bundle(
             project_root=config.project_root,
             plan_path=plan_path,
             region_registry_path=config.project_root / "config/wb/regions.json",
         )
-        validate_four_region_bundle(bundle)
+        plan_spec = validate_four_region_bundle(bundle)
+        paths = ScopedPaths.build(
+            project_root=config.project_root,
+            collection_plan_id=plan_spec.collection_plan_id,
+            run_id=run_id,
+        )
+        state_dir = (
+            config.project_root
+            / "state/wb_four_region_nightly"
+            / plan_spec.collection_plan_id
+            / run_id
+        )
+        state_path = state_dir / "state.json"
+        latest_path = state_dir.parent / "latest.json"
         runtime_window = bundle.collection_plan.runtime_window
         if runtime_window is None:
             raise CriticalPipelineError(
@@ -2266,5 +2412,6 @@ def run_four_region_downstream(
                 error=exc,
                 stage=stage,
                 lock_ownership="not_acquired",
+                plan_spec=plan_spec,
             )
         raise

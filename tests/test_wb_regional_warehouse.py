@@ -273,6 +273,13 @@ def test_regional_warehouse_is_idempotent_and_assigns_legacy_to_yaroslavl(
             "SELECT region_id, region_provenance, count(*) "
             "FROM regional_query_positions GROUP BY ALL ORDER BY region_id"
         ).fetchall()
+        region_contract = database.execute(
+            """
+            SELECT marketplace, region_id, region_name, displayed_region
+            FROM regional_query_positions
+            ORDER BY region_id
+            """
+        ).fetchall()
         legacy_fields = database.execute(
             """
             SELECT imt_id, brand_id, supplier_name, final_price, price,
@@ -316,6 +323,10 @@ def test_regional_warehouse_is_idempotent_and_assigns_legacy_to_yaroslavl(
         ("moscow", "scoped_collection_plan", 1),
         ("yaroslavl", "legacy_global_assigned_yaroslavl", 1),
     ]
+    assert region_contract == [
+        ("wb", "moscow", "Москва", "Москва"),
+        ("wb", "yaroslavl", "Ярославль", "Ярославль"),
+    ]
     assert legacy_fields == (
         "8001",
         "6001",
@@ -330,6 +341,8 @@ def test_regional_warehouse_is_idempotent_and_assigns_legacy_to_yaroslavl(
     assert quality_counts == (2, 1)
     assert legacy_quality == (600.0, 77, 1, 1, 1, 1, 1, 1)
     assert {
+        "marketplace",
+        "displayed_region",
         "collected_at_utc",
         "imt_id",
         "brand_id",
@@ -351,6 +364,59 @@ def test_regional_warehouse_is_idempotent_and_assigns_legacy_to_yaroslavl(
         "endpoint_usage_json",
         "source_manifest_sha256",
     }.issubset(run_quality_columns)
+
+
+def test_same_pack_query_region_date_generation_is_rejected(
+    tmp_path: Path,
+) -> None:
+    bridge_path, sellers_path = _sources(tmp_path)
+    first = ingest_regional_run(
+        project_root=tmp_path,
+        run_id="20260726_001600Z",
+        collection_plan_id="shevron-four-regions-top1000-v2",
+        bridge_path=bridge_path,
+        sellers_path=sellers_path,
+    )
+    assert first["status"] == "success"
+
+    second_run = "20260726_021600Z"
+    rows = list(
+        csv.DictReader(
+            bridge_path.open("r", encoding="utf-8-sig", newline=""),
+            delimiter=";",
+        )
+    )
+    rows[0]["run_id"] = second_run
+    write_csv_rows(bridge_path, rows, BRIDGE_FIELDS)
+    manifest_path = bridge_path.parent / "collection_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["run_id"] = second_run
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="regional query generation already exists for date",
+    ):
+        ingest_regional_run(
+            project_root=tmp_path,
+            run_id=second_run,
+            collection_plan_id="shevron-four-regions-top1000-v2",
+            bridge_path=bridge_path,
+            sellers_path=sellers_path,
+        )
+    database = duckdb.connect(first["database_path"], read_only=True)
+    try:
+        assert database.execute(
+            "SELECT count(*) FROM regional_query_positions"
+        ).fetchone()[0] == 1
+        assert database.execute(
+            "SELECT count(*) FROM regional_query_generations"
+        ).fetchone()[0] == 1
+    finally:
+        database.close()
 
 
 def test_regional_warehouse_rechecks_integrity_inside_transaction(

@@ -17,7 +17,7 @@ import duckdb
 from app.common.exceptions import CriticalPipelineError
 
 
-REGIONAL_WAREHOUSE_SCHEMA = "wb_regional_warehouse_v2"
+REGIONAL_WAREHOUSE_SCHEMA = "wb_regional_warehouse_v3"
 LEGACY_REGION_ID = "yaroslavl"
 LEGACY_REGION_NAME = "Ярославль"
 LEGACY_REGION_PROVENANCE = "legacy_global_assigned_yaroslavl"
@@ -166,11 +166,13 @@ def _create_schema(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS regional_query_positions (
+            marketplace VARCHAR NOT NULL,
             run_id VARCHAR NOT NULL,
             run_date VARCHAR NOT NULL,
             collected_at_utc VARCHAR,
             region_id VARCHAR NOT NULL,
             region_name VARCHAR NOT NULL,
+            displayed_region VARCHAR NOT NULL,
             region_provenance VARCHAR NOT NULL,
             collection_plan_id VARCHAR NOT NULL,
             query_pack_id VARCHAR NOT NULL,
@@ -201,6 +203,29 @@ def _create_schema(connection: duckdb.DuckDBPyConnection) -> None:
             source_sha256 VARCHAR NOT NULL,
             source_row_sha256 VARCHAR NOT NULL,
             PRIMARY KEY (run_id, region_id, query_id, absolute_position)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS regional_query_generations (
+            marketplace VARCHAR NOT NULL,
+            run_date VARCHAR NOT NULL,
+            query_pack_id VARCHAR NOT NULL,
+            query_pack_version VARCHAR NOT NULL,
+            region_id VARCHAR NOT NULL,
+            query_id VARCHAR NOT NULL,
+            run_id VARCHAR NOT NULL,
+            collection_plan_id VARCHAR NOT NULL,
+            source_manifest_sha256 VARCHAR NOT NULL,
+            PRIMARY KEY (
+                marketplace,
+                run_date,
+                query_pack_id,
+                query_pack_version,
+                region_id,
+                query_id
+            )
         )
         """
     )
@@ -471,9 +496,14 @@ def _legacy_source_tables(connection: duckdb.DuckDBPyConnection) -> None:
                 absolute_position := absolute_position
             ))) AS source_key_sha256,
             sha256(to_json(struct_pack(
+                marketplace := 'wb',
                 run_id := run_id,
                 run_date := run_date,
                 collected_at_utc := collected_at_utc,
+                region_id := 'yaroslavl',
+                region_name := 'Ярославль',
+                displayed_region := 'Ярославль',
+                region_provenance := 'legacy_global_assigned_yaroslavl',
                 query := query,
                 page := page,
                 position_on_page := position_on_page,
@@ -843,9 +873,11 @@ def migrate_legacy_yaroslavl(
                 """
                 INSERT INTO regional_query_positions
                 SELECT
+                    'wb',
                     source.run_id,
                     source.run_date,
                     source.collected_at_utc,
+                    ?,
                     ?,
                     ?,
                     ?,
@@ -888,6 +920,7 @@ def migrate_legacy_yaroslavl(
                 """,
                 [
                     LEGACY_REGION_ID,
+                    LEGACY_REGION_NAME,
                     LEGACY_REGION_NAME,
                     LEGACY_REGION_PROVENANCE,
                     LEGACY_REGION_ID,
@@ -1179,17 +1212,20 @@ def ingest_regional_run(
                 ).hexdigest()
                 connection.execute(
                     """
-                    INSERT INTO regional_query_positions VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        INSERT INTO regional_query_positions VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     [
+                        "wb",
                         run_id,
                         _run_date(run_id),
                         row.get("collected_at_utc", ""),
                         region_id,
                         row.get("region_name", ""),
+                        row.get("displayed_region")
+                        or row.get("region_name", ""),
                         COLLECTED_REGION_PROVENANCE,
                         collection_plan_id,
                         row.get("query_pack_id", ""),
@@ -1332,6 +1368,44 @@ def ingest_regional_run(
                 raise CriticalPipelineError(
                     "regional query quality evidence is incomplete"
                 )
+            query_pack_id = str(
+                collection_manifest.get("query_pack_id", "")
+            )
+            query_pack_version = str(
+                collection_manifest.get("query_pack_version", "")
+            )
+            if not query_pack_id or not query_pack_version:
+                raise CriticalPipelineError(
+                    "regional query pack identity is incomplete"
+                )
+            generation_scopes = {
+                (row["region_id"], row["query_id"])
+                for row in query_quality_rows
+            }
+            for region_id, query_id in sorted(generation_scopes):
+                prior_generation = connection.execute(
+                    """
+                    SELECT run_id
+                    FROM regional_query_generations
+                    WHERE marketplace = 'wb'
+                      AND run_date = ?
+                      AND query_pack_id = ?
+                      AND query_pack_version = ?
+                      AND region_id = ?
+                      AND query_id = ?
+                    """,
+                    [
+                        _run_date(run_id),
+                        query_pack_id,
+                        query_pack_version,
+                        region_id,
+                        query_id,
+                    ],
+                ).fetchone()
+                if prior_generation is not None:
+                    raise CriticalPipelineError(
+                        "regional query generation already exists for date"
+                    )
             for row in query_quality_rows:
                 scope = (row["region_id"], row["query_id"])
                 scope_positions = positions_by_scope.get(scope, [])
@@ -1426,6 +1500,24 @@ def ingest_regional_run(
                             for field in REGIONAL_RUN_QUALITY_HASH_FIELDS
                         ],
                         source_row_sha256,
+                    ],
+                )
+            for region_id, query_id in sorted(generation_scopes):
+                connection.execute(
+                    """
+                    INSERT INTO regional_query_generations VALUES (
+                        'wb', ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    [
+                        _run_date(run_id),
+                        query_pack_id,
+                        query_pack_version,
+                        region_id,
+                        query_id,
+                        run_id,
+                        collection_plan_id,
+                        collection_manifest_sha256,
                     ],
                 )
             for row in query_quality_rows:

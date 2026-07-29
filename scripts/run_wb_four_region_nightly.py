@@ -7,7 +7,7 @@ import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -25,10 +25,15 @@ from app.common.nightly_coordinator import (
 )
 from app.common.nightly_attestation import integrity_gate
 from app.serp.collection_plan import CollectionPlanValidationError
+from app.serp.collection_plan import load_collection_plan_bundle
 from app.serp.collection_plan_runner import (
     CollectionPlanRunError,
     run_collection_plan,
     validate_resumable_collection_state,
+)
+from app.serp.execution_matrix_runner import (
+    ExecutionMatrixRunError,
+    run_execution_matrix,
 )
 from app.serp.four_region_nightly import (
     FOUR_REGION_PLAN_ID,
@@ -43,7 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run the isolated four-region WB pipeline"
     )
     parser.add_argument("--config", default="config/config.yaml")
-    parser.add_argument("--plan-file", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--plan-file")
+    source.add_argument("--matrix-file")
     parser.add_argument("--no-publish", action="store_true", required=True)
     parser.add_argument("--resume-run-id")
     parser.add_argument("--downstream-only-run-id")
@@ -124,12 +131,13 @@ def _read_json(path: Path) -> Mapping[str, Any] | None:
 
 def _completed_collection_manifest(
     project_root: Path,
+    collection_plan_id: str,
     run_id: str,
 ) -> Mapping[str, Any] | None:
     path = (
         project_root
         / "state/wb_collection_plans"
-        / FOUR_REGION_PLAN_ID
+        / collection_plan_id
         / run_id
         / "manifest.json"
     )
@@ -138,7 +146,7 @@ def _completed_collection_manifest(
         manifest is None
         or manifest.get("schema_version") != "wb_collection_plan_manifest_v2"
         or manifest.get("run_id") != run_id
-        or manifest.get("collection_plan_id") != FOUR_REGION_PLAN_ID
+        or manifest.get("collection_plan_id") != collection_plan_id
         or manifest.get("status") != "success"
         or manifest.get("complete") is not True
     ):
@@ -156,6 +164,69 @@ def _completed_collection_manifest(
     ):
         return None
     return manifest
+
+
+def execute_four_region_plan(
+    *,
+    config: Any,
+    plan_path: Path,
+    run_id: str,
+    resume: bool,
+    downstream_only: bool,
+    absolute_deadline_utc: datetime | None,
+    input_integrity_gate: Any,
+    on_downstream_start: Callable[[], None] = lambda: None,
+    matrix_continuation: bool = False,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    bundle = load_collection_plan_bundle(
+        project_root=config.project_root,
+        plan_path=plan_path,
+        region_registry_path=config.project_root / "config/wb/regions.json",
+    )
+    collection_plan_id = bundle.collection_plan.collection_plan_id
+    completed_manifest = (
+        _completed_collection_manifest(
+            config.project_root,
+            collection_plan_id,
+            run_id,
+        )
+        if resume or downstream_only
+        else None
+    )
+    if downstream_only or completed_manifest is not None:
+        manifest: Mapping[str, Any] = {
+            "run_id": run_id,
+            "status": "previously_completed",
+            "complete": True,
+        }
+    else:
+        manifest = run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            run_id=None if resume else run_id,
+            resume_run_id=run_id if resume else None,
+            absolute_deadline_utc=absolute_deadline_utc,
+            input_integrity_gate=input_integrity_gate,
+            matrix_continuation=matrix_continuation,
+        )
+        if (
+            manifest.get("status") != "success"
+            or manifest.get("complete") is not True
+        ):
+            raise CriticalPipelineError(
+                "four-region collection is incomplete; downstream blocked"
+            )
+    on_downstream_start()
+    downstream = run_four_region_downstream(
+        config=config,
+        plan_path=plan_path,
+        run_id=str(manifest["run_id"]),
+        execution_mode=PRE_CUTOVER_DOWNSTREAM_MODE,
+        absolute_deadline_utc=absolute_deadline_utc,
+        input_integrity_gate=input_integrity_gate,
+    )
+    return manifest, downstream
 
 
 def _is_deferred_error(exc: BaseException) -> bool:
@@ -191,6 +262,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if args.matrix_file and args.downstream_only_run_id:
+        print(
+            "--downstream-only-run-id is not supported with --matrix-file",
+            file=sys.stderr,
+        )
+        return 2
     now = datetime.now(UTC)
     run_id = (
         args.downstream_only_run_id
@@ -198,7 +275,9 @@ def main() -> int:
         or now.strftime("%Y%m%d_%H%M%SZ")
     )
     config = None
-    downstream_started = False
+    stage_marker = {"downstream_started": False}
+    collection_plan_id = FOUR_REGION_PLAN_ID
+    plan_path: Path | None = None
     try:
         require_official_live_entry_lease(environment=os.environ)
         verify_inputs = integrity_gate(PROJECT_ROOT)
@@ -206,64 +285,100 @@ def main() -> int:
         if not args.downstream_only_run_id and not args.resume_run_id:
             run_id = _adapter_run_ref(now)
         config = load_config(args.config)
-        plan_path = Path(args.plan_file)
-        if not plan_path.is_absolute():
-            plan_path = config.project_root / plan_path
-        completed_manifest = (
-            _completed_collection_manifest(config.project_root, run_id)
-            if args.resume_run_id or args.downstream_only_run_id
-            else None
-        )
-        if args.downstream_only_run_id or completed_manifest is not None:
-            manifest = {
-                "run_id": run_id,
-                "status": "previously_completed",
-                "complete": True,
-            }
-        else:
-            manifest = run_collection_plan(
+        if args.matrix_file:
+            matrix_path = Path(args.matrix_file)
+            if not matrix_path.is_absolute():
+                matrix_path = config.project_root / matrix_path
+
+            def execute_entry(
+                entry: Any,
+                plan_run_id: str,
+                resume: bool,
+                matrix_deadline_utc: datetime,
+            ) -> None:
+                execute_four_region_plan(
+                    config=config,
+                    plan_path=config.project_root / entry.plan_file,
+                    run_id=plan_run_id,
+                    resume=resume,
+                    downstream_only=False,
+                    absolute_deadline_utc=matrix_deadline_utc,
+                    input_integrity_gate=verify_inputs,
+                    matrix_continuation=not resume,
+                )
+
+            matrix_state = run_execution_matrix(
                 config=config,
-                plan_path=plan_path,
-                no_publish=args.no_publish,
-                run_id=None if args.resume_run_id else run_id,
-                resume_run_id=args.resume_run_id,
+                matrix_path=matrix_path,
+                matrix_run_id=run_id,
+                resume=bool(args.resume_run_id),
+                execute_entry=execute_entry,
                 absolute_deadline_utc=absolute_deadline_utc,
                 input_integrity_gate=verify_inputs,
             )
-            if manifest.get("status") != "success" or manifest.get("complete") is not True:
-                raise CriticalPipelineError(
-                    "four-region collection is incomplete; downstream blocked"
-                )
-        downstream_started = True
-        downstream = run_four_region_downstream(
-            config=config,
-            plan_path=plan_path,
-            run_id=str(manifest["run_id"]),
-            execution_mode=PRE_CUTOVER_DOWNSTREAM_MODE,
-            absolute_deadline_utc=absolute_deadline_utc,
-            input_integrity_gate=verify_inputs,
-        )
+            manifest = {
+                "run_id": run_id,
+                "status": matrix_state["status"],
+                "complete": matrix_state["complete"],
+            }
+            downstream = {
+                "status": matrix_state["status"],
+                "complete": matrix_state["complete"],
+            }
+        else:
+            plan_path = Path(str(args.plan_file))
+            if not plan_path.is_absolute():
+                plan_path = config.project_root / plan_path
+            manifest, downstream = execute_four_region_plan(
+                config=config,
+                plan_path=plan_path,
+                run_id=run_id,
+                resume=bool(args.resume_run_id),
+                downstream_only=bool(args.downstream_only_run_id),
+                absolute_deadline_utc=absolute_deadline_utc,
+                input_integrity_gate=verify_inputs,
+                on_downstream_start=lambda: stage_marker.__setitem__(
+                    "downstream_started",
+                    True,
+                ),
+            )
     except (
         CriticalPipelineError,
         CollectionPlanValidationError,
         FileNotFoundError,
         CollectionPlanRunError,
+        ExecutionMatrixRunError,
     ) as exc:
-        if config is not None and not downstream_started:
+        if (
+            config is not None
+            and plan_path is not None
+            and not stage_marker["downstream_started"]
+        ):
             write_four_region_failure_attempt(
                 config=config,
                 run_id=run_id,
                 error=exc,
             )
-        resumable = config is not None and (
-            validate_resumable_collection_state(
-                config=config,
-                plan_path=plan_path,
-                run_id=run_id,
-            )
-            or _completed_collection_manifest(config.project_root, run_id)
-            is not None
+        resumable = bool(
+            isinstance(exc, ExecutionMatrixRunError) and exc.resumable
         )
+        if config is not None and plan_path is not None:
+            resumable = resumable or (
+                validate_resumable_collection_state(
+                    config=config,
+                    plan_path=plan_path,
+                    run_id=run_id,
+                )
+                or (
+                    bool(collection_plan_id)
+                    and _completed_collection_manifest(
+                        config.project_root,
+                        collection_plan_id,
+                        run_id,
+                    )
+                    is not None
+                )
+            )
         if isinstance(exc, RunLockedError) or str(getattr(exc, "code", "")) in {
             "shared_marketplace_guard_busy",
             "shared_marketplace_validation_busy",

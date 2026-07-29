@@ -1364,6 +1364,7 @@ def _egress_hash(value: str, *, salt: bytes) -> str:
 
 
 PRODUCT_FIELDS = (
+    "marketplace",
     "run_id",
     "collected_at_utc",
     "status",
@@ -1377,6 +1378,7 @@ PRODUCT_FIELDS = (
     "query_group",
     "region_id",
     "region_name",
+    "displayed_region",
     "dest_id_observed",
     "dest_resolved_at_utc",
     "dest_resolution_source",
@@ -1405,6 +1407,7 @@ PRODUCT_FIELDS = (
 )
 
 PAGE_FIELDS = (
+    "marketplace",
     "run_id",
     "collection_scope",
     "collection_plan_id",
@@ -1416,6 +1419,7 @@ PAGE_FIELDS = (
     "query_group",
     "region_id",
     "region_name",
+    "displayed_region",
     "dest_id_observed",
     "dest_resolved_at_utc",
     "dest_resolution_source",
@@ -1550,6 +1554,7 @@ class CollectionPlanRunner:
         sleeper: Callable[[float], None] = time_module.sleep,
         absolute_deadline_utc: datetime | None = None,
         input_integrity_gate: Callable[[], None] | None = None,
+        matrix_continuation: bool = False,
     ) -> None:
         self.config = config
         self.plan_path = plan_path
@@ -1562,6 +1567,15 @@ class CollectionPlanRunner:
                 "run_id and resume_run_id are mutually exclusive"
             )
         self.resume = resume_run_id is not None
+        if matrix_continuation and (
+            self.resume
+            or run_id is None
+            or absolute_deadline_utc is None
+        ):
+            raise CollectionPlanRunError(
+                "matrix continuation contract is invalid"
+            )
+        self.matrix_continuation = matrix_continuation
         self.run_id = _safe_run_id(
             resume_run_id or run_id or _default_run_id(started)
         )
@@ -1579,7 +1593,7 @@ class CollectionPlanRunner:
         if window is not None:
             self.deadline = DeadlineGuard.for_runtime_window(
                 window,
-                resume=self.resume,
+                resume=self.resume or self.matrix_continuation,
                 now=self.now,
                 absolute_deadline_utc=self.absolute_deadline_utc,
             )
@@ -2135,6 +2149,7 @@ class CollectionPlanRunner:
             final_price, price, sale_price = _product_prices(product)
             rows.append(
                 {
+                    "marketplace": "wb",
                     "run_id": self.run_id,
                     "collected_at_utc": collected_at_utc,
                     "status": "success",
@@ -2148,6 +2163,7 @@ class CollectionPlanRunner:
                     "query_group": task.query_group,
                     "region_id": task.region_id,
                     "region_name": task.region_name,
+                    "displayed_region": task.region_name,
                     "dest_id_observed": resolution.dest_id_observed,
                     "dest_resolved_at_utc": resolution.dest_resolved_at_utc,
                     "dest_resolution_source": resolution.dest_resolution_source,
@@ -4577,6 +4593,7 @@ def run_collection_plan(
     sleeper: Callable[[float], None] = time_module.sleep,
     absolute_deadline_utc: datetime | None = None,
     input_integrity_gate: Callable[[], None] | None = None,
+    matrix_continuation: bool = False,
 ) -> dict[str, Any]:
     owned_transport = False
     active_transport = transport
@@ -4607,6 +4624,7 @@ def run_collection_plan(
             sleeper=sleeper,
             absolute_deadline_utc=absolute_deadline_utc,
             input_integrity_gate=input_integrity_gate,
+            matrix_continuation=matrix_continuation,
         ).run()
     finally:
         if owned_transport:
