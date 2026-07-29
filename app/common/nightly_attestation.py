@@ -148,6 +148,9 @@ def expected_manifest_files(project_root: Path) -> tuple[str, ...]:
         Path(
             "config/wb/query_packs/shevron-core/2026-07-26.1.json"
         ),
+        Path(
+            "config/wb/execution_matrices/four-region-nightly-v1.json"
+        ),
     }
     candidates.update(
         path.relative_to(root)

@@ -166,6 +166,18 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   Ozon, cron, proxy, cookies, `runtime.env`, request headers, parser `latest`,
   or raw/staging/marts retention. Warehouse failure is non-fatal for parser
   publication and must be reported separately as `warehouse_failed`.
+- The four-region nightly configuration uses the versioned execution matrix
+  `config/wb/execution_matrices/four-region-nightly-v1.json`. Its activation
+  flag is independent from plan/region flags. Matrix entries bind an exact
+  query-pack ID/version to an exact plan; duplicate pack versions, plans or
+  execution IDs fail closed. Keep the matrix disabled until the joint
+  coordinator cutover gate.
+- Regional WB position facts use `marketplace=wb` and preserve
+  query-pack/version, query group, query, run/date, region ID/name,
+  displayed-region label and absolute position. Historical global WB facts are
+  assigned only to legacy region ID `yaroslavl`; raw history is not rewritten.
+  A verified regional daily query generation is unique by marketplace/date/
+  pack/version/region/query.
 - Use the centralized runtime `/home/Codex/agent-tools/parser_wb-python`.
 - Agents must not install tools or dependencies themselves. If a dependency is
   missing, report the requirement for centralized installation.

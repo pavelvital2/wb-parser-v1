@@ -1364,6 +1364,7 @@ def _egress_hash(value: str, *, salt: bytes) -> str:
 
 
 PRODUCT_FIELDS = (
+    "marketplace",
     "run_id",
     "collected_at_utc",
     "status",
@@ -1377,6 +1378,7 @@ PRODUCT_FIELDS = (
     "query_group",
     "region_id",
     "region_name",
+    "displayed_region",
     "dest_id_observed",
     "dest_resolved_at_utc",
     "dest_resolution_source",
@@ -1405,6 +1407,7 @@ PRODUCT_FIELDS = (
 )
 
 PAGE_FIELDS = (
+    "marketplace",
     "run_id",
     "collection_scope",
     "collection_plan_id",
@@ -1416,6 +1419,7 @@ PAGE_FIELDS = (
     "query_group",
     "region_id",
     "region_name",
+    "displayed_region",
     "dest_id_observed",
     "dest_resolved_at_utc",
     "dest_resolution_source",
@@ -2135,6 +2139,7 @@ class CollectionPlanRunner:
             final_price, price, sale_price = _product_prices(product)
             rows.append(
                 {
+                    "marketplace": "wb",
                     "run_id": self.run_id,
                     "collected_at_utc": collected_at_utc,
                     "status": "success",
@@ -2148,6 +2153,7 @@ class CollectionPlanRunner:
                     "query_group": task.query_group,
                     "region_id": task.region_id,
                     "region_name": task.region_name,
+                    "displayed_region": task.region_name,
                     "dest_id_observed": resolution.dest_id_observed,
                     "dest_resolved_at_utc": resolution.dest_resolved_at_utc,
                     "dest_resolution_source": resolution.dest_resolution_source,

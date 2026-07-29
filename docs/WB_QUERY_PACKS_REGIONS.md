@@ -27,7 +27,14 @@ collection.
 config/wb/query_packs/{query_pack_id}/{version}.json
 config/wb/regions.json
 config/wb/collection_plans/{collection_plan_id}.json
+config/wb/execution_matrices/{execution_matrix_id}.json
 ```
+
+`four-region-nightly-v1.json` is the production scheduling projection. It can
+list multiple enabled, reviewed query-pack/plan pairs without parser code
+changes, but has its own top-level activation flag. It remains disabled until
+the joint coordinator cutover; its only current enabled entry is
+`shevron-core@2026-07-26.1`.
 
 The first pack,
 `config/wb/query_packs/shevron-core/2026-07-26.1.json`, is a versioned copy of
