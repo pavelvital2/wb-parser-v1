@@ -433,7 +433,7 @@ def _validate_sources() -> list[dict[str, str]]:
         != "wb_query_pack_execution_matrix_v1"
         or matrix.get("execution_matrix_id")
         != "four-region-nightly-v1"
-        or matrix.get("enabled") is not False
+        or matrix.get("enabled") is not True
         or matrix.get("entries")
         != [
             {
@@ -453,7 +453,7 @@ def _validate_sources() -> list[dict[str, str]]:
         plan.get("schema_version") != "wb_collection_plan_v2"
         or plan.get("collection_plan_id")
         != "shevron-four-regions-top1000-v2"
-        or plan.get("enabled") is not False
+        or plan.get("enabled") is not True
         or plan.get("query_pack_file")
         != "config/wb/query_packs/shevron-core/2026-07-26.1.json"
         or plan.get("region_set") != list(FOUR_REGIONS)
@@ -486,7 +486,7 @@ def _validate_sources() -> list[dict[str, str]]:
         if isinstance(item, dict)
     }
     if set(FOUR_REGIONS) - set(region_entries) or any(
-        region_entries[region_id].get("enabled") is not False
+        region_entries[region_id].get("enabled") is not True
         or region_entries[region_id].get("resolver") != "wb_geo_xinfo"
         for region_id in FOUR_REGIONS
     ):

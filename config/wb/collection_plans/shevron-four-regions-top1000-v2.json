@@ -1,7 +1,7 @@
 {
   "schema_version": "wb_collection_plan_v2",
   "collection_plan_id": "shevron-four-regions-top1000-v2",
-  "enabled": false,
+  "enabled": true,
   "query_pack_file": "config/wb/query_packs/shevron-core/2026-07-26.1.json",
   "query_ids": [
     "shevron-na-lipuchke",

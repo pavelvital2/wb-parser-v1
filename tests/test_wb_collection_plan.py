@@ -96,7 +96,7 @@ def _endpoint_policy() -> EffectiveEndpointPolicy:
     )
 
 
-def test_committed_stage1_bundle_is_valid_and_disabled() -> None:
+def test_committed_stage1_plan_is_disabled_with_active_shared_regions() -> None:
     bundle = _load_bundle(PROJECT_ROOT)
 
     assert bundle.query_pack.query_pack_id == "shevron-core"
@@ -121,7 +121,7 @@ def test_committed_stage1_bundle_is_valid_and_disabled() -> None:
         "novosibirsk",
         "kazan",
     ]
-    assert all(not region.enabled for region in bundle.region_registry.regions)
+    assert all(region.enabled for region in bundle.region_registry.regions)
     assert all(region.dest_id is None for region in bundle.region_registry.regions)
     assert all(
         region.dest_resolution_status == "unresolved"
@@ -454,6 +454,10 @@ def test_enabled_plan_rejects_disabled_region_reference(tmp_path: Path) -> None:
     plan = _read_json(plan_path)
     plan["enabled"] = True
     _write_json(plan_path, plan)
+    registry_path = root / REGIONS_RELATIVE
+    registry = _read_json(registry_path)
+    registry["regions"][0]["enabled"] = False
+    _write_json(registry_path, registry)
 
     with pytest.raises(CollectionPlanValidationError, match="disabled regions"):
         _load_bundle(root)

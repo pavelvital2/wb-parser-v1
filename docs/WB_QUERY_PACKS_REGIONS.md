@@ -1,7 +1,7 @@
 # WB query packs and regions
 
-Status: isolated regional SERP implementation; tracked plans and regions are
-disabled, and live execution requires a separate owner approval
+Status: owner-approved four-region production contour is enabled in tracked
+configuration; execution remains controlled by the coordinator and lock gates
 
 ## Scope
 
@@ -32,9 +32,8 @@ config/wb/execution_matrices/{execution_matrix_id}.json
 
 `four-region-nightly-v1.json` is the production scheduling projection. It can
 list multiple enabled, reviewed query-pack/plan pairs without parser code
-changes, but has its own top-level activation flag. It remains disabled until
-the joint coordinator cutover; its only current enabled entry is
-`shevron-core@2026-07-26.1`.
+changes and has its own top-level activation flag. Owner approval enables the
+matrix with exactly one current entry: `shevron-core@2026-07-26.1`.
 
 The production-shaped matrix command is:
 
@@ -74,10 +73,11 @@ The first pack,
 the normalized 30-query sequence in `exports/queries.txt`. The legacy TXT file
 remains the only input to the existing nightly SERP command.
 
-The Moscow and Rostov-on-Don registry entries use the coordinates recorded in
-the approved research document. Both entries are disabled. Their `dest_id` and
-resolution fields are null/unresolved because the observed WB destination
-values are dated evidence, not stable configuration.
+The four production registry entries use the coordinates recorded in the
+approved plan and are enabled for runtime resolution: Moscow, Rostov-on-Don,
+Novosibirsk and Kazan. Their tracked `dest_id` and resolution fields remain
+null/unresolved because observed WB destination values are runtime evidence,
+not stable configuration.
 
 The tracked plan is also disabled and fixes these non-runtime policies:
 
@@ -237,9 +237,9 @@ config/wb/collection_plans/shevron-moscow-rostov-top1000-v1.json
 ```
 
 It contains all 30 `shevron-core` queries in pack order, Moscow and
-Rostov-on-Don, depth 1000 (10 pages per query, 600 pages total). The tracked
-plan and both tracked regions remain disabled. Enabling or executing it needs
-separate owner authorization.
+Rostov-on-Don, depth 1000 (10 pages per query, 600 pages total). This legacy
+manual plan remains disabled; the shared Moscow and Rostov registry entries
+are enabled only as part of the approved four-region v2 contour.
 
 Deep runs use one immutable segment per `region_id + query_id`, at most 10
 pages. Every segment has an egress check before and after its search pages.
@@ -334,11 +334,13 @@ Loaders reject:
   resolved destinations;
 - malformed provenance and query-pack identity/hash mismatches.
 
-## Stop gate
+## Activation Gate
 
-The tracked plan and regions remain disabled. This implementation does not
-authorize a resolver/search run or guarded pilot. Scoped publication, warehouse
-migration, Parser Data API changes and scheduling remain unapproved.
+The production matrix, four-region v2 plan and exact four region entries are
+enabled by owner approval. Diagnostic pilot plans remain disabled. Execution
+still requires the reviewed coordinator command, proxy-only runtime,
+lock-v3/quarantine validation and deadline gates; this configuration change
+does not itself launch resolver/search traffic.
 
 ## Stage 3 guarded pilot
 
@@ -351,9 +353,11 @@ scripts/run_wb_guarded_regional_pilot.sh
 The launcher accepts no arguments, loads and hashes ignored
 `config/runtime.env` before Python/config loading, and executes the fixed
 `--no-publish --guarded-pilot` plan. It does not bypass plan or region
-validation. The tracked plan and both tracked regions remain `enabled=false`;
-a future live pilot requires a separate reviewed enable commit followed by a
-disable commit and explicit owner approval.
+validation. The tracked guarded-pilot plan remains `enabled=false`; its shared
+Moscow and Rostov registry entries are enabled only for the reviewed
+four-region v2 contour. A future guarded pilot still requires a separate
+reviewed plan-enable commit followed by a disable commit and explicit owner
+approval.
 
 While holding the existing daily, pipeline, warehouse-refresh and plan locks,
 the guarded runner performs this fixed sequence:
