@@ -6,11 +6,13 @@ The parser-owned adapter targets only the four-region WB pipeline:
 
 ```text
 scripts/run_wb_four_region_nightly.sh
-config/wb/collection_plans/shevron-four-regions-top1000-v2.json
+config/wb/execution_matrices/four-region-nightly-v1.json
 ```
 
 The Moscow/Rostov two-region plans are not coordinator fallbacks. The v2 plan
-and all four regions remain disabled until a separate reviewed cutover.
+and all four regions remain disabled until a separate reviewed cutover. The
+matrix is independently disabled and currently contains only the approved
+`shevron-core@2026-07-26.1` entry.
 
 The coordinator contract versions are:
 
@@ -29,7 +31,7 @@ before loading `config/runtime.env` or starting parser work:
    absolute deadline and exact result path;
 2. validate or acquire the host locks in fixed order `guard -> validation`;
 3. inspect the quarantine marker while both locks are held;
-4. validate the exact four-region command and reject other plans;
+4. validate the exact matrix command and reject unreviewed coordinator plans;
 5. verify the versioned input manifest, exact centralized Python
    binary/version/hash and the approved installed dependency tree;
 6. parse `config/runtime.env` in-process with the strict dotenv grammar, bind
@@ -60,6 +62,14 @@ than silently degrading to a no-op.
 The absolute coordinator deadline caps the existing plan deadline. It is
 passed to collection and downstream guards and never extends their local
 cutoffs.
+
+The matrix runner binds one coordinator `run_ref` to deterministic child plan
+run IDs. It executes enabled entries serially through the existing four-region
+pipeline, persists a durable checkpoint after each entry, validates regional
+warehouse generation keys, and skips completed entries on resume. It publishes
+the matrix-level latest pointer only after all enabled entries are complete.
+Adding another approved query pack is a versioned matrix/plan/query-pack config
+change; it does not require a coordinator command change.
 
 ## Terminal Result
 

@@ -43,6 +43,9 @@ SUPERVISOR = PROJECT_ROOT / "scripts/marketplace_lock_v3_supervisor.py"
 FOUR_REGION_PLAN = (
     "config/wb/collection_plans/shevron-four-regions-top1000-v2.json"
 )
+FOUR_REGION_MATRIX = (
+    "config/wb/execution_matrices/four-region-nightly-v1.json"
+)
 MAX_STATUS_BYTES = 64 * 1024
 OFFICIAL_PASSTHROUGH_TARGETS = frozenset(
     {
@@ -80,12 +83,20 @@ def _validate_four_region_command(
     *,
     invocation: CoordinatorInvocation | None,
 ) -> None:
-    base = ["--plan-file", FOUR_REGION_PLAN, "--no-publish"]
+    coordinator_base = [
+        "--matrix-file",
+        FOUR_REGION_MATRIX,
+        "--no-publish",
+    ]
     if invocation is not None:
         expected = (
-            base
+            coordinator_base
             if invocation.phase == "initial"
-            else [*base, "--resume-run-id", invocation.resume_ref]
+            else [
+                *coordinator_base,
+                "--resume-run-id",
+                invocation.resume_ref,
+            ]
         )
         if arguments != expected:
             raise NightlyCoordinatorContractError(
@@ -94,9 +105,12 @@ def _validate_four_region_command(
             )
         return
 
+    plan_base = ["--plan-file", FOUR_REGION_PLAN, "--no-publish"]
     supported_bases = (
-        base,
-        ["--config", "config/config.yaml", *base],
+        coordinator_base,
+        ["--config", "config/config.yaml", *coordinator_base],
+        plan_base,
+        ["--config", "config/config.yaml", *plan_base],
     )
     if any(arguments == candidate for candidate in supported_bases):
         return

@@ -53,6 +53,15 @@ validates every referenced plan and pack. For the first cutover the matrix
 itself remains disabled and contains only the enabled
 `shevron-core@2026-07-26.1` entry; activation is a separate joint gate.
 
+The matrix is an executable orchestration contract, not only a validator.
+`scripts/run_wb_four_region_nightly.sh --matrix-file ... --no-publish`
+executes enabled entries serially through the existing one-plan pipeline.
+Durable matrix state pins source hashes and child run IDs, resumes the current
+entry without repeating completed entries, and rejects duplicate
+`date + marketplace + pack/version + region + query` generations. The
+matrix-level latest pointer is published only after all enabled entries,
+sellers and regional warehouse stages succeed.
+
 ### Collection
 
 - New plan: `shevron-four-regions-top1000-v2`.

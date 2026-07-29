@@ -36,6 +36,39 @@ changes, but has its own top-level activation flag. It remains disabled until
 the joint coordinator cutover; its only current enabled entry is
 `shevron-core@2026-07-26.1`.
 
+The production-shaped matrix command is:
+
+```bash
+scripts/run_wb_four_region_nightly.sh \
+  --matrix-file config/wb/execution_matrices/four-region-nightly-v1.json \
+  --no-publish
+```
+
+The runner executes enabled entries sequentially through the same four-region
+collection, seller and warehouse pipeline used by the one-plan command. Matrix
+state is stored under
+`state/wb_execution_matrices/{execution_matrix_id}/runs/{matrix_run_id}`.
+Each entry pins exact matrix, plan, query-pack and region-registry hashes plus
+its child run ID. A checkpoint resume validates these bytes, skips completed
+entries and resumes only the current child run. The deduplication identity is
+`run_date + marketplace + query_pack_id/version + region_id + query_id` and is
+checked against the regional warehouse before collection.
+
+The matrix validates the reviewed new-run window once and gives every serial
+child the same bounded absolute deadline. A later pack may therefore begin
+after the one-plan start grace only as an explicit matrix continuation; it
+cannot extend the matrix cutoff. If the remaining window is insufficient, the
+pending entry is checkpointed only when its child state is resumable or proven
+pristine, and a later approved invocation continues without repeating prior
+entries.
+
+`state/wb_execution_matrices/{execution_matrix_id}/latest.json` is updated
+atomically only after every enabled entry has completed collection, sellers and
+regional warehouse ingestion. A partial, failed or interrupted matrix run
+leaves the previous matrix latest unchanged. The existing one-plan
+`--plan-file` command remains available for audited manual compatibility; the
+coordinator command uses `--matrix-file`.
+
 The first pack,
 `config/wb/query_packs/shevron-core/2026-07-26.1.json`, is a versioned copy of
 the normalized 30-query sequence in `exports/queries.txt`. The legacy TXT file
@@ -409,7 +442,7 @@ Depth is a maximum: v2 requires a consistent payload `total` and records
 1-10 pages per query. A terminal short page is valid only when it exactly
 completes `min(total, 1000)`; empty or inconsistent payloads fail closed.
 
-The only future full-pipeline launcher is:
+The compatible one-plan full-pipeline launcher is:
 
 ```bash
 scripts/run_wb_four_region_nightly.sh \
@@ -418,16 +451,18 @@ scripts/run_wb_four_region_nightly.sh \
   --no-publish
 ```
 
-This wrapper is also the fixed Parser Nightly Coordinator adapter target. Under
-the coordinator it accepts only this v2 plan, retains the inherited
+The wrapper remains the fixed Parser Nightly Coordinator adapter target. Under
+the coordinator it accepts only the reviewed execution matrix, retains the inherited
 `marketplace_collection_lock_v3` validation FD, honors the coordinator absolute
 deadline and emits `marketplace_parser_result_v3`. See
 `docs/WB_NIGHTLY_COORDINATOR_ADAPTER.md`. The older two-region plans are not a
 fallback.
 
-Resume requires the same command plus `--resume-run-id`. The launcher must not
+Matrix resume requires the matrix command plus `--resume-run-id`. One-plan
+resume remains compatible with the one-plan command. The launcher must not
 be scheduled or used live until the owner approves a controlled window and the
-plan plus exactly four regions are enabled in a reviewed change.
+matrix, referenced plans and exactly four regions are enabled in a reviewed
+change.
 
 If collection is already complete but downstream was stopped by its own
 runtime cutoff, use the same launcher with `--downstream-only-run-id`. It

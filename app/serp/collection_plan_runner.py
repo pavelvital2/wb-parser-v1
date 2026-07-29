@@ -1554,6 +1554,7 @@ class CollectionPlanRunner:
         sleeper: Callable[[float], None] = time_module.sleep,
         absolute_deadline_utc: datetime | None = None,
         input_integrity_gate: Callable[[], None] | None = None,
+        matrix_continuation: bool = False,
     ) -> None:
         self.config = config
         self.plan_path = plan_path
@@ -1566,6 +1567,15 @@ class CollectionPlanRunner:
                 "run_id and resume_run_id are mutually exclusive"
             )
         self.resume = resume_run_id is not None
+        if matrix_continuation and (
+            self.resume
+            or run_id is None
+            or absolute_deadline_utc is None
+        ):
+            raise CollectionPlanRunError(
+                "matrix continuation contract is invalid"
+            )
+        self.matrix_continuation = matrix_continuation
         self.run_id = _safe_run_id(
             resume_run_id or run_id or _default_run_id(started)
         )
@@ -1583,7 +1593,7 @@ class CollectionPlanRunner:
         if window is not None:
             self.deadline = DeadlineGuard.for_runtime_window(
                 window,
-                resume=self.resume,
+                resume=self.resume or self.matrix_continuation,
                 now=self.now,
                 absolute_deadline_utc=self.absolute_deadline_utc,
             )
@@ -4583,6 +4593,7 @@ def run_collection_plan(
     sleeper: Callable[[float], None] = time_module.sleep,
     absolute_deadline_utc: datetime | None = None,
     input_integrity_gate: Callable[[], None] | None = None,
+    matrix_continuation: bool = False,
 ) -> dict[str, Any]:
     owned_transport = False
     active_transport = transport
@@ -4613,6 +4624,7 @@ def run_collection_plan(
             sleeper=sleeper,
             absolute_deadline_utc=absolute_deadline_utc,
             input_integrity_gate=input_integrity_gate,
+            matrix_continuation=matrix_continuation,
         ).run()
     finally:
         if owned_transport:

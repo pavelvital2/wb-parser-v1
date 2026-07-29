@@ -1589,15 +1589,6 @@ def test_launcher_preserves_authoritative_downstream_failure_state(
         "load_config",
         lambda _path: SimpleNamespace(project_root=tmp_path),
     )
-    monkeypatch.setattr(
-        four_region_launcher,
-        "run_collection_plan",
-        lambda **_kwargs: {
-            "run_id": RUN_ID,
-            "status": "success",
-            "complete": True,
-        },
-    )
     state_path = (
         tmp_path
         / "state/wb_four_region_nightly"
@@ -1618,10 +1609,21 @@ def test_launcher_preserves_authoritative_downstream_failure_state(
         )
         raise CriticalPipelineError("sanitized downstream failure")
 
+    def failed_pipeline(**kwargs):
+        kwargs["on_downstream_start"]()
+        return (
+            {
+                "run_id": RUN_ID,
+                "status": "success",
+                "complete": True,
+            },
+            failed_downstream(),
+        )
+
     monkeypatch.setattr(
         four_region_launcher,
-        "run_four_region_downstream",
-        failed_downstream,
+        "execute_four_region_plan",
+        failed_pipeline,
     )
     monkeypatch.setattr(
         four_region_launcher,
@@ -1676,13 +1678,8 @@ def test_launcher_rejected_published_resume_preserves_state_and_latest(
 
     monkeypatch.setattr(
         four_region_launcher,
-        "run_collection_plan",
+        "execute_four_region_plan",
         rejected_resume,
-    )
-    monkeypatch.setattr(
-        four_region_launcher,
-        "run_four_region_downstream",
-        lambda **_kwargs: pytest.fail("downstream must remain blocked"),
     )
     monkeypatch.setattr(
         sys,

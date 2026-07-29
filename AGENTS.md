@@ -172,6 +172,13 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   query-pack ID/version to an exact plan; duplicate pack versions, plans or
   execution IDs fail closed. Keep the matrix disabled until the joint
   coordinator cutover gate.
+- The official four-region coordinator command uses that execution matrix,
+  not a hard-coded plan argument. Its durable state is under
+  `state/wb_execution_matrices/`; resume must skip completed entries and the
+  matrix latest pointer may advance only after all enabled entries complete.
+  Deduplication is by date, marketplace, pack/version, region and query ID.
+  The audited one-plan `--plan-file` mode remains available for manual
+  compatibility but is not the coordinator schedule projection.
 - Regional WB position facts use `marketplace=wb` and preserve
   query-pack/version, query group, query, run/date, region ID/name,
   displayed-region label and absolute position. Historical global WB facts are

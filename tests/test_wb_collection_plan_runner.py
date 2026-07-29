@@ -2019,6 +2019,63 @@ def test_deadline_bounds_request_timeout() -> None:
     assert 0 < guard.request_timeout(3_600) < 600
 
 
+def test_matrix_continuation_uses_shared_deadline_after_new_run_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, _pilot_plan = _project(tmp_path, monkeypatch)
+    plan_path = (
+        root
+        / "config/wb/collection_plans/"
+        "shevron-four-regions-top1000-v2.json"
+    )
+    plan = _read_json(plan_path)
+    plan["enabled"] = True
+    _write_json(plan_path, plan)
+    bundle = load_collection_plan_bundle(
+        project_root=root,
+        plan_path=plan_path,
+        region_registry_path=root / REGIONS_RELATIVE,
+    )
+    current = datetime(2026, 7, 26, 1, 0, tzinfo=timezone.utc)
+    absolute_deadline = current + timedelta(hours=2)
+    normal = CollectionPlanRunner(
+        config=config,
+        plan_path=plan_path,
+        transport=FakeTransport(),
+        no_publish=True,
+        run_id=RUN_ID,
+        now=lambda: current,
+        absolute_deadline_utc=absolute_deadline,
+    )
+    with pytest.raises(CollectionPlanRunError, match="start window"):
+        normal._configure_runtime_deadline(bundle)
+
+    continuation = CollectionPlanRunner(
+        config=config,
+        plan_path=plan_path,
+        transport=FakeTransport(),
+        no_publish=True,
+        run_id=RUN_ID,
+        now=lambda: current,
+        absolute_deadline_utc=absolute_deadline,
+        matrix_continuation=True,
+    )
+    continuation._configure_runtime_deadline(bundle)
+    assert continuation.deadline.deadline_utc == absolute_deadline
+
+    with pytest.raises(CollectionPlanRunError, match="continuation"):
+        CollectionPlanRunner(
+            config=config,
+            plan_path=plan_path,
+            transport=FakeTransport(),
+            no_publish=True,
+            run_id=RUN_ID,
+            now=lambda: current,
+            matrix_continuation=True,
+        )
+
+
 def test_final_manifest_write_is_rejected_inside_deadline_reserve(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -35,6 +35,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PLAN_ARGUMENT = (
     "config/wb/collection_plans/shevron-four-regions-top1000-v2.json"
 )
+MATRIX_ARGUMENT = (
+    "config/wb/execution_matrices/four-region-nightly-v1.json"
+)
+COORDINATOR_ARGUMENTS = [
+    "--matrix-file",
+    MATRIX_ARGUMENT,
+    "--no-publish",
+]
 RUN_REF = "20260727_001500Z"
 
 
@@ -223,8 +231,8 @@ def _command_digest(stage: str) -> str:
             checker.DEPLOYED_PROJECT_ROOT
             / "scripts/run_wb_four_region_nightly.sh"
         ),
-        "--plan-file",
-        PLAN_ARGUMENT,
+        "--matrix-file",
+        MATRIX_ARGUMENT,
         "--no-publish",
     ]
     if stage == "wb_resume":
@@ -877,15 +885,13 @@ def test_coordinator_command_must_match_exact_phase(
 ) -> None:
     initial = _invocation(tmp_path)
     adapter._validate_four_region_command(
-        ["--plan-file", PLAN_ARGUMENT, "--no-publish"],
+        COORDINATOR_ARGUMENTS,
         invocation=initial,
     )
     resume = _invocation(tmp_path, stage="wb_resume", resume_ref=RUN_REF)
     adapter._validate_four_region_command(
         [
-            "--plan-file",
-            PLAN_ARGUMENT,
-            "--no-publish",
+            *COORDINATOR_ARGUMENTS,
             "--resume-run-id",
             RUN_REF,
         ],
@@ -896,7 +902,7 @@ def test_coordinator_command_must_match_exact_phase(
         match="coordinator_command_invalid",
     ):
         adapter._validate_four_region_command(
-            ["--plan-file", PLAN_ARGUMENT, "--no-publish"],
+            COORDINATOR_ARGUMENTS,
             invocation=resume,
         )
 
@@ -1022,7 +1028,7 @@ def test_child_exit_must_match_status_before_result_commit(
     try:
         with pytest.raises(ExitCalled) as raised:
             adapter._run_four_region(
-                ["--plan-file", PLAN_ARGUMENT, "--no-publish"]
+                COORDINATOR_ARGUMENTS
             )
         assert raised.value.code == 2
         assert captured["outcome"] == "hard_failure"
@@ -1131,7 +1137,7 @@ def test_deadline_is_rechecked_immediately_before_spawn(
     try:
         with pytest.raises(ExitCalled) as raised:
             adapter._run_four_region(
-                ["--plan-file", PLAN_ARGUMENT, "--no-publish"]
+                COORDINATOR_ARGUMENTS
             )
         assert raised.value.code == 75
         assert captured["reason_code"] == (
@@ -2326,7 +2332,7 @@ def test_deadline_refusal_happens_before_runtime_load_or_child(
     try:
         with pytest.raises(ExitCalled) as raised:
             adapter._run_four_region(
-                ["--plan-file", PLAN_ARGUMENT, "--no-publish"]
+                COORDINATOR_ARGUMENTS
             )
         assert raised.value.code == 75
         assert captured["outcome"] == "deferred"
@@ -2383,7 +2389,7 @@ def test_runtime_validation_failure_stops_before_child_spawn(
     try:
         with pytest.raises(ExitCalled) as raised:
             adapter._run_four_region(
-                ["--plan-file", PLAN_ARGUMENT, "--no-publish"]
+                COORDINATOR_ARGUMENTS
             )
         assert raised.value.code == 2
         assert captured["outcome"] == "hard_failure"
@@ -2683,6 +2689,15 @@ def test_completed_resume_skips_collection_and_is_idempotent(
         pipeline_launcher,
         "load_config",
         lambda _path: SimpleNamespace(project_root=tmp_path),
+    )
+    monkeypatch.setattr(
+        pipeline_launcher,
+        "load_collection_plan_bundle",
+        lambda **_kwargs: SimpleNamespace(
+            collection_plan=SimpleNamespace(
+                collection_plan_id=pipeline_launcher.FOUR_REGION_PLAN_ID,
+            )
+        ),
     )
     monkeypatch.setattr(
         pipeline_launcher,
