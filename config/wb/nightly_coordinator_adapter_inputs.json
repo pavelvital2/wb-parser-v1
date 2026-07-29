@@ -82,7 +82,7 @@
     "scripts/run_wb_persistent_watchdog.sh": "a171f57bdd7a9735beb485098b8db9470c3de54641c255fce87bce1cefb92d72",
     "scripts/run_wb_warehouse_refresh.sh": "17f62b78d871ad1ea3965cf2fe7bccc2865dad11ee5ab2410fb47474b698dd58",
     "scripts/wb_cookie_keeper.py": "dba7b5edd145a93e4ac2d8b66de028b49bd81d3acec9a0c0ad078121c131b2f8",
-    "scripts/wb_nightly_coordinator_adapter.py": "1320c57ef6967884b1270324530df43a4adce278795942101f91575148a066e2",
+    "scripts/wb_nightly_coordinator_adapter.py": "79bd53ed4916ad16d62cc81010a6c884ca34afc21bf81a08c7f2f0a52ac38a8e",
     "scripts/wb_nightly_preflight.py": "0cf938a82aef823fdf43be55b52041b357271b6d4e4f77a26d2098383d1855a0",
     "scripts/wb_persistent_session.py": "8f3181f1a77a1d6f72182c42a4712fd04f08a5d41b07538210d9f04d897353c8",
     "scripts/wb_persistent_session_watchdog.py": "33cf1f48ad9033823b4cd802027757f8b051e92623388b63869dca7ae4d21f9f",

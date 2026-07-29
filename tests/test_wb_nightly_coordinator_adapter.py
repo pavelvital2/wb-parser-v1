@@ -2423,6 +2423,70 @@ def test_passthrough_rejects_unreviewed_target_before_spawn(
         os.close(validation_fd)
 
 
+def test_entry_check_subcommand_has_no_arguments_and_validates_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        adapter,
+        "require_official_live_entry_lease",
+        lambda: calls.append("entry-check"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["wb_nightly_coordinator_adapter.py", "entry-check"],
+    )
+
+    assert adapter.main() == 0
+    assert calls == ["entry-check"]
+
+
+def test_warehouse_passthrough_lock_contention_refuses_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _lock_policy(tmp_path)
+    quarantine_parent = tmp_path / "quarantine"
+    quarantine_parent.mkdir(mode=0o755)
+    marker = quarantine_parent / "unsafe.json"
+    contender_fd = os.open(policy.guard_path, os.O_RDWR)
+    fcntl.flock(contender_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(
+        adapter,
+        "acquire_marketplace_collection_lease",
+        lambda: contract.acquire_marketplace_collection_lease(
+            environment={},
+            policy=policy,
+            quarantine_marker_path=marker,
+        ),
+    )
+    monkeypatch.setattr(
+        adapter.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "warehouse child must not start while host guard is busy"
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "wb_nightly_coordinator_adapter.py",
+            "passthrough",
+            "--",
+            str(PROJECT_ROOT / "scripts/run_wb_warehouse_refresh.sh"),
+            "--migrate-legacy-yaroslavl",
+            "--dry-run",
+        ],
+    )
+    try:
+        assert adapter.main() == contract.EXIT_BY_OUTCOME["deferred"]
+    finally:
+        fcntl.flock(contender_fd, fcntl.LOCK_UN)
+        os.close(contender_fd)
+
+
 @pytest.mark.parametrize(
     "target",
     sorted(adapter.OFFICIAL_PASSTHROUGH_TARGETS),
