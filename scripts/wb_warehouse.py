@@ -21,8 +21,14 @@ COORDINATOR_LOCK_DIRECTORY = Path("/run/lock/parser-nightly-coordinator")
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app.common.config import load_config
 from app.common.durable_atomic import durable_atomic_replace
+from app.common.exceptions import CriticalPipelineError
 from app.common.nightly_attestation import integrity_gate
+from app.warehouse.wb_regional import (
+    check_legacy_yaroslavl_database,
+    migrate_legacy_yaroslavl_database,
+)
 
 
 def _require_host_lease_after_cutover() -> None:
@@ -512,6 +518,19 @@ def main(argv: list[str] | None = None) -> int:
     sql_parser = subparsers.add_parser("sql", help="run a read-only SQL query against warehouse")
     sql_parser.add_argument("query")
 
+    migration_parser = subparsers.add_parser(
+        "migrate-legacy-yaroslavl",
+        help="safely migrate global WB warehouse history into regional storage",
+    )
+    migration_mode = migration_parser.add_mutually_exclusive_group(required=True)
+    migration_mode.add_argument("--dry-run", action="store_true")
+    migration_mode.add_argument("--apply", action="store_true")
+
+    subparsers.add_parser(
+        "check-legacy-yaroslavl",
+        help="read-only validation of the regional legacy migration",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "build":
         print_json(build(args.project_root, dry_run=args.dry_run))
@@ -521,6 +540,45 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "sql":
         print_json(run_sql(args.project_root, args.query))
+        return 0
+    if args.command == "migrate-legacy-yaroslavl":
+        project_root = args.project_root.resolve(strict=True)
+        config = load_config(project_root / "config/config.yaml")
+        run_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%SZ")
+        try:
+            result = migrate_legacy_yaroslavl_database(
+                project_root=project_root,
+                apply=args.apply,
+                run_id=run_id,
+                stale_seconds=config.runtime.lock_stale_seconds,
+                integrity_gate=integrity_gate(project_root),
+            )
+        except CriticalPipelineError:
+            print_json(
+                {
+                    "schema_version": "wb_legacy_yaroslavl_migration_v1",
+                    "status": "failed",
+                    "reason_code": "legacy_yaroslavl_migration_failed",
+                }
+            )
+            return 2
+        print_json(result)
+        return 0
+    if args.command == "check-legacy-yaroslavl":
+        try:
+            result = check_legacy_yaroslavl_database(
+                project_root=args.project_root,
+            )
+        except CriticalPipelineError:
+            print_json(
+                {
+                    "schema_version": "wb_legacy_yaroslavl_migration_v1",
+                    "status": "failed",
+                    "reason_code": "legacy_yaroslavl_check_failed",
+                }
+            )
+            return 2
+        print_json(result)
         return 0
     return 2
 

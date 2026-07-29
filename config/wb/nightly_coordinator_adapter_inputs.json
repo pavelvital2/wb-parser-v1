@@ -44,7 +44,7 @@
     "app/suggest/alpha.py": "c9879832c121f85e46d032742a502e36bc616a696f5cf7dfaa7dab6c23edff04",
     "app/suggest/runner.py": "2829fd7cca46f37c591e3cfe9572848e5964dfcd4dfa2c94544c65a89f0c6746",
     "app/warehouse/__init__.py": "1b4c581cf3ceacf6ff627bb4c32e7eb6e88eafbad8b8a7c67187ff1608817adc",
-    "app/warehouse/wb_regional.py": "e72e507f364ea06f3deb7e5d9408f038319edbffa6c42e66d4d8f8e3f0de02e8",
+    "app/warehouse/wb_regional.py": "632db031e75417719efc55045dd54110d205db68051c5ffe09c4267e50d6d3e6",
     "app/webui/__init__.py": "aaf31bbc5c30d4a25632eb3bbcfd9b903315deb2fe604b4e303b544cd03f9f77",
     "app/webui/app.py": "afb286ba23482476c7e321c7d7d7e46df450df51fd448d8358b04f22242b107c",
     "app/webui/auth.py": "dd9c3859b59e4f41ee8419d8ec8d1baf0c15a7f3f725f56b98990a7c9ba71edd",
@@ -80,7 +80,7 @@
     "scripts/run_wb_nightly_preflight.sh": "19b9c1c34785aed89c24d50c1ca450399da812b233250ffddf07f78ad3918d94",
     "scripts/run_wb_persistent_session.sh": "ec6749e14ba19c222e49060ca6c490f396e0151a02bdd3e2c60cf68b81662e53",
     "scripts/run_wb_persistent_watchdog.sh": "a171f57bdd7a9735beb485098b8db9470c3de54641c255fce87bce1cefb92d72",
-    "scripts/run_wb_warehouse_refresh.sh": "ba6e9edee0c1d98c55cc8d61fc4808087bdd5dd584aa68e88bc7eccfe3419e55",
+    "scripts/run_wb_warehouse_refresh.sh": "17f62b78d871ad1ea3965cf2fe7bccc2865dad11ee5ab2410fb47474b698dd58",
     "scripts/wb_cookie_keeper.py": "dba7b5edd145a93e4ac2d8b66de028b49bd81d3acec9a0c0ad078121c131b2f8",
     "scripts/wb_nightly_coordinator_adapter.py": "1320c57ef6967884b1270324530df43a4adce278795942101f91575148a066e2",
     "scripts/wb_nightly_preflight.py": "0cf938a82aef823fdf43be55b52041b357271b6d4e4f77a26d2098383d1855a0",
@@ -88,7 +88,7 @@
     "scripts/wb_persistent_session_watchdog.py": "33cf1f48ad9033823b4cd802027757f8b051e92623388b63869dca7ae4d21f9f",
     "scripts/wb_runtime_env.py": "b4940b8bbdb1c69a465f5bd51dca96f67add29f2da9d6985340e09ed95703cd4",
     "scripts/wb_runtime_env.sh": "dd44779db42e86ebe5aa6a6070cddd2ca05912dfd471edc384cae844645bf3ab",
-    "scripts/wb_warehouse.py": "e8e6f78b65a0e2d4067a2b910ee47cfdb89581d980a1d961e73f7bd858fa3856"
+    "scripts/wb_warehouse.py": "bd9ed0e325a84c31ef8d657364666fb4332cd3bec80d884099d472ae22a41e56"
   },
   "files": [
     "app/__init__.py",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 
 from app.common.csv_io import write_csv_rows
 from app.common.exceptions import CriticalPipelineError
+from app.serp.collection_plan_runner import acquire_advisory_lock
 from app.warehouse.wb_regional import (
     DUCKDB_MAX_THREADS,
     DUCKDB_MEMORY_LIMIT,
@@ -17,8 +19,10 @@ from app.warehouse.wb_regional import (
     _create_schema,
     _regional_run_quality_sha256,
     bounded_regional_connection,
+    check_legacy_yaroslavl_database,
     ingest_regional_run,
     migrate_legacy_yaroslavl,
+    migrate_legacy_yaroslavl_database,
 )
 
 
@@ -127,6 +131,7 @@ def _legacy_global_database(project: Path) -> None:
         )
     finally:
         connection.close()
+    path.chmod(0o644)
 
 
 def _legacy_execute(project: Path, sql: str) -> None:
@@ -865,3 +870,287 @@ def test_position_fact_key_preserves_repeated_product_at_different_positions(
     finally:
         database.close()
     assert facts == [("1001", 1), ("1001", 2)]
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_standalone_legacy_migration_dry_run_does_not_publish(
+    tmp_path: Path,
+) -> None:
+    _legacy_global_database(tmp_path)
+    source = tmp_path / "data/warehouse/wb/wb.duckdb"
+    source_sha256 = _file_sha256(source)
+
+    result = migrate_legacy_yaroslavl_database(
+        project_root=tmp_path,
+        apply=False,
+        run_id="20260729_120000Z",
+    )
+
+    assert result["mode"] == "dry_run"
+    assert result["status"] == "updated"
+    assert result["publication"] == "not_requested"
+    assert result["source"]["sha256"] == source_sha256
+    assert result["migration"]["positions"] == 1
+    assert result["migration"]["sellers"] == 1
+    assert result["migration"]["run_quality"] == 1
+    assert result["check"]["api_source_schema_compatible"] is True
+    assert result["check"]["invalid_region_rows"] == 0
+    assert not (
+        tmp_path / "data/warehouse/wb_regional/wb_regional.duckdb"
+    ).exists()
+    assert _file_sha256(source) == source_sha256
+
+
+def test_standalone_legacy_migration_apply_is_atomic_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    _legacy_global_database(tmp_path)
+    first = migrate_legacy_yaroslavl_database(
+        project_root=tmp_path,
+        apply=True,
+        run_id="20260729_120000Z",
+    )
+    database_path = (
+        tmp_path / "data/warehouse/wb_regional/wb_regional.duckdb"
+    )
+    first_sha256 = _file_sha256(database_path)
+    check = check_legacy_yaroslavl_database(project_root=tmp_path)
+
+    assert first["status"] == "updated"
+    assert first["publication"] == "published"
+    assert check["positions"] == 1
+    assert check["sellers"] == 1
+    assert check["run_quality"] == 1
+    assert check["invalid_region_rows"] == 0
+    assert check["api_source_schema_compatible"] is True
+    assert check["legacy_dimensions"] == [
+        {
+            "marketplace": "wb",
+            "region_id": "yaroslavl",
+            "region_name": "Ярославль",
+            "displayed_region": "Ярославль",
+            "region_provenance": "legacy_global_assigned_yaroslavl",
+            "collection_plan_id": "legacy-global",
+            "query_pack_id": "legacy-global",
+            "query_pack_version": "legacy",
+            "query_group": "legacy-global",
+        }
+    ]
+    assert check["seller_legacy_dimensions"] == [
+        {
+            "region_id": "yaroslavl",
+            "region_name": "Ярославль",
+            "region_provenance": "legacy_global_assigned_yaroslavl",
+        }
+    ]
+    assert check["run_quality_legacy_dimensions"] == [
+        {
+            "region_id": "yaroslavl",
+            "region_provenance": "legacy_global_assigned_yaroslavl",
+            "collection_plan_id": "legacy-global",
+            "query_pack_id": "legacy-global",
+            "query_pack_version": "legacy",
+        }
+    ]
+
+    second = migrate_legacy_yaroslavl_database(
+        project_root=tmp_path,
+        apply=True,
+        run_id="20260729_120100Z",
+    )
+    assert second["status"] == "no_changes"
+    assert second["publication"] == "no_changes"
+    assert _file_sha256(database_path) == first_sha256
+
+
+def test_standalone_legacy_migration_preserves_collected_regions(
+    tmp_path: Path,
+) -> None:
+    _legacy_global_database(tmp_path)
+    bridge_path, sellers_path = _sources(tmp_path)
+    ingest_regional_run(
+        project_root=tmp_path,
+        run_id="20260726_001600Z",
+        collection_plan_id="shevron-four-regions-top1000-v2",
+        bridge_path=bridge_path,
+        sellers_path=sellers_path,
+    )
+
+    result = migrate_legacy_yaroslavl_database(
+        project_root=tmp_path,
+        apply=True,
+        run_id="20260729_120000Z",
+    )
+    connection = duckdb.connect(
+        str(tmp_path / "data/warehouse/wb_regional/wb_regional.duckdb"),
+        read_only=True,
+    )
+    try:
+        regions = connection.execute(
+            "SELECT region_id, region_name, region_provenance, count(*) "
+            "FROM regional_query_positions GROUP BY ALL ORDER BY region_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert result["status"] == "no_changes"
+    assert regions == [
+        ("moscow", "Москва", "scoped_collection_plan", 1),
+        (
+            "yaroslavl",
+            "Ярославль",
+            "legacy_global_assigned_yaroslavl",
+            1,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE regional_query_positions SET query_pack_id = 'wrong' "
+        "WHERE region_provenance = 'legacy_global_assigned_yaroslavl'",
+        "UPDATE regional_seller_snapshots SET region_name = 'wrong' "
+        "WHERE region_provenance = 'legacy_global_assigned_yaroslavl'",
+        "UPDATE regional_run_quality SET collection_plan_id = 'wrong' "
+        "WHERE region_provenance = 'legacy_global_assigned_yaroslavl'",
+    ],
+)
+def test_standalone_legacy_check_rejects_dimension_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    _legacy_global_database(tmp_path)
+    migrate_legacy_yaroslavl_database(
+        project_root=tmp_path,
+        apply=True,
+        run_id="20260729_120000Z",
+    )
+    database_path = (
+        tmp_path / "data/warehouse/wb_regional/wb_regional.duckdb"
+    )
+    connection = duckdb.connect(str(database_path))
+    try:
+        connection.execute(mutation)
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="legacy dimensions are invalid",
+    ):
+        check_legacy_yaroslavl_database(project_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            "UPDATE query_positions SET product_name = 'changed' "
+            "WHERE run_id = '20260701_000000Z'",
+            "changed an already imported row",
+        ),
+        (
+            "DELETE FROM query_positions "
+            "WHERE run_id = '20260701_000000Z'",
+            "removed an already imported row",
+        ),
+    ],
+)
+def test_standalone_legacy_migration_rejects_source_history_drift(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    _legacy_global_database(tmp_path)
+    migrate_legacy_yaroslavl_database(
+        project_root=tmp_path,
+        apply=True,
+        run_id="20260729_120000Z",
+    )
+    target = tmp_path / "data/warehouse/wb_regional/wb_regional.duckdb"
+    target_sha256 = _file_sha256(target)
+    _legacy_execute(tmp_path, mutation)
+
+    with pytest.raises(CriticalPipelineError, match=message):
+        migrate_legacy_yaroslavl_database(
+            project_root=tmp_path,
+            apply=True,
+            run_id="20260729_120100Z",
+        )
+    assert _file_sha256(target) == target_sha256
+
+
+def test_standalone_legacy_migration_failure_before_publish_keeps_target(
+    tmp_path: Path,
+) -> None:
+    _legacy_global_database(tmp_path)
+
+    def fail_before_publish(event: str, _path: Path) -> None:
+        if event == "before_publish":
+            raise CriticalPipelineError("fixture publication failure")
+
+    with pytest.raises(CriticalPipelineError, match="publication failure"):
+        migrate_legacy_yaroslavl_database(
+            project_root=tmp_path,
+            apply=True,
+            run_id="20260729_120000Z",
+            event_hook=fail_before_publish,
+        )
+    assert not (
+        tmp_path / "data/warehouse/wb_regional/wb_regional.duckdb"
+    ).exists()
+    assert not list(
+        (tmp_path / "data/warehouse/wb_regional").glob(
+            ".wb-regional-yaroslavl-*.duckdb"
+        )
+    )
+
+
+def test_standalone_legacy_migration_lock_contention_fails_before_target(
+    tmp_path: Path,
+) -> None:
+    _legacy_global_database(tmp_path)
+    daily_lock = tmp_path / "state/locks/products_sellers_daily.flock"
+    with acquire_advisory_lock(daily_lock):
+        with pytest.raises(CriticalPipelineError):
+            migrate_legacy_yaroslavl_database(
+                project_root=tmp_path,
+                apply=True,
+                run_id="20260729_120000Z",
+            )
+    assert not (
+        tmp_path / "data/warehouse/wb_regional/wb_regional.duckdb"
+    ).exists()
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink"])
+def test_standalone_legacy_migration_rejects_unsafe_existing_target(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    _legacy_global_database(tmp_path)
+    warehouse_dir = tmp_path / "data/warehouse/wb_regional"
+    warehouse_dir.mkdir(parents=True)
+    external = tmp_path / "external.duckdb"
+    external.write_bytes(b"trusted-external")
+    external.chmod(0o644)
+    target = warehouse_dir / "wb_regional.duckdb"
+    if unsafe_kind == "symlink":
+        target.symlink_to(external)
+    else:
+        target.hardlink_to(external)
+    external_sha256 = _file_sha256(external)
+
+    with pytest.raises(CriticalPipelineError, match="unsafe"):
+        migrate_legacy_yaroslavl_database(
+            project_root=tmp_path,
+            apply=True,
+            run_id="20260729_120000Z",
+        )
+    assert _file_sha256(external) == external_sha256
+    assert not list(
+        warehouse_dir.glob(".wb-regional-yaroslavl-*.duckdb")
+    )

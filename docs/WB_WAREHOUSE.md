@@ -146,6 +146,62 @@ state/locks/wb_warehouse_refresh.flock
 статус успешного парсинга и не откатывает `latest`; она пишется в лог/state и
 попадает отдельной строкой `Warehouse` в Telegram-отчет.
 
+## Миграция исторических данных в regional warehouse
+
+Официальный standalone path использует тот же warehouse wrapper, но отдельный
+режим. Он не запускает SERP/sellers, не читает сеть и не меняет исходный
+`data/warehouse/wb/wb.duckdb`, CSV/JSON или parser latest:
+
+```bash
+scripts/run_wb_warehouse_refresh.sh \
+  --migrate-legacy-yaroslavl --dry-run
+
+scripts/run_wb_warehouse_refresh.sh \
+  --migrate-legacy-yaroslavl --apply
+
+scripts/run_wb_warehouse_refresh.sh \
+  --migrate-legacy-yaroslavl --check
+```
+
+Перед dry-run/apply команда non-blocking захватывает locks в порядке:
+
+```text
+products_sellers_daily.flock
+pipeline.lock
+wb_warehouse_refresh.flock
+wb_collection_plan.flock
+```
+
+Source global DuckDB открывается через read-only `ATTACH`. Миграция выполняется
+в отдельной staging DuckDB с production-ограничениями `memory_limit=1GiB`,
+`threads=2` и private temp spill. Staging проверяется read-only до публикации.
+При `--apply` только полностью проверенный staging-файл атомарно заменяет
+`data/warehouse/wb_regional/wb_regional.duckdb`, после чего fsync выполняется
+для каталога. Ошибка до replace оставляет прежний target неизменным.
+
+Исторические строки получают:
+
+```text
+region_id=yaroslavl
+region_name=Ярославль
+displayed_region=Ярославль
+region_provenance=legacy_global_assigned_yaroslavl
+query_pack_id=legacy-global
+query_pack_version=legacy
+query_group=legacy-global
+```
+
+Повторный `--apply` без новых global rows возвращает `no_changes` и не
+перепубликует target. Добавление новых legacy runs синхронизируется
+инкрементально; изменение или исчезновение ранее импортированной строки
+отклоняет всю staging-транзакцию. Фактические будущие региональные строки
+сохраняют исходный `region_id/region_name` и не переклассифицируются.
+
+Поле проверки `api_source_schema_compatible=true` подтверждает только наличие
+и читаемость таблиц regional warehouse, предназначенных для будущего API
+источника. Оно не означает, что текущий Parser Data API уже переключён с
+global warehouse на regional warehouse.
+
 ## Правила безопасности
 
 - Не удалять `raw/`, `staging/`, `marts/` на этом этапе.
