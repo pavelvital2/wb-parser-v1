@@ -549,7 +549,12 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   warehouse only through read-only DuckDB attachment, validates a bounded
   staging database and atomically publishes only
   `data/warehouse/wb_regional/wb_regional.duckdb`. Do not run ad-hoc SQL
-  against the production regional database.
+  against the production regional database. When secure host lock-v3 is
+  installed, this exact wrapper remains the official maintenance entry: the
+  allowlisted adapter acquires guard and validation locks, and the nested
+  wrapper must pass `entry-check` on inherited lease descriptors before
+  invoking warehouse code. Never bypass this check or authorize it with a
+  manually exported marker variable.
   Before final cutover, four-region downstream uses the explicit
   `pre_cutover_legacy_nightly_protected_v1` mode. It must reject protected or
   insufficient-clearance starts before acquiring any shared lock; changing

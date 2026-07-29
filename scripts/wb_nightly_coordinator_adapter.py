@@ -502,10 +502,10 @@ def _run_passthrough(arguments: list[str]) -> int:
 def main() -> int:
     try:
         args = build_parser().parse_args()
-        arguments = _strip_separator(args.arguments)
         if args.command == "entry-check":
             require_official_live_entry_lease()
             return 0
+        arguments = _strip_separator(args.arguments)
         if args.command == "four-region":
             return _run_four_region(arguments)
         return _run_passthrough(arguments)

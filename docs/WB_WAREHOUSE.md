@@ -163,6 +163,13 @@ scripts/run_wb_warehouse_refresh.sh \
   --migrate-legacy-yaroslavl --check
 ```
 
+После появления secure host lock-v3 directory wrapper сначала получает оба
+host locks через allowlisted coordinator adapter. Внутренний wrapper обязательно
+выполняет `entry-check` по унаследованным FD/inode/owner/quarantine данным и
+только затем вызывает warehouse CLI. Ручной экспорт trust-переменных не нужен и
+не является авторизацией. Активный coordinator/collector, quarantine marker или
+невалидный lease останавливают maintenance до чтения/публикации warehouse.
+
 Перед dry-run/apply команда non-blocking захватывает locks в порядке:
 
 ```text

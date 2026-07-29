@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def load_module(project_root: Path):
     spec = importlib.util.spec_from_file_location(
@@ -23,7 +25,11 @@ def write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def install_scripts(project: Path) -> None:
+def install_scripts(
+    project: Path,
+    *,
+    coordinator_lock_dir: Path | None = None,
+) -> None:
     scripts_dir = project / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[1]
@@ -31,7 +37,11 @@ def install_scripts(project: Path) -> None:
         source = root / "scripts" / name
         target = scripts_dir / name
         text = source.read_text(encoding="utf-8")
-        isolated_lock = project / "coordinator-lock-not-present"
+        isolated_lock = (
+            coordinator_lock_dir
+            if coordinator_lock_dir is not None
+            else project / "coordinator-lock-not-present"
+        )
         text = text.replace(
             "/run/lock/parser-nightly-coordinator",
             str(isolated_lock),
@@ -224,6 +234,117 @@ def test_wb_warehouse_wrapper_routes_official_legacy_migration_mode(
         "--dry-run",
     ]
     assert not (project / "state/wb_warehouse/latest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("mode", "warehouse_arguments"),
+    (
+        (
+            "--dry-run",
+            ["migrate-legacy-yaroslavl", "--dry-run"],
+        ),
+        (
+            "--apply",
+            ["migrate-legacy-yaroslavl", "--apply"],
+        ),
+        (
+            "--check",
+            ["check-legacy-yaroslavl"],
+        ),
+    ),
+)
+def test_wb_warehouse_migration_uses_passthrough_and_nested_entry_check(
+    tmp_path: Path,
+    mode: str,
+    warehouse_arguments: list[str],
+) -> None:
+    project = tmp_path / "project"
+    coordinator_lock_dir = tmp_path / "parser-nightly-coordinator"
+    coordinator_lock_dir.mkdir()
+    install_scripts(
+        project,
+        coordinator_lock_dir=coordinator_lock_dir,
+    )
+    event_log = tmp_path / "events.jsonl"
+    write(
+        project / "scripts/wb_nightly_coordinator_adapter.py",
+        "\n".join(
+            (
+                "import json, os, sys",
+                "event_log = os.environ['TEST_EVENT_LOG']",
+                "command = sys.argv[1]",
+                "with open(event_log, 'a', encoding='utf-8') as stream:",
+                "    stream.write(json.dumps([command, *sys.argv[2:]]) + '\\n')",
+                "if command == 'passthrough':",
+                "    arguments = sys.argv[2:]",
+                "    if arguments[:1] == ['--']:",
+                "        arguments = arguments[1:]",
+                "    environment = dict(os.environ)",
+                "    environment['PARSER_WB_LOCK_V3_WRAPPED'] = '1'",
+                "    environment['TEST_INHERITED_LEASE'] = '1'",
+                "    os.execvpe(arguments[0], arguments, environment)",
+                "if command == 'entry-check':",
+                "    if os.environ.get('TEST_INHERITED_LEASE') != '1':",
+                "        raise SystemExit(2)",
+                "    raise SystemExit(0)",
+                "raise SystemExit(2)",
+            )
+        )
+        + "\n",
+    )
+    write(
+        project / "scripts/wb_warehouse.py",
+        "\n".join(
+            (
+                "import json, os, sys",
+                "with open(os.environ['TEST_EVENT_LOG'], 'a', encoding='utf-8') as stream:",
+                "    stream.write(json.dumps(['warehouse', *sys.argv[1:]]) + '\\n')",
+                "print(json.dumps({'status': 'ok'}))",
+            )
+        )
+        + "\n",
+    )
+    env = {
+        **os.environ,
+        "PARSER_WB_PROJECT_DIR": str(project),
+        "PARSER_WB_PYTHON_BIN": sys.executable,
+        "TEST_EVENT_LOG": str(event_log),
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(project / "scripts/run_wb_warehouse_refresh.sh"),
+            "--migrate-legacy-yaroslavl",
+            mode,
+        ],
+        cwd=project,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    events = [
+        json.loads(line)
+        for line in event_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[0] == [
+        "passthrough",
+        "--",
+        str(project / "scripts/run_wb_warehouse_refresh.sh"),
+        "--migrate-legacy-yaroslavl",
+        mode,
+    ]
+    assert events[1] == ["entry-check"]
+    assert events[2] == [
+        "warehouse",
+        "--project-root",
+        str(project),
+        *warehouse_arguments,
+    ]
 
 
 def test_wb_warehouse_wrapper_rejects_ambiguous_legacy_migration_mode(
