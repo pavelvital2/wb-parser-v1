@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 PROJECT_DIR="/home/pavel/projects/parser_wb"
 PYTHON_BIN="/home/Codex/agent-tools/parser_wb-python/bin/python"
+COORDINATOR_LOCK_DIR="/run/lock/parser-nightly-coordinator"
 CONFIG_FILE="$PROJECT_DIR/config/config.yaml"
 COOKIE_FILE="$PROJECT_DIR/config/wb_cookie.txt"
 RUNTIME_ENV_FILE="$PROJECT_DIR/config/runtime.env"
@@ -10,6 +11,11 @@ RUNTIME_LOADER="$PROJECT_DIR/scripts/wb_runtime_env.sh"
 SESSION_SCRIPT="$PROJECT_DIR/scripts/wb_persistent_session.py"
 LOCK_FILE="$PROJECT_DIR/state/locks/wb_persistent_session.flock"
 LOG_FILE="$PROJECT_DIR/data/logs/wb_persistent_session.log"
+
+if [[ -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ]]; then
+  echo "WB persistent session is disabled by coordinator lock-v3 cutover" >&2
+  exit 75
+fi
 
 mkdir -p "$PROJECT_DIR/data/logs" "$PROJECT_DIR/state/locks"
 exec >> "$LOG_FILE" 2>&1

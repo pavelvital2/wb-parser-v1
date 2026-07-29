@@ -55,6 +55,15 @@ REGISTRY_RELATIVE = Path("config/wb/regions.json")
 RUN_ID = "20260726_001600Z"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_host_lock_v3(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        four_region_launcher,
+        "require_official_live_entry_lease",
+        lambda **_kwargs: None,
+    )
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -1121,10 +1130,45 @@ def test_four_region_inputs_preserve_repeated_position_facts_and_dedup_sellers(
     assert seller_by_product["2001"]["supplier_id"] == ""
 
 
-def test_legacy_nightly_wrapper_is_byte_identical() -> None:
-    digest = hashlib.sha256(
-        (PROJECT_ROOT / "scripts/run_products_sellers_daily.sh").read_bytes()
-    ).hexdigest()
+def test_legacy_nightly_wrapper_diff_is_only_lock_v3_bootstrap_and_safe_fd() -> None:
+    source = (
+        PROJECT_ROOT / "scripts/run_products_sellers_daily.sh"
+    ).read_text(encoding="utf-8")
+    source = source.replace(
+        "export PYTHONDONTWRITEBYTECODE=1\n",
+        "",
+        1,
+    )
+    source = source.replace(
+        'COORDINATOR_ADAPTER="$PROJECT_DIR/scripts/'
+        'wb_nightly_coordinator_adapter.py"\n'
+        'COORDINATOR_LOCK_DIR="/run/lock/parser-nightly-coordinator"\n',
+        "",
+        1,
+    )
+    source = source.replace(
+        '\nif [[ -e "$COORDINATOR_LOCK_DIR" '
+        '|| -L "$COORDINATOR_LOCK_DIR" ]]; then\n'
+        '  if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" ]]; then\n'
+        '    exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" '
+        'passthrough -- "$0" "$@"\n'
+        "  fi\n"
+        '  if ! "$PYTHON_BIN" "$COORDINATOR_ADAPTER" entry-check; then\n'
+        '    echo "WB host lock-v3 lease validation failed" >&2\n'
+        "    exit 2\n"
+        "  fi\n"
+        "fi\n",
+        "",
+        1,
+    )
+    source = source.replace(
+        'exec {daily_lock_fd}>"$LOCK_FILE"\n'
+        'if ! flock -n "$daily_lock_fd"; then\n',
+        'exec 9>"$LOCK_FILE"\n'
+        "if ! flock -n 9; then\n",
+        1,
+    )
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
     assert digest == "423f1cf6efa8eb3c13b5ddcee3df183b885a757454b175240e8374e2a7d286c4"
 
 
@@ -1133,6 +1177,11 @@ def test_launcher_blocks_downstream_for_partial_collection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     called = {"downstream": False}
+    monkeypatch.setattr(
+        four_region_launcher,
+        "validate_resumable_collection_state",
+        lambda **_kwargs: False,
+    )
     monkeypatch.setattr(
         four_region_launcher,
         "load_config",
@@ -1171,7 +1220,7 @@ def test_launcher_blocks_downstream_for_partial_collection(
             RUN_ID,
         ],
     )
-    assert four_region_launcher.main() == 1
+    assert four_region_launcher.main() == 2
     assert called["downstream"] is False
     state_path, _latest_path = _downstream_state_paths(tmp_path)
     assert not state_path.exists()
@@ -1532,6 +1581,11 @@ def test_launcher_preserves_authoritative_downstream_failure_state(
 ) -> None:
     monkeypatch.setattr(
         four_region_launcher,
+        "validate_resumable_collection_state",
+        lambda **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
         "load_config",
         lambda _path: SimpleNamespace(project_root=tmp_path),
     )
@@ -1590,7 +1644,7 @@ def test_launcher_preserves_authoritative_downstream_failure_state(
             RUN_ID,
         ],
     )
-    assert four_region_launcher.main() == 1
+    assert four_region_launcher.main() == 2
     assert _read_json(state_path) == {
         "status": "failed",
         "stage": "warehouse",
@@ -1606,6 +1660,11 @@ def test_launcher_rejected_published_resume_preserves_state_and_latest(
     state_path, latest_path = _write_published_downstream_state(tmp_path)
     state_before = state_path.read_bytes()
     latest_before = latest_path.read_bytes()
+    monkeypatch.setattr(
+        four_region_launcher,
+        "validate_resumable_collection_state",
+        lambda **_kwargs: False,
+    )
     monkeypatch.setattr(
         four_region_launcher,
         "load_config",
@@ -1640,7 +1699,7 @@ def test_launcher_rejected_published_resume_preserves_state_and_latest(
         ],
     )
 
-    assert four_region_launcher.main() == 1
+    assert four_region_launcher.main() == 2
     assert state_path.read_bytes() == state_before
     assert latest_path.read_bytes() == latest_before
     latest = _read_json(latest_path)
@@ -1826,6 +1885,25 @@ def test_publication_rejects_state_mutation_before_latest_replace(
         CriticalPipelineError,
         match="publication bytes mismatch",
     ):
+        four_region._write_authoritative_latest(lease, pointer)
+
+    assert latest_path.read_bytes() == prior_latest
+    assert lease.latest_published is False
+
+
+def test_publication_integrity_gate_rejects_latest_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, lease, _state_path, latest_path, pointer, prior_latest = (
+        _publication_transaction(tmp_path, monkeypatch)
+    )
+
+    def reject_drift() -> None:
+        raise CriticalPipelineError("input attestation changed")
+
+    lease.integrity_gate = reject_drift
+    with pytest.raises(CriticalPipelineError, match="input attestation changed"):
         four_region._write_authoritative_latest(lease, pointer)
 
     assert latest_path.read_bytes() == prior_latest

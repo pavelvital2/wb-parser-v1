@@ -19,10 +19,20 @@ def _copy_launcher(tmp_path: Path, launcher_name: str) -> Path:
     config = project / "config"
     scripts.mkdir(parents=True)
     config.mkdir(parents=True)
-    shutil.copy2(
-        PROJECT_ROOT / "scripts/wb_runtime_env.sh",
-        scripts / "wb_runtime_env.sh",
-    )
+    for relative in (
+        "scripts/wb_runtime_env.sh",
+        "scripts/wb_runtime_env.py",
+        "app/__init__.py",
+        "app/common/__init__.py",
+        "app/common/durable_atomic.py",
+        "app/common/exceptions.py",
+        "app/common/nightly_coordinator.py",
+        "app/common/runtime_env.py",
+    ):
+        source = PROJECT_ROOT / relative
+        target = project / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
     shutil.copy2(
         PROJECT_ROOT / f"scripts/{launcher_name}",
         scripts / launcher_name,
@@ -68,6 +78,13 @@ def _write_runtime_env(project: Path) -> Path:
         "PARSER_WB_COOKIE_REQUIRED=0\n",
         encoding="utf-8",
     )
+    runtime_env.chmod(0o600)
+    headers = project / "config/wb_request_headers.json"
+    headers.write_text("{}\n", encoding="utf-8")
+    headers.chmod(0o600)
+    cookie = project / "config/wb_cookie.txt"
+    cookie.write_text("test-cookie\n", encoding="utf-8")
+    cookie.chmod(0o600)
     return runtime_env
 
 
@@ -331,12 +348,16 @@ def test_real_keeper_launcher_imports_then_fails_closed_before_network(
     config.mkdir(parents=True)
     for relative in (
         "scripts/wb_runtime_env.sh",
+        "scripts/wb_runtime_env.py",
         "scripts/run_wb_access_tool.sh",
         "scripts/wb_cookie_keeper.py",
         "app/__init__.py",
         "app/common/__init__.py",
+        "app/common/durable_atomic.py",
         "app/common/exceptions.py",
+        "app/common/nightly_coordinator.py",
         "app/common/proxy_required.py",
+        "app/common/runtime_env.py",
     ):
         source = PROJECT_ROOT / relative
         target = project / relative
@@ -347,6 +368,7 @@ def test_real_keeper_launcher_imports_then_fails_closed_before_network(
         "PARSER_WB_COOKIE_REQUIRED=0\n",
         encoding="utf-8",
     )
+    (config / "runtime.env").chmod(0o600)
     (config / "config.yaml").write_text(
         "runtime:\n"
         "  http_timeout_seconds: 1\n"
@@ -358,6 +380,7 @@ def test_real_keeper_launcher_imports_then_fails_closed_before_network(
         encoding="utf-8",
     )
     (config / "wb_cookie.txt").write_text("test_cookie=1\n", encoding="utf-8")
+    (config / "wb_cookie.txt").chmod(0o600)
     network_sentinel = tmp_path / "network-called"
     hook_dir = tmp_path / "hook"
     hook_dir.mkdir()

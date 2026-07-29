@@ -411,6 +411,13 @@ scripts/run_wb_four_region_nightly.sh \
   --no-publish
 ```
 
+This wrapper is also the fixed Parser Nightly Coordinator adapter target. Under
+the coordinator it accepts only this v2 plan, retains the inherited
+`marketplace_collection_lock_v3` validation FD, honors the coordinator absolute
+deadline and emits `marketplace_parser_result_v3`. See
+`docs/WB_NIGHTLY_COORDINATOR_ADAPTER.md`. The older two-region plans are not a
+fallback.
+
 Resume requires the same command plus `--resume-run-id`. The launcher must not
 be scheduled or used live until the owner approves a controlled window and the
 plan plus exactly four regions are enabled in a reviewed change.

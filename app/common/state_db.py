@@ -8,9 +8,10 @@ from typing import Any
 
 
 class StateDB:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, create_parent: bool = True) -> None:
         self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if create_parent:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -26,6 +27,33 @@ class StateDB:
             raise
         finally:
             conn.close()
+
+    @contextmanager
+    def _connect_read_only(self) -> Iterator[sqlite3.Connection]:
+        resolved = self.db_path.resolve(strict=True)
+        conn = sqlite3.connect(
+            f"{resolved.as_uri()}?mode=ro",
+            uri=True,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON;")
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def schema_snapshot_read_only(self) -> dict[str, set[str]]:
+        with self._connect_read_only() as conn:
+            tables = {
+                str(row["name"])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            return {
+                table: self._table_columns(conn, table)
+                for table in tables
+            }
 
     def init_schema(self) -> None:
         with self._connect() as conn:
@@ -244,6 +272,33 @@ class StateDB:
             rows = conn.execute(
                 """
                 SELECT run_id, """ + pipeline_expr + """ AS pipeline, status, created_at_utc, items_ok, items_error
+                FROM runs
+                ORDER BY created_at_utc DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_runs_read_only(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect_read_only() as conn:
+            cols = self._runs_columns(conn)
+            if {"pipeline", "component"} <= cols:
+                pipeline_expr = "COALESCE(pipeline, component)"
+            elif "pipeline" in cols:
+                pipeline_expr = "pipeline"
+            elif "component" in cols:
+                pipeline_expr = "component"
+            else:
+                raise sqlite3.OperationalError(
+                    "runs pipeline identity is unavailable"
+                )
+            rows = conn.execute(
+                """
+                SELECT run_id, """
+                + pipeline_expr
+                + """ AS pipeline, status, created_at_utc,
+                       items_ok, items_error
                 FROM runs
                 ORDER BY created_at_utc DESC
                 LIMIT ?

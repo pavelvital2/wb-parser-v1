@@ -7,11 +7,17 @@ import json
 import shutil
 import stat
 import sys
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.common.nightly_coordinator import require_official_live_entry_lease
+
 KEEPER_PATH = PROJECT_ROOT / "scripts" / "wb_cookie_keeper.py"
 EXIT_OK = 0
 EXIT_PREFLIGHT_FAILED = 20
@@ -225,6 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    require_official_live_entry_lease(environment=os.environ)
     args = build_parser().parse_args(argv)
     config = keeper.load_config(resolve_path(args.config))
     if args.command == "backup":

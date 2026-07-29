@@ -28,8 +28,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
     config = load_config(cfg_path)
     configure_logging(config)
 
-    db = StateDB(config.paths.SQLITE_DB)
-    db.init_schema()
+    db = StateDB(config.paths.SQLITE_DB, create_parent=False)
 
     auth_manager = build_auth_manager(config)
     services = WebUIServices(config)
@@ -99,4 +98,3 @@ def create_app(config_path: str | None = None) -> FastAPI:
 
 
 app = create_app()
-

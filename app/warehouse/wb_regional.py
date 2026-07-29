@@ -10,7 +10,7 @@ import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import duckdb
 
@@ -673,6 +673,7 @@ def migrate_legacy_yaroslavl(
     *,
     project_root: Path,
     connection: duckdb.DuckDBPyConnection,
+    integrity_gate: Callable[[], None] = lambda: None,
 ) -> dict[str, int | str]:
     try:
         runtime_contract = connection.execute(
@@ -1030,6 +1031,7 @@ def migrate_legacy_yaroslavl(
                     revision_id,
                 ],
             )
+            integrity_gate()
             connection.execute("COMMIT")
         except Exception:
             connection.execute("ROLLBACK")
@@ -1060,6 +1062,7 @@ def ingest_regional_run(
     bridge_path: Path,
     sellers_path: Path,
     collection_manifest_path: Path | None = None,
+    integrity_gate: Callable[[], None] = lambda: None,
 ) -> dict[str, Any]:
     if collection_manifest_path is None:
         collection_manifest_path = bridge_path.parent / "collection_manifest.json"
@@ -1096,6 +1099,7 @@ def ingest_regional_run(
         legacy = migrate_legacy_yaroslavl(
             project_root=project_root,
             connection=connection,
+            integrity_gate=integrity_gate,
         )
         prior = connection.execute(
             "SELECT bridge_sha256, sellers_sha256, collection_manifest_sha256, "
@@ -1479,6 +1483,7 @@ def ingest_regional_run(
                     REGIONAL_WAREHOUSE_SCHEMA,
                 ],
             )
+            integrity_gate()
             connection.execute("COMMIT")
         except Exception:
             connection.execute("ROLLBACK")

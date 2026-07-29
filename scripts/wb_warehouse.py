@@ -9,11 +9,32 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+COORDINATOR_LOCK_DIRECTORY = Path("/run/lock/parser-nightly-coordinator")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.common.durable_atomic import durable_atomic_replace
+from app.common.nightly_attestation import integrity_gate
+
+
+def _require_host_lease_after_cutover() -> None:
+    if not os.path.lexists(COORDINATOR_LOCK_DIRECTORY):
+        return
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    from app.common.nightly_coordinator import (
+        require_official_live_entry_lease,
+    )
+
+    require_official_live_entry_lease(environment=os.environ)
 
 try:
     import duckdb
@@ -337,15 +358,31 @@ def export_parquet(con: duckdb.DuckDBPyConnection, warehouse_dir: Path) -> dict[
     return exported
 
 
-def write_manifest(warehouse_dir: Path, manifest: dict[str, Any]) -> Path:
+def write_manifest(
+    project_root: Path,
+    warehouse_dir: Path,
+    manifest: dict[str, Any],
+) -> Path:
     manifests_dir = warehouse_dir / "manifests"
     manifests_dir.mkdir(parents=True, exist_ok=True)
     latest = manifests_dir / "latest.json"
     stamp = manifest["built_at_utc"].replace(":", "").replace("-", "")
     stamped = manifests_dir / f"warehouse_build_{stamp}.json"
     payload = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    latest.write_text(payload, encoding="utf-8")
-    stamped.write_text(payload, encoding="utf-8")
+    encoded = payload.encode("utf-8")
+    gate = integrity_gate(project_root)
+    durable_atomic_replace(
+        stamped.absolute(),
+        encoded,
+        mode=0o644,
+        integrity_gate=gate,
+    )
+    durable_atomic_replace(
+        latest.absolute(),
+        encoded,
+        mode=0o644,
+        integrity_gate=gate,
+    )
     return latest
 
 
@@ -396,7 +433,7 @@ def build(project_root: Path, dry_run: bool = False) -> dict[str, Any]:
             "views": ["query_positions", "seller_daily_metrics", "daily_run_quality"],
             "limitations": MVP_LIMITATIONS,
         }
-        manifest_path = write_manifest(warehouse_dir, manifest)
+        manifest_path = write_manifest(project_root, warehouse_dir, manifest)
         manifest["manifest_path"] = str(manifest_path)
         return manifest
     finally:
@@ -462,6 +499,7 @@ def print_json(data: Any) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _require_host_lease_after_cutover()
     parser = argparse.ArgumentParser(description="WB parser analytics warehouse MVP")
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
     subparsers = parser.add_subparsers(dest="command", required=True)

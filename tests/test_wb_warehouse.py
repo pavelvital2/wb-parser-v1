@@ -122,6 +122,7 @@ def test_wb_warehouse_refresh_wrapper_dry_run_writes_state(tmp_path: Path):
         **os.environ,
         "PARSER_WB_PROJECT_DIR": str(project),
         "PARSER_WB_PYTHON_BIN": sys.executable,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
     }
 
     result = subprocess.run(
@@ -158,6 +159,7 @@ def test_wb_warehouse_refresh_wrapper_skips_failed_latest_report(tmp_path: Path)
         **os.environ,
         "PARSER_WB_PROJECT_DIR": str(project),
         "PARSER_WB_PYTHON_BIN": sys.executable,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
     }
 
     result = subprocess.run(

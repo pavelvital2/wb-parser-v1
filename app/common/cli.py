@@ -2,7 +2,9 @@
 
 import argparse
 import json
+import os
 import sqlite3
+import sys
 from pathlib import Path
 
 from .cleanup import cleanup_runtime_files
@@ -23,6 +25,24 @@ from .state_db import StateDB
 
 
 _RUN_TARGETS = [COMPONENT_SUGGEST, COMPONENT_FILTER, COMPONENT_SERP, COMPONENT_SELLERS, PIPELINE_DAILY, PIPELINE_MONTHLY]
+_COORDINATOR_LOCK_DIRECTORY = Path("/run/lock/parser-nightly-coordinator")
+
+
+def _live_entry_refusal_exit() -> int | None:
+    if not os.path.lexists(_COORDINATOR_LOCK_DIRECTORY):
+        return None
+    from .nightly_coordinator import (
+        EXIT_BY_OUTCOME,
+        NightlyCoordinatorContractError,
+        require_official_live_entry_lease,
+    )
+
+    try:
+        require_official_live_entry_lease(environment=os.environ)
+    except NightlyCoordinatorContractError as exc:
+        print("WB live entry refused by host lock contract", file=sys.stderr)
+        return EXIT_BY_OUTCOME.get(exc.outcome, 2)
+    return None
 
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
@@ -121,18 +141,16 @@ def _doctor_checks(config: AppConfig, db: StateDB) -> tuple[list[str], list[str]
         elif not p.is_dir():
             errors.append(f"path is not directory {name}: {p}")
 
-    db.init_schema()
-    try:
-        with sqlite3.connect(config.paths.SQLITE_DB) as conn:
-            tables = {
-                row[0]
-                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            }
-        for table in {"runs", "tasks", "errors", "checkpoints"}:
-            if table not in tables:
-                errors.append(f"state_db missing table: {table}")
-    except Exception as exc:
-        errors.append(f"state_db is not readable: {exc}")
+    if not db.db_path.exists():
+        warnings.append(f"state_db not found yet: {db.db_path}")
+    else:
+        try:
+            schema = db.schema_snapshot_read_only()
+            for table in {"runs", "tasks", "errors", "checkpoints"}:
+                if table not in schema:
+                    errors.append(f"state_db missing table: {table}")
+        except Exception as exc:
+            errors.append(f"state_db is not readable: {exc}")
 
     suggest_cfg = config.raw.get("suggest", {})
     filter_cfg = config.raw.get("filter", {})
@@ -216,7 +234,7 @@ def cmd_doctor(config_path: str) -> int:
     config = load_config(config_path)
     configure_logging(config)
     logger = get_logger("doctor")
-    db = StateDB(config.paths.SQLITE_DB)
+    db = StateDB(config.paths.SQLITE_DB, create_parent=False)
 
     errors, warnings = _doctor_checks(config=config, db=db)
 
@@ -242,9 +260,12 @@ def cmd_doctor(config_path: str) -> int:
 def cmd_runs(config_path: str, limit: int) -> int:
     config = load_config(config_path)
     configure_logging(config)
-    db = StateDB(config.paths.SQLITE_DB)
-    db.init_schema()
-    rows = db.list_runs(limit=limit)
+    db = StateDB(config.paths.SQLITE_DB, create_parent=False)
+    try:
+        rows = db.list_runs_read_only(limit=limit)
+    except (OSError, sqlite3.Error):
+        print("State DB is not readable")
+        return 1
     if not rows:
         print("No runs yet")
         return 0
@@ -354,6 +375,13 @@ def cmd_collection_plan(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.command in {"cleanup", "collection-plan", "run"} or (
+        args.command in _RUN_TARGETS
+    ):
+        refusal_exit = _live_entry_refusal_exit()
+        if refusal_exit is not None:
+            return refusal_exit
 
     if args.command in {"doctor", "validate"}:
         return cmd_doctor(args.config)

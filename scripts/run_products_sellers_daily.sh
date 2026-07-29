@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 PROJECT_DIR="/home/pavel/projects/parser_wb"
 PYTHON_BIN="/home/Codex/agent-tools/parser_wb-python/bin/python"
+COORDINATOR_ADAPTER="$PROJECT_DIR/scripts/wb_nightly_coordinator_adapter.py"
+COORDINATOR_LOCK_DIR="/run/lock/parser-nightly-coordinator"
 CONFIG_FILE="$PROJECT_DIR/config/config.yaml"
 COOKIE_FILE="$PROJECT_DIR/config/wb_cookie.txt"
 RUNTIME_ENV_FILE="$PROJECT_DIR/config/runtime.env"
@@ -17,6 +20,16 @@ STARTED_AT="$(date --iso-8601=seconds)"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S%z)"
 SERP_MAX_ATTEMPTS="${PARSER_WB_SERP_MAX_ATTEMPTS:-2}"
 SERP_RETRY_SLEEP_SECONDS="${PARSER_WB_SERP_RETRY_SLEEP_SECONDS:-3600}"
+
+if [[ -e "$COORDINATOR_LOCK_DIR" || -L "$COORDINATOR_LOCK_DIR" ]]; then
+  if [[ "${PARSER_WB_LOCK_V3_WRAPPED:-0}" != "1" ]]; then
+    exec "$PYTHON_BIN" "$COORDINATOR_ADAPTER" passthrough -- "$0" "$@"
+  fi
+  if ! "$PYTHON_BIN" "$COORDINATOR_ADAPTER" entry-check; then
+    echo "WB host lock-v3 lease validation failed" >&2
+    exit 2
+  fi
+fi
 
 notify_on_exit() {
   local status=$?
@@ -49,8 +62,8 @@ trap notify_on_exit EXIT
 
 mkdir -p "$PROJECT_DIR/data/logs" "$PROJECT_DIR/state/locks"
 
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
+exec {daily_lock_fd}>"$LOCK_FILE"
+if ! flock -n "$daily_lock_fd"; then
   echo "$(date --iso-8601=seconds) products+sellers daily: previous run is still active"
   exit 75
 fi

@@ -1,8 +1,10 @@
 ﻿from __future__ import annotations
 
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
+
+from .durable_atomic import durable_atomic_copy
+from .nightly_attestation import integrity_gate
 
 
 @dataclass(slots=True)
@@ -102,5 +104,23 @@ class ProjectPaths:
         latest_dir = self._layer_root(layer) / component / "latest"
         latest_dir.mkdir(parents=True, exist_ok=True)
         target = latest_dir / filename
-        shutil.copy2(source_path, target)
+        durable_atomic_copy(
+            source_path.absolute(),
+            target.absolute(),
+            integrity_gate=integrity_gate(self.BASE_DIR),
+        )
         return target
+
+    def publish_output_copy(
+        self,
+        *,
+        source_path: Path,
+        target_path: Path,
+    ) -> Path:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        durable_atomic_copy(
+            source_path.absolute(),
+            target_path.absolute(),
+            integrity_gate=integrity_gate(self.BASE_DIR),
+        )
+        return target_path

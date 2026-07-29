@@ -20,6 +20,10 @@ from zoneinfo import ZoneInfo
 import requests
 
 from app.common.config import AppConfig
+from app.common.durable_atomic import (
+    DurableAtomicWriteError,
+    durable_atomic_replace,
+)
 from app.common.exceptions import CriticalPipelineError
 from app.common.proxy_required import (
     assert_requests_session_proxy,
@@ -420,6 +424,7 @@ class DeadlineGuard:
         *,
         resume: bool,
         now: Callable[[], datetime] = _default_now,
+        absolute_deadline_utc: datetime | None = None,
     ) -> "DeadlineGuard":
         current = now()
         if current.tzinfo is None:
@@ -453,6 +458,19 @@ class DeadlineGuard:
             + timedelta(seconds=window.max_invocation_runtime_seconds),
             cutoff,
         )
+        if absolute_deadline_utc is not None:
+            if (
+                absolute_deadline_utc.tzinfo is None
+                or absolute_deadline_utc.utcoffset()
+                != timezone.utc.utcoffset(absolute_deadline_utc)
+            ):
+                raise CollectionPlanRunError(
+                    "coordinator absolute deadline must be UTC"
+                )
+            invocation_deadline = min(
+                invocation_deadline,
+                absolute_deadline_utc.astimezone(MOSCOW_TZ),
+            )
         guard = cls(
             deadline_utc=invocation_deadline.astimezone(timezone.utc),
             now=now,
@@ -667,39 +685,27 @@ def _write_atomic_bytes(
     *,
     project_root: Path,
     event_hook: WriteEventHook | None = None,
+    integrity_gate: Callable[[], None] | None = None,
+    require_absent: bool = False,
 ) -> None:
     _ensure_scoped_parent(
         path,
         project_root=project_root,
         event_hook=event_hook,
     )
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise CollectionPlanRunError(f"atomic target must be a regular file: {path}")
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = -1
     try:
-        fd = os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        view = memoryview(payload)
-        while view:
-            written = os.write(fd, view)
-            view = view[written:]
-        os.fsync(fd)
-        if event_hook is not None:
-            event_hook("file_fsynced", path)
-        os.close(fd)
-        fd = -1
-        os.replace(temp_path, path)
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-        if event_hook is not None:
-            event_hook("directory_fsynced", path)
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        temp_path.unlink(missing_ok=True)
+        durable_atomic_replace(
+            path,
+            payload,
+            mode=0o600,
+            require_absent=require_absent,
+            integrity_gate=integrity_gate,
+            event_hook=event_hook,
+        )
+    except DurableAtomicWriteError as exc:
+        raise CollectionPlanRunError(
+            f"durable atomic write failed: {path}"
+        ) from exc
 
 
 def _json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -1542,6 +1548,8 @@ class CollectionPlanRunner:
         write_event_hook: WriteEventHook | None = None,
         egress_hash_salt: bytes | None = None,
         sleeper: Callable[[float], None] = time_module.sleep,
+        absolute_deadline_utc: datetime | None = None,
+        input_integrity_gate: Callable[[], None] | None = None,
     ) -> None:
         self.config = config
         self.plan_path = plan_path
@@ -1563,6 +1571,8 @@ class CollectionPlanRunner:
         self.write_event_hook = write_event_hook
         self.egress_hash_salt = egress_hash_salt or secrets.token_bytes(32)
         self.sleeper = sleeper
+        self.absolute_deadline_utc = absolute_deadline_utc
+        self.input_integrity_gate = input_integrity_gate or (lambda: None)
 
     def _configure_runtime_deadline(self, bundle: CollectionPlanBundle) -> None:
         window = bundle.collection_plan.runtime_window
@@ -1571,6 +1581,7 @@ class CollectionPlanRunner:
                 window,
                 resume=self.resume,
                 now=self.now,
+                absolute_deadline_utc=self.absolute_deadline_utc,
             )
         setter = getattr(self.transport, "set_network_timeout_provider", None)
         if callable(setter):
@@ -1715,9 +1726,16 @@ class CollectionPlanRunner:
             payload,
             project_root=self.config.project_root,
             event_hook=self.write_event_hook,
+            integrity_gate=self.input_integrity_gate,
         )
 
-    def _write_or_verify(self, path: Path, payload: bytes) -> None:
+    def _write_or_verify(
+        self,
+        path: Path,
+        payload: bytes,
+        *,
+        publication: bool = False,
+    ) -> None:
         if path.exists():
             existing = _read_regular_bytes(
                 path,
@@ -1728,7 +1746,22 @@ class CollectionPlanRunner:
                     f"immutable artifact content mismatch: {path}"
                 )
             return
-        self._write(path, payload)
+        if publication:
+            _ensure_scoped_parent(
+                path,
+                project_root=self.config.project_root,
+                event_hook=self.write_event_hook,
+            )
+            _write_atomic_bytes(
+                path,
+                payload,
+                project_root=self.config.project_root,
+                event_hook=self.write_event_hook,
+                integrity_gate=self.input_integrity_gate,
+                require_absent=True,
+            )
+        else:
+            self._write(path, payload)
 
     def _estimated_remaining_seconds(
         self,
@@ -1802,6 +1835,23 @@ class CollectionPlanRunner:
             ),
             "proxy_route_sha256": proxy_route_sha256,
         }
+        manifest_sha256 = os.getenv(
+            "PARSER_WB_COORDINATOR_INPUT_MANIFEST_SHA256",
+            "",
+        )
+        runtime_input_sha256 = os.getenv(
+            "PARSER_WB_COORDINATOR_RUNTIME_INPUT_SHA256", ""
+        )
+        if manifest_sha256 or runtime_input_sha256:
+            if (
+                not _SHA256_RE.fullmatch(manifest_sha256)
+                or not _SHA256_RE.fullmatch(runtime_input_sha256)
+            ):
+                raise CollectionPlanRunError(
+                    "runtime input provenance is invalid"
+                )
+            fingerprint["input_manifest_sha256"] = manifest_sha256
+            fingerprint["runtime_input_sha256"] = runtime_input_sha256
         fingerprint["fingerprint_sha256"] = _canonical_sha256(fingerprint)
         return fingerprint
 
@@ -2422,7 +2472,11 @@ class CollectionPlanRunner:
             }
             payload_bytes = _json_bytes(payload)
             target = paths.latest_region_manifest_path(region["region_id"])
-            self._write_or_verify(target, payload_bytes)
+            self._write_or_verify(
+                target,
+                payload_bytes,
+                publication=True,
+            )
             region_refs.append(
                 {
                     "region_id": region["region_id"],
@@ -2492,6 +2546,7 @@ class CollectionPlanRunner:
         bundle: CollectionPlanBundle,
         effective_plan_sha256: str,
         expected_refs: tuple[Mapping[str, Any], ...],
+        promote: bool = True,
     ) -> tuple[list[dict[str, Any]], set[str]]:
         records: list[dict[str, Any]] = []
         verified_ids: set[str] = set()
@@ -2994,8 +3049,9 @@ class CollectionPlanRunner:
                 paths=paths,
                 segment=segment,
             )
-        for segment in validated_segments:
-            self._promote_verified_segment(paths=paths, segment=segment)
+        if promote:
+            for segment in validated_segments:
+                self._promote_verified_segment(paths=paths, segment=segment)
         return records, verified_ids
 
     def _validate_verified_segment_artifacts(
@@ -3099,6 +3155,7 @@ class CollectionPlanRunner:
             stale_seconds=self.config.runtime.lock_stale_seconds,
             event_hook=self.lock_event_hook,
         ):
+            self.input_integrity_gate()
             bundle = self._load_bundle()
             self._validate_mode(bundle)
             if self._bundle_identity(bundle) != self._bundle_identity(initial_bundle):
@@ -3901,6 +3958,7 @@ class CollectionPlanRunner:
                 caught = exc
 
             if caught is None:
+                self.input_integrity_gate()
                 for region_manifest in manifest_regions:
                     products_all, pages_all = region_rows[region_manifest["region_id"]]
                     region_manifest["outputs"] = self._write_scope_outputs(
@@ -4053,6 +4111,7 @@ class CollectionPlanRunner:
             if not collection_complete:
                 raise CollectionPlanRunError("collection plan run is incomplete")
             try:
+                self.input_integrity_gate()
                 manifest["regional_latest"] = self._publish_regional_latest(
                     paths=paths,
                     bundle=bundle,
@@ -4075,6 +4134,7 @@ class CollectionPlanRunner:
             manifest["status"] = "success"
             manifest["complete"] = True
             manifest["error"] = None
+            self.input_integrity_gate()
             self._replace(paths.manifest_path, _json_bytes(manifest), final_manifest=True)
             return manifest
 
@@ -4515,6 +4575,8 @@ def run_collection_plan(
     write_event_hook: WriteEventHook | None = None,
     egress_hash_salt: bytes | None = None,
     sleeper: Callable[[float], None] = time_module.sleep,
+    absolute_deadline_utc: datetime | None = None,
+    input_integrity_gate: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     owned_transport = False
     active_transport = transport
@@ -4543,7 +4605,110 @@ def run_collection_plan(
             write_event_hook=write_event_hook,
             egress_hash_salt=egress_hash_salt,
             sleeper=sleeper,
+            absolute_deadline_utc=absolute_deadline_utc,
+            input_integrity_gate=input_integrity_gate,
         ).run()
     finally:
         if owned_transport:
+            active_transport.close()
+
+
+def validate_resumable_collection_state(
+    *,
+    config: AppConfig,
+    plan_path: Path,
+    run_id: str,
+    transport: ScopedTransport | None = None,
+) -> bool:
+    active_transport: ScopedTransport | None = transport
+    owned_transport = transport is None
+    try:
+        if active_transport is None:
+            active_transport = RequestsScopedTransport.from_config(config)
+        runner = CollectionPlanRunner(
+            config=config,
+            plan_path=plan_path,
+            transport=active_transport,
+            no_publish=True,
+            resume_run_id=run_id,
+        )
+        bundle = runner._load_bundle()
+        runner._validate_mode(bundle)
+        paths = ScopedPaths.build(
+            project_root=config.project_root,
+            collection_plan_id=bundle.collection_plan.collection_plan_id,
+            run_id=runner.run_id,
+        )
+        manifest = _json_object_from_bytes(
+            _read_regular_bytes(
+                paths.manifest_path,
+                project_root=config.project_root,
+            ),
+            field="resume manifest",
+        )
+        snapshot = _json_object_from_bytes(
+            _read_regular_bytes(
+                paths.effective_plan_path,
+                project_root=config.project_root,
+            ),
+            field="effective plan",
+        )
+        if (
+            manifest.get("schema_version")
+            != RESUMABLE_MANIFEST_SCHEMA_VERSION
+            or manifest.get("run_id") != run_id
+            or manifest.get("collection_plan_id")
+            != bundle.collection_plan.collection_plan_id
+            or manifest.get("complete") is True
+            or manifest.get("status") == "success"
+            or manifest.get("transport_fingerprint")
+            != runner._transport_fingerprint()
+        ):
+            return False
+        effective_sha256 = canonical_effective_plan_sha256(snapshot)
+        if (
+            manifest.get("effective_plan_sha256") != effective_sha256
+            or snapshot.get("transport_fingerprint")
+            != runner._transport_fingerprint()
+        ):
+            return False
+        resume = manifest.get("resume")
+        refs = resume.get("segments") if isinstance(resume, dict) else None
+        if not isinstance(refs, list) or not refs:
+            return False
+        verified, verified_ids = runner._verified_segments(
+            paths=paths,
+            bundle=bundle,
+            effective_plan_sha256=effective_sha256,
+            expected_refs=tuple(refs),
+            promote=False,
+        )
+        discarded = runner._validate_discarded_segments(
+            value=resume.get("discarded_segments"),
+            bundle=bundle,
+            verified_segment_ids=verified_ids,
+        )
+        failed_segment = resume.get("failed_segment")
+        if failed_segment is not None and (
+            not discarded or failed_segment != discarded[-1]
+        ):
+            return False
+        expected_scopes = len(bundle.enabled_regions) * len(
+            bundle.enabled_queries
+        )
+        return (
+            len(verified) < expected_scopes
+            or manifest.get("status") == "publication_pending"
+        )
+    except (
+        CollectionPlanRunError,
+        CollectionPlanValidationError,
+        CriticalPipelineError,
+        OSError,
+        ValueError,
+        AttributeError,
+    ):
+        return False
+    finally:
+        if owned_transport and active_transport is not None:
             active_transport.close()

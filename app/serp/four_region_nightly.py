@@ -6,7 +6,6 @@ import json
 import os
 import re
 import stat
-import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
@@ -16,6 +15,10 @@ from zoneinfo import ZoneInfo
 
 from app.common.config import AppConfig
 from app.common.csv_io import read_csv_rows, write_csv_rows
+from app.common.durable_atomic import (
+    DurableAtomicWriteError,
+    durable_atomic_replace,
+)
 from app.common.exceptions import CriticalPipelineError
 from app.common.run_context import RunContext, utc_now_iso
 from app.common.state_db import StateDB
@@ -188,6 +191,7 @@ class _AuthoritativeStateLease:
     run_id: str
     prior_state_bytes: bytes | None
     prior_latest_bytes: bytes | None
+    integrity_gate: Callable[[], None]
     active: bool = True
     state_written: bool = False
     reconcile_only: bool = False
@@ -354,31 +358,25 @@ def _atomic_replace_bytes(
     *,
     new_bytes: bytes,
     on_replaced: Callable[[], None] | None = None,
+    integrity_gate: Callable[[], None] | None = None,
 ) -> None:
-    temp: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".candidate",
-            delete=False,
-        ) as handle:
-            temp = Path(handle.name)
-            os.chmod(temp, 0o600)
-            handle.write(new_bytes)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, path)
-        temp = None
-        if on_replaced is not None:
-            on_replaced()
+        def event_hook(event: str, _path: Path) -> None:
+            if event == "replaced" and on_replaced is not None:
+                on_replaced()
+
+        durable_atomic_replace(
+            path,
+            new_bytes,
+            mode=0o600,
+            integrity_gate=integrity_gate,
+            event_hook=event_hook,
+        )
         _fsync_directory(path.parent)
-    finally:
-        if temp is not None:
-            try:
-                temp.unlink(missing_ok=True)
-            except OSError:
-                pass
+    except DurableAtomicWriteError as exc:
+        raise CriticalPipelineError(
+            "durable downstream publication failed"
+        ) from exc
 
 
 def _safe_state_parent(path: Path, *, project_root: Path) -> None:
@@ -1093,6 +1091,7 @@ def _begin_authoritative_state_transition(
     run_id: str,
     project_root: Path,
     candidate_lineage: Mapping[str, Any],
+    integrity_gate: Callable[[], None] = lambda: None,
 ) -> _AuthoritativeStateLease:
     _safe_state_parent(state_path, project_root=project_root)
     _safe_state_parent(latest_path, project_root=project_root)
@@ -1178,6 +1177,7 @@ def _begin_authoritative_state_transition(
         run_id=run_id,
         prior_state_bytes=state_bytes,
         prior_latest_bytes=latest_bytes,
+        integrity_gate=integrity_gate,
         state_written=completed_state,
         reconcile_only=completed_state,
         already_published=(
@@ -1274,6 +1274,7 @@ def _write_authoritative_state(
         lease.state_path,
         new_bytes=encoded,
         on_replaced=mark_state_replaced,
+        integrity_gate=lease.integrity_gate,
     )
     verified = _trusted_file_snapshot(
         lease.state_path,
@@ -1342,7 +1343,11 @@ def _write_authoritative_latest(
             raise CriticalPipelineError(
                 "downstream latest is newer than publication candidate"
             )
-    _atomic_replace_bytes(lease.latest_path, new_bytes=encoded)
+    _atomic_replace_bytes(
+        lease.latest_path,
+        new_bytes=encoded,
+        integrity_gate=lease.integrity_gate,
+    )
     state_snapshot = _trusted_file_snapshot(
         lease.state_path,
         expected_bytes=lease.expected_state_bytes,
@@ -1879,9 +1884,11 @@ def _run_locked_four_region_downstream(
     execution_contract: DownstreamExecutionContract,
     sellers_factory: Callable[..., SellersEngine],
     warehouse_ingest: Callable[..., dict[str, Any]],
+    input_integrity_gate: Callable[[], None],
 ) -> dict[str, Any]:
     stage = "state_transition"
     try:
+        input_integrity_gate()
         candidate_lineage = _collection_lineage(
             config=config,
             bundle=bundle,
@@ -1894,6 +1901,7 @@ def _run_locked_four_region_downstream(
             run_id=run_id,
             project_root=config.project_root,
             candidate_lineage=candidate_lineage,
+            integrity_gate=input_integrity_gate,
         )
     except Exception as exc:
         write_four_region_failure_attempt(
@@ -1908,6 +1916,7 @@ def _run_locked_four_region_downstream(
     if lease.reconcile_only:
         stage = "state_publication"
         try:
+            input_integrity_gate()
             if lease.expected_state_bytes is None:
                 raise CriticalPipelineError(
                     "completed downstream state bytes are missing"
@@ -1927,6 +1936,7 @@ def _run_locked_four_region_downstream(
                 "lineage": completed_state["lineage"],
             }
             deadline.ensure_active()
+            input_integrity_gate()
             _write_authoritative_latest(lease, pointer)
             return completed_state
         except Exception as exc:
@@ -1947,6 +1957,7 @@ def _run_locked_four_region_downstream(
     warehouse_result: Mapping[str, Any] | None = None
     try:
         stage = "input_build"
+        input_integrity_gate()
         inputs = build_four_region_inputs(
             config=config,
             bundle=bundle,
@@ -1980,6 +1991,7 @@ def _run_locked_four_region_downstream(
             request_timeout_provider=deadline.request_timeout,
         )
         stage = "sellers"
+        input_integrity_gate()
         sellers_result = sellers_factory(
             config=config,
             db=db,
@@ -2012,6 +2024,7 @@ def _run_locked_four_region_downstream(
         seller_output_sha256 = _sha256(seller_output_path)
         deadline.ensure_active()
         stage = "warehouse"
+        input_integrity_gate()
         warehouse_result = warehouse_ingest(
             project_root=config.project_root,
             run_id=run_id,
@@ -2021,6 +2034,7 @@ def _run_locked_four_region_downstream(
                 str(sellers_result["mart_sellers_path"])
             ),
             collection_manifest_path=paths.manifest_path,
+            integrity_gate=input_integrity_gate,
         )
         if warehouse_result.get("status") not in {
             "success",
@@ -2031,6 +2045,7 @@ def _run_locked_four_region_downstream(
             )
         deadline.ensure_active()
         stage = "state_publication"
+        input_integrity_gate()
         state = {
             "schema_version": DOWNSTREAM_SCHEMA,
             "run_id": run_id,
@@ -2119,6 +2134,7 @@ def _run_locked_four_region_downstream(
             "state_sha256": lease.expected_state_sha256,
             "lineage": state["lineage"],
         }
+        input_integrity_gate()
         _write_authoritative_latest(lease, pointer)
         return state
     except Exception as exc:
@@ -2178,7 +2194,10 @@ def run_four_region_downstream(
     warehouse_ingest: Callable[..., dict[str, Any]] = ingest_regional_run,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     execution_mode: str = PRE_CUTOVER_DOWNSTREAM_MODE,
+    absolute_deadline_utc: datetime | None = None,
+    input_integrity_gate: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    integrity_gate = input_integrity_gate or (lambda: None)
     paths = ScopedPaths.build(
         project_root=config.project_root,
         collection_plan_id=FOUR_REGION_PLAN_ID,
@@ -2216,6 +2235,7 @@ def run_four_region_downstream(
             runtime_window,
             resume=True,
             now=now,
+            absolute_deadline_utc=absolute_deadline_utc,
         )
         stage = "lock_acquisition"
         with acquire_collection_plan_locks(
@@ -2223,6 +2243,7 @@ def run_four_region_downstream(
             stale_seconds=config.runtime.lock_stale_seconds,
         ):
             locks_owned = True
+            integrity_gate()
             return _run_locked_four_region_downstream(
                 config=config,
                 bundle=bundle,
@@ -2235,6 +2256,7 @@ def run_four_region_downstream(
                 execution_contract=execution_contract,
                 sellers_factory=sellers_factory,
                 warehouse_ingest=warehouse_ingest,
+                input_integrity_gate=integrity_gate,
             )
     except Exception as exc:
         if not locks_owned:

@@ -353,6 +353,39 @@ def test_regional_warehouse_is_idempotent_and_assigns_legacy_to_yaroslavl(
     }.issubset(run_quality_columns)
 
 
+def test_regional_warehouse_rechecks_integrity_inside_transaction(
+    tmp_path: Path,
+) -> None:
+    bridge_path, sellers_path = _sources(tmp_path)
+
+    def reject_drift() -> None:
+        raise CriticalPipelineError("input attestation changed")
+
+    with pytest.raises(CriticalPipelineError, match="input attestation changed"):
+        ingest_regional_run(
+            project_root=tmp_path,
+            run_id="20260726_001600Z",
+            collection_plan_id="shevron-four-regions-top1000-v2",
+            bridge_path=bridge_path,
+            sellers_path=sellers_path,
+            integrity_gate=reject_drift,
+        )
+
+    database = duckdb.connect(
+        str(tmp_path / "data/warehouse/wb_regional/wb_regional.duckdb"),
+        read_only=True,
+    )
+    try:
+        assert database.execute(
+            "SELECT count(*) FROM regional_ingestions"
+        ).fetchone()[0] == 0
+        assert database.execute(
+            "SELECT count(*) FROM regional_query_positions"
+        ).fetchone()[0] == 0
+    finally:
+        database.close()
+
+
 def test_regional_run_quality_hash_covers_every_retained_field(
     tmp_path: Path,
 ) -> None:

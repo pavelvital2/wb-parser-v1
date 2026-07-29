@@ -23,6 +23,7 @@ from app.common.proxy_required import (
     build_requests_session,
     require_marketplace_proxy,
 )
+from app.common.nightly_coordinator import require_official_live_entry_lease
 
 
 KEEPER_PATH = PROJECT_ROOT / "scripts" / "wb_cookie_keeper.py"
@@ -303,6 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    require_official_live_entry_lease(environment=os.environ)
     args = build_parser().parse_args(argv)
     config = keeper.load_config(keeper.resolve_path(args.config))
     cookie_path = keeper.resolve_cookie_path(config, args.cookie_file)
