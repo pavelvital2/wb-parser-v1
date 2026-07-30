@@ -452,9 +452,13 @@ production-shaped but disabled four-region definition for Moscow,
 Rostov-on-Don, Novosibirsk and Kazan. It uses all 30 pinned `shevron-core`
 queries and maximum depth 1000, so a complete generation contains at most
 1200 pages.
-Depth is a maximum: v2 requires a consistent payload `total` and records
-1-10 pages per query. A terminal short page is valid only when it exactly
-completes `min(total, 1000)`; empty or inconsistent payloads fail closed.
+Depth is a maximum: v2 records 1-10 pages per query. WB may change its live
+payload `total` between full pages. That drift is accepted only while every
+page remains locally consistent and `min(total, 1000)` stays unchanged;
+per-page checkpoints retain each observed total. A terminal short page is
+valid only when its exact count completes the current `min(total, 1000)`.
+Empty, malformed, count-inconsistent, or capped-total-changing payloads fail
+closed.
 
 The compatible one-plan full-pipeline launcher is:
 

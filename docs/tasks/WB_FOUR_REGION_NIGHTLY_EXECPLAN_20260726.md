@@ -75,10 +75,13 @@ sellers and regional warehouse stages succeed.
 - No direct network fallback and no proxy rotation.
 - No global latest, sellers, warehouse or notification stage starts from a
   partial collection.
-- For v2 only, payload `total` is mandatory and stable inside a query segment.
-  A short final page is accepted only when its exact count agrees with
-  `min(total, 1000)` and preceding 100-item pages. Empty, inconsistent or
-  anti-bot payloads fail the segment. Existing v1 plans remain strict.
+- For v2 only, payload `total` is mandatory on every page. Live drift is
+  accepted only while every page count is locally consistent and
+  `min(total, 1000)` remains unchanged; each page checkpoint retains its
+  observed total. A short final page is accepted only when its exact count
+  agrees with the current `min(total, 1000)` and preceding 100-item pages.
+  Empty, malformed, capped-total-changing or anti-bot payloads fail the
+  segment. Existing v1 plans remain strict.
 
 ### Bounded Runtime
 

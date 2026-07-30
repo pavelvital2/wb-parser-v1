@@ -425,7 +425,7 @@ def test_bounded_runner_accepts_live_total_change_above_depth(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    root, config, plan_path = _project(tmp_path, monkeypatch)
     plan = _read_json(plan_path)
     plan["schema_version"] = "wb_collection_plan_v2"
     plan["depth"] = 1000
@@ -472,6 +472,73 @@ def test_bounded_runner_accepts_live_total_change_above_depth(
         segment["completion"]["capped_total"]
         for segment in manifest["resume"]["segments"]
     } == {1000}
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / plan["collection_plan_id"]
+        / RUN_ID
+    )
+    first_query_id = plan["query_ids"][0]
+    assert _read_json(
+        state_dir
+        / "checkpoints/moscow"
+        / first_query_id
+        / "page_001.json"
+    )["payload_total"] == 83_256
+    assert _read_json(
+        state_dir
+        / "checkpoints/moscow"
+        / first_query_id
+        / "page_002.json"
+    )["payload_total"] == 83_255
+
+
+def test_bounded_runner_rejects_live_change_to_capped_total(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["schema_version"] = "wb_collection_plan_v2"
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    plan["runtime_window"] = {
+        "mode": "bounded_resumable",
+        "scheduled_start_msk": "00:15",
+        "new_run_start_grace_seconds": 43200,
+        "max_invocation_runtime_seconds": 21600,
+        "absolute_cutoff_msk": "23:00",
+        "minimum_resume_window_seconds": 1800,
+        "finalization_reserve_seconds": 60,
+    }
+    _write_json(plan_path, plan)
+
+    class CappedTotalChangeTransport(FakeTransport):
+        def search(
+            self,
+            request: ScopedSearchRequest,
+            *,
+            timeout_seconds: float,
+        ) -> ScopedSearchResult:
+            result = super().search(request, timeout_seconds=timeout_seconds)
+            return ScopedSearchResult(
+                payload={
+                    **result.payload,
+                    "total": 1_500 if request.task.page == 1 else 999,
+                },
+                endpoint_id=result.endpoint_id,
+                dest_id_sent=result.dest_id_sent,
+                attempted_endpoint_ids=result.attempted_endpoint_ids,
+            )
+
+    transport = CappedTotalChangeTransport()
+    with pytest.raises(
+        CollectionPlanRunError,
+        match="search_capped_total_changed_between_pages",
+    ):
+        _run(config, plan_path, transport)
+
+    assert len(transport.search_calls) == 2
 
 
 def test_runner_honors_plan_depth_with_distinct_page_identity_and_positions(
