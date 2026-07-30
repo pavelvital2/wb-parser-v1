@@ -659,6 +659,98 @@ def _entry_is_pristine(
     return not any(os.path.lexists(path) for path in candidates)
 
 
+def _recover_failed_outer_state(
+    *,
+    state: dict[str, Any],
+    matrix: ExecutionMatrix,
+    run_date: str,
+    checked_probe: Callable[
+        [ExecutionMatrixEntry],
+        Mapping[tuple[str, str], str],
+    ],
+    complete: Callable[
+        [ExecutionMatrixEntry, str],
+        MatrixEntryCompletion,
+    ],
+    can_resume: Callable[[ExecutionMatrixEntry, str], bool],
+    is_pristine: Callable[[ExecutionMatrixEntry, str], bool],
+) -> None:
+    if (
+        state["status"] != "failed"
+        or state["complete"] is not False
+        or state["finished_at_utc"] is not None
+    ):
+        raise ExecutionMatrixRunError(
+            "execution matrix has no resumable state"
+        )
+
+    attempted = [
+        index
+        for index, entry_state in enumerate(state["entries"])
+        if entry_state["status"] != "success"
+        and entry_state["attempts"] > 0
+    ]
+    if len(attempted) != 1:
+        raise ExecutionMatrixRunError(
+            "failed execution matrix recovery evidence is invalid"
+        )
+    attempted_index = attempted[0]
+
+    for index, (entry, entry_state) in enumerate(
+        zip(matrix.enabled_entries, state["entries"], strict=True)
+    ):
+        plan_run_id = str(entry_state["plan_run_id"])
+        observed = checked_probe(entry)
+        if index < attempted_index:
+            if entry_state["status"] != "success":
+                raise ExecutionMatrixRunError(
+                    "failed execution matrix recovery order is invalid"
+                )
+            completion = complete(entry, plan_run_id)
+            if (
+                completion.state_path != entry_state["state_path"]
+                or completion.state_sha256 != entry_state["state_sha256"]
+            ):
+                raise ExecutionMatrixRunError(
+                    "failed execution matrix completion evidence changed"
+                )
+            _validate_generation_state(
+                entry=entry,
+                run_date=run_date,
+                plan_run_id=plan_run_id,
+                observed=observed,
+                before_execution=False,
+                resumable_entry=True,
+            )
+            continue
+
+        if observed:
+            raise ExecutionMatrixRunError(
+                "failed execution matrix generation evidence conflicts"
+            )
+        if index == attempted_index:
+            if (
+                entry_state["status"] != "pending"
+                or entry_state["attempts"] != 1
+                or can_resume(entry, plan_run_id) is not True
+            ):
+                raise ExecutionMatrixRunError(
+                    "failed execution matrix child checkpoint is invalid"
+                )
+            continue
+        if (
+            entry_state["status"] != "pending"
+            or entry_state["attempts"] != 0
+            or is_pristine(entry, plan_run_id) is not True
+        ):
+            raise ExecutionMatrixRunError(
+                "failed execution matrix future entry is not pristine"
+            )
+
+    state["entries"][attempted_index]["status"] = "checkpoint"
+    state["status"] = "checkpoint"
+
+
 def run_execution_matrix(
     *,
     config: AppConfig,
@@ -768,6 +860,7 @@ def run_execution_matrix(
         if state is None or state["status"] not in {
             "checkpoint",
             "running",
+            "failed",
             "success",
         }:
             raise ExecutionMatrixRunError(
@@ -834,6 +927,21 @@ def run_execution_matrix(
             plan_run_id=child_run_id,
         )
     )
+
+    if resume and state["status"] == "failed":
+        _recover_failed_outer_state(
+            state=state,
+            matrix=matrix,
+            run_date=run_date,
+            checked_probe=checked_probe,
+            complete=complete,
+            can_resume=can_resume,
+            is_pristine=is_pristine,
+        )
+        state["updated_at_utc"] = (
+            now().astimezone(UTC).replace(microsecond=0).isoformat()
+        )
+        _write_json(state_path, state, integrity_gate=attest)
 
     if state["status"] != "success":
         for index, entry in enumerate(matrix.enabled_entries):

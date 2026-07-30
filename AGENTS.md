@@ -179,6 +179,11 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   `state/wb_execution_matrices/`; resume must skip completed entries and the
   matrix latest pointer may advance only after all enabled entries complete.
   Deduplication is by date, marketplace, pack/version, region and query ID.
+- A legacy `failed` matrix state is resumable only through the narrow recovery
+  gate: exactly one `pending` entry with one recorded attempt, a strictly valid
+  child checkpoint, no warehouse generation for that entry, fully verified
+  preceding entries, and pristine following entries. Any other failed-state
+  shape remains fail-closed before entry execution.
   The audited one-plan `--plan-file` mode remains available for manual
   compatibility but is not the coordinator schedule projection.
 - A new four-region run may start during the reviewed 12-hour recovery window

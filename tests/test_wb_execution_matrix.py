@@ -333,6 +333,50 @@ def _run_matrix(
     )
 
 
+def _failed_pending_matrix_state(
+    *,
+    root: Path,
+    matrix_path: Path,
+    harness: _MatrixHarness,
+) -> Path:
+    harness.fail_execution_id = "shevron-core-four-regions-top1000"
+    harness.failures_remaining = 1
+    with pytest.raises(ExecutionMatrixRunError) as captured:
+        run_execution_matrix(
+            config=SimpleNamespace(project_root=root),
+            matrix_path=matrix_path,
+            matrix_run_id="20260728_211500Z",
+            resume=False,
+            execute_entry=harness.execute,
+            input_integrity_gate=lambda: None,
+            generation_probe=harness.generation,
+            completion_validator=harness.completion,
+            resumable_probe=lambda *_args: False,
+            pristine_probe=lambda *_args: False,
+            now=lambda: datetime(2026, 7, 28, 21, 15, tzinfo=UTC),
+        )
+    assert captured.value.resumable is False
+    state_path = (
+        root
+        / "state/wb_execution_matrices/four-region-nightly-v1/"
+        "runs/20260728_211500Z/state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "failed"
+    assert state["complete"] is False
+    assert state["failure_reason"] == "RuntimeError"
+    assert [
+        (
+            entry["status"],
+            entry["attempts"],
+            entry["state_path"],
+            entry["state_sha256"],
+        )
+        for entry in state["entries"]
+    ] == [("pending", 1, None, None)]
+    return state_path
+
+
 def test_matrix_runner_refuses_disabled_matrix_without_state(
     tmp_path: Path,
 ) -> None:
@@ -436,6 +480,138 @@ def test_matrix_pristine_failed_entry_resumes_as_fresh_same_child_run(
     assert state["status"] == "success"
     assert [call[2] for call in harness.calls] == [False, False]
     assert harness.calls[0][1] == harness.calls[1][1]
+
+
+def test_matrix_recovers_exact_failed_pending_attempt_from_child_checkpoint(
+    tmp_path: Path,
+) -> None:
+    root, matrix_path = _enabled_matrix_root(tmp_path)
+    harness = _MatrixHarness()
+    _failed_pending_matrix_state(
+        root=root,
+        matrix_path=matrix_path,
+        harness=harness,
+    )
+
+    state = _run_matrix(
+        root=root,
+        matrix_path=matrix_path,
+        harness=harness,
+        resume=True,
+    )
+
+    assert state["status"] == "success"
+    assert state["complete"] is True
+    assert harness.calls == [
+        (
+            "shevron-core-four-regions-top1000",
+            "20260728_211500Z",
+            False,
+        ),
+        (
+            "shevron-core-four-regions-top1000",
+            "20260728_211500Z",
+            True,
+        ),
+    ]
+
+
+@pytest.mark.parametrize("attempts", (0, 2))
+def test_matrix_failed_outer_rejects_non_exact_attempt_count_before_entry(
+    tmp_path: Path,
+    attempts: int,
+) -> None:
+    root, matrix_path = _enabled_matrix_root(tmp_path)
+    harness = _MatrixHarness()
+    state_path = _failed_pending_matrix_state(
+        root=root,
+        matrix_path=matrix_path,
+        harness=harness,
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["entries"][0]["attempts"] = attempts
+    state_path.write_text(
+        json.dumps(
+            state,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    before = state_path.read_bytes()
+
+    with pytest.raises(ExecutionMatrixRunError, match="recovery|checkpoint"):
+        _run_matrix(
+            root=root,
+            matrix_path=matrix_path,
+            harness=harness,
+            resume=True,
+        )
+
+    assert len(harness.calls) == 1
+    assert state_path.read_bytes() == before
+
+
+def test_matrix_failed_outer_rejects_invalid_child_checkpoint_before_entry(
+    tmp_path: Path,
+) -> None:
+    root, matrix_path = _enabled_matrix_root(tmp_path)
+    harness = _MatrixHarness()
+    state_path = _failed_pending_matrix_state(
+        root=root,
+        matrix_path=matrix_path,
+        harness=harness,
+    )
+    harness.fail_execution_id = None
+    before = state_path.read_bytes()
+
+    with pytest.raises(ExecutionMatrixRunError, match="child checkpoint"):
+        _run_matrix(
+            root=root,
+            matrix_path=matrix_path,
+            harness=harness,
+            resume=True,
+        )
+
+    assert len(harness.calls) == 1
+    assert state_path.read_bytes() == before
+
+
+def test_matrix_failed_outer_rejects_generation_conflict_before_entry(
+    tmp_path: Path,
+) -> None:
+    root, matrix_path = _enabled_matrix_root(tmp_path)
+    harness = _MatrixHarness()
+    state_path = _failed_pending_matrix_state(
+        root=root,
+        matrix_path=matrix_path,
+        harness=harness,
+    )
+    matrix = load_execution_matrix(
+        project_root=root,
+        matrix_path=matrix_path,
+    )
+    entry = matrix.enabled_entries[0]
+    harness.generations[entry.execution_id] = {
+        (
+            entry.bundle.collection_plan.region_set[0],
+            entry.bundle.collection_plan.query_ids[0],
+        ): "20260728_211500Z",
+    }
+    before = state_path.read_bytes()
+
+    with pytest.raises(ExecutionMatrixRunError, match="generation"):
+        _run_matrix(
+            root=root,
+            matrix_path=matrix_path,
+            harness=harness,
+            resume=True,
+        )
+
+    assert len(harness.calls) == 1
+    assert state_path.read_bytes() == before
 
 
 def test_second_approved_pack_uses_generic_four_region_contract(
