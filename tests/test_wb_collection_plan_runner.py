@@ -421,6 +421,59 @@ def test_runner_rejects_transport_channel_as_egress_identity(
     assert transport.search_calls == []
 
 
+def test_bounded_runner_accepts_live_total_change_above_depth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["schema_version"] = "wb_collection_plan_v2"
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    plan["runtime_window"] = {
+        "mode": "bounded_resumable",
+        "scheduled_start_msk": "00:15",
+        "new_run_start_grace_seconds": 43200,
+        "max_invocation_runtime_seconds": 21600,
+        "absolute_cutoff_msk": "23:00",
+        "minimum_resume_window_seconds": 1800,
+        "finalization_reserve_seconds": 60,
+    }
+    _write_json(plan_path, plan)
+
+    class LiveTotalTransport(FakeTransport):
+        def search(
+            self,
+            request: ScopedSearchRequest,
+            *,
+            timeout_seconds: float,
+        ) -> ScopedSearchResult:
+            result = super().search(request, timeout_seconds=timeout_seconds)
+            return ScopedSearchResult(
+                payload={
+                    **result.payload,
+                    "total": 83_256 if request.task.page == 1 else 83_255,
+                },
+                endpoint_id=result.endpoint_id,
+                dest_id_sent=result.dest_id_sent,
+                attempted_endpoint_ids=result.attempted_endpoint_ids,
+            )
+
+    manifest = _run(config, plan_path, LiveTotalTransport())
+
+    assert manifest["status"] == "success"
+    assert manifest["complete"] is True
+    assert manifest["totals"]["pages_ok"] == 60
+    assert {
+        segment["completion"]["payload_total"]
+        for segment in manifest["resume"]["segments"]
+    } == {83_255}
+    assert {
+        segment["completion"]["capped_total"]
+        for segment in manifest["resume"]["segments"]
+    } == {1000}
+
+
 def test_runner_honors_plan_depth_with_distinct_page_identity_and_positions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
