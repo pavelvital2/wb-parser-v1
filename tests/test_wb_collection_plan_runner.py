@@ -101,6 +101,7 @@ def _project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     shutil.copytree(PROJECT_ROOT / "config/wb", root / "config/wb")
     for name in (
         "PARSER_WB_REQUEST_HEADERS_FILE",
+        "PARSER_WB_PROXY_ROTATE_URL",
         "PARSER_WB_PROXY_URL",
         "WB_COOKIE_FILE",
     ):
@@ -2624,6 +2625,92 @@ def test_requests_transport_uses_one_session_for_egress_resolver_and_search() ->
     ]
 
 
+def test_requests_transport_falls_back_to_verified_proxy_health() -> None:
+    primary = FakeSession([requests.ReadTimeout("blocked")])
+    fallback = FakeSession(
+        [
+            FakeResponse(
+                payload={
+                    "ok": True,
+                    "marketplaceTransportVerified": True,
+                    "external_ip": "203.0.113.12",
+                }
+            ),
+            FakeResponse(
+                payload={
+                    "ok": True,
+                    "marketplaceTransportVerified": True,
+                    "external_ip": "203.0.113.12",
+                }
+            ),
+        ]
+    )
+    transport = RequestsScopedTransport(
+        session=primary,  # type: ignore[arg-type]
+        request_params={"appType": "1"},
+        endpoint_urls=("https://search.example.test",),
+        timeout_seconds=45,
+        referer_base="https://www.wildberries.ru/search?query=",
+        egress_check_url="https://ip.example.test",
+        egress_session=primary,  # type: ignore[arg-type]
+        egress_fallback_url="http://127.0.0.1:9840/health",
+        egress_fallback_session=fallback,  # type: ignore[arg-type]
+    )
+
+    assert transport.egress_identity(timeout_seconds=10) == "203.0.113.12"
+    assert transport.egress_identity(timeout_seconds=10) == "203.0.113.12"
+    assert len(primary.calls) == 1
+    assert [call[0] for call in fallback.calls] == [
+        "http://127.0.0.1:9840/health",
+        "http://127.0.0.1:9840/health",
+    ]
+    assert primary.calls[0][1]["timeout"] == 5.0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "ok": False,
+            "marketplaceTransportVerified": True,
+            "external_ip": "203.0.113.12",
+        },
+        {
+            "ok": True,
+            "marketplaceTransportVerified": False,
+            "external_ip": "203.0.113.12",
+        },
+    ],
+)
+def test_requests_transport_rejects_unhealthy_proxy_health(
+    payload: dict[str, Any],
+) -> None:
+    fallback = FakeSession([FakeResponse(payload=payload)])
+    transport = RequestsScopedTransport(
+        session=FakeSession([]),  # type: ignore[arg-type]
+        request_params={},
+        endpoint_urls=("https://search.example.test",),
+        timeout_seconds=45,
+        referer_base="https://www.wildberries.ru/search?query=",
+        egress_fallback_url="http://127.0.0.1:9840/health",
+        egress_fallback_session=fallback,  # type: ignore[arg-type]
+    )
+    transport._egress_fallback_active = True
+
+    with pytest.raises(ScopedTransportError, match="egress_fallback_unhealthy"):
+        transport.egress_identity(timeout_seconds=10)
+
+
+def test_proxy_health_url_drops_rotation_path_query_and_credentials() -> None:
+    assert RequestsScopedTransport._proxy_health_url(
+        "http://127.0.0.1:9840/rotate?token=test-only"
+    ) == "http://127.0.0.1:9840/health"
+    with pytest.raises(CollectionPlanRunError, match="rotation URL is invalid"):
+        RequestsScopedTransport._proxy_health_url(
+            "http://user:password@127.0.0.1:9840/rotate"
+        )
+
+
 def test_from_config_keeps_wb_secrets_out_of_neutral_egress_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2665,6 +2752,52 @@ def test_from_config_keeps_wb_secrets_out_of_neutral_egress_session(
     assert "cookie" in transport.request_headers
     assert "authorization" in transport.request_headers
     assert transport.session.trust_env is False
+
+
+def test_from_config_builds_secret_free_proxy_health_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, _plan_path = _project(tmp_path, monkeypatch)
+    cookie_path = root / "config/test-cookie.txt"
+    cookie_path.write_text("session=fake-test-value", encoding="utf-8")
+    config.raw["serp"]["wb_cookie_file"] = str(cookie_path)
+    config.raw["serp"]["request_headers"] = {
+        "authorization": "Bearer fake-test-token"
+    }
+    monkeypatch.setenv("PARSER_WB_PROXY_URL", "http://proxy.example.test:8080")
+    monkeypatch.setenv(
+        "PARSER_WB_PROXY_ROTATE_URL",
+        "http://127.0.0.1:9840/rotate?token=test-only",
+    )
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_LOADED", "1")
+    monkeypatch.setenv("PARSER_WB_RUNTIME_ENV_SHA256", "a" * 64)
+
+    class CaptureSession:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+            self.proxies: dict[str, str] = {}
+            self.trust_env = True
+
+        def close(self) -> None:
+            pass
+
+    sessions: list[CaptureSession] = []
+
+    def session_factory():
+        session = CaptureSession()
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(requests, "Session", session_factory)
+    transport = RequestsScopedTransport.from_config(config)
+
+    assert len(sessions) == 2
+    assert transport.egress_fallback_url == "http://127.0.0.1:9840/health"
+    assert transport.egress_fallback_session is sessions[1]
+    assert sessions[1].trust_env is False
+    assert sessions[1].proxies == {}
+    assert sessions[1].headers == {}
 
 
 def test_cli_adds_explicit_collection_plan_without_changing_legacy_aliases() -> None:

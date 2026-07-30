@@ -3,9 +3,10 @@
 ## Boundary
 
 Every outbound request that obtains or verifies WB marketplace data must use
-the explicitly configured marketplace proxy. This includes neutral egress
-identity checks because they are evidence for the same collection route.
-There is no direct network fallback.
+the explicitly configured marketplace proxy. The primary neutral egress
+identity check therefore uses the same proxied session as the regional
+resolver and search requests. There is no direct fallback for WB marketplace
+data.
 
 The proxy-only boundary does not include:
 
@@ -14,11 +15,36 @@ The proxy-only boundary does not include:
 - local filesystem, SQLite, DuckDB or warehouse work;
 - local/internal control-plane APIs.
 
-The local proxy-rotation endpoint remains on its existing control-plane route.
+The local proxy-rotation and health endpoints remain on their existing
+control-plane route.
 After a successful rotation, every subsequent WB request still uses a newly
 created, explicitly proxied marketplace session. The rotation endpoint is not a
 marketplace data endpoint and must never receive query text, cookies, request
 headers or proxy credentials.
+
+Some mobile networks allow WB while blocking neutral public IP-check services.
+When the primary neutral check fails with a network error, the collection-plan
+transport may use the local Proxy Health API as control-plane evidence. This
+fallback:
+
+- is derived from the ignored `PARSER_WB_PROXY_ROTATE_URL`, but removes its
+  path, query and any token before requesting `/health`;
+- uses a separate direct session with `trust_env=false`, no proxy, cookies,
+  marketplace headers or credentials;
+- requires HTTP 200, JSON `ok=true`,
+  `marketplaceTransportVerified=true` and a syntactically valid
+  `external_ip`;
+- is latched for the remaining lifetime of that transport instance, avoiding a
+  repeated five-second timeout before every segment;
+- never carries WB data and never changes the proxy route used by the resolver
+  or search requests.
+
+An unhealthy/malformed Proxy Health response remains fail-closed. This
+control-plane fallback does not prove the external IP by an independent public
+service when `external_ip_verified=false`; it proves that the managed proxy
+controller reports a valid identity and has verified the marketplace
+transport. A spontaneous upstream IP change not observed by that controller
+remains a documented residual risk.
 
 ## Required launch contract
 
@@ -78,7 +104,7 @@ first marketplace request.
 | Regional geo resolver | collection-plan or guarded pilot launcher | one `requests.Session` | required runtime loader and shared guard |
 | Regional scoped SERP | collection-plan launcher | same `requests.Session` | production endpoint order/params/headers through shared guard |
 | Regional probe/search/repeat | guarded pilot launcher | same `requests.Session` | Stage 3.2 contour preflight and shared guard |
-| Regional neutral egress | collection-plan or guarded pilot launcher | same `requests.Session` | same proxy route/session as regional requests |
+| Regional neutral egress | collection-plan or guarded pilot launcher | same `requests.Session`; bounded local health fallback only after network error | primary check uses the same proxy route/session; fallback is control-plane evidence only |
 
 The watchdog's tmux/process checks are local. Any keeper/browser repair it
 starts inherits the required runtime provenance and still passes the component
@@ -121,7 +147,9 @@ Regression tests monkeypatch network/browser constructors and prove:
 
 - zero marketplace calls without loaded runtime/proxy;
 - explicit proxy assignment on normal requests and Playwright paths;
-- no direct fallback;
+- no direct fallback for marketplace data;
+- bounded secret-free Proxy Health fallback only after a neutral-check network
+  error, with unhealthy responses rejected;
 - one regional session/route;
 - pacing, budget, deadline and terminal rate-limit behavior;
 - local rotation/Telegram/GitHub routing is outside this data-plane guard.
