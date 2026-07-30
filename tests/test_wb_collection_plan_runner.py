@@ -1591,6 +1591,334 @@ def test_top1000_resume_rejects_transport_fingerprint_mismatch_before_network(
     assert transport.egress_calls == 0
 
 
+def _attested_fingerprint(
+    *,
+    endpoint_sha256: str,
+    request_params_sha256: str,
+    proxy_route_sha256: str,
+    input_manifest_sha256: str,
+    runtime_input_sha256: str,
+) -> dict[str, str]:
+    fingerprint = {
+        "schema_version": "wb_transport_fingerprint_v1",
+        "ordered_endpoint_urls_sha256": endpoint_sha256,
+        "request_params_sha256": request_params_sha256,
+        "proxy_route_sha256": proxy_route_sha256,
+        "input_manifest_sha256": input_manifest_sha256,
+        "runtime_input_sha256": runtime_input_sha256,
+    }
+    fingerprint["fingerprint_sha256"] = runner_module._canonical_sha256(
+        fingerprint
+    )
+    return fingerprint
+
+
+def test_reviewed_production_attestation_transition_is_hash_only() -> None:
+    stored = _attested_fingerprint(
+        endpoint_sha256=(
+            "6adec51ee15afaf98b7b2a66b53b735fcb8149f0d42b71b3bfd3e5ccc8a6ae08"
+        ),
+        request_params_sha256=(
+            "740688b67b86ba24e9130bba4e0813b4c00176f1f53c6990dfa9465020de1714"
+        ),
+        proxy_route_sha256=(
+            "632d1832fa9c70611097b15f2ce2754c492de1b4dcbfb161cc3d54e1e3c8df44"
+        ),
+        input_manifest_sha256=(
+            "a138f1da73b8d7238ec54f952e8f4a23de9a02a89a2d8adc1c37d902339c7eb2"
+        ),
+        runtime_input_sha256=(
+            "49bdfdd7d575f6289d653b6f65d91e63295a23afadca511ba255dc84d87756a6"
+        ),
+    )
+    assert (
+        stored["fingerprint_sha256"]
+        == "6474fc29ce5096a59b1ad028ed9951746ba34f30d7120b498e0f28e6d44a191e"
+    )
+    current = _attested_fingerprint(
+        endpoint_sha256=stored["ordered_endpoint_urls_sha256"],
+        request_params_sha256=stored["request_params_sha256"],
+        proxy_route_sha256=stored["proxy_route_sha256"],
+        input_manifest_sha256="c" * 64,
+        runtime_input_sha256=stored["runtime_input_sha256"],
+    )
+
+    transition = runner_module._resume_attestation_transition(
+        stored=stored,
+        current=current,
+        run_id="20260730_082402Z",
+        collection_plan_id="shevron-four-regions-top1000-v2",
+        effective_plan_sha256=(
+            "2ff60fcf82e394ef6fed60e468bd983aa46d88d4ee0606ace51995a1960052af"
+        ),
+    )
+
+    assert transition == {
+        "schema_version": "wb_resume_attestation_transition_v1",
+        "transition_id": "wb-20260730-approved-code-repair-v1",
+        "from_input_manifest_sha256": stored["input_manifest_sha256"],
+        "to_input_manifest_sha256": current["input_manifest_sha256"],
+        "from_transport_fingerprint_sha256": stored["fingerprint_sha256"],
+        "to_transport_fingerprint_sha256": current["fingerprint_sha256"],
+    }
+    assert "url" not in json.dumps(transition).lower()
+    assert "proxy_route_sha256" not in transition
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "run_id",
+        "collection_plan_id",
+        "effective_plan_sha256",
+        "endpoint",
+        "request_params",
+        "proxy_route",
+        "runtime_input",
+        "claimed_digest",
+    ],
+)
+def test_reviewed_attestation_transition_rejects_other_drift(
+    mismatch: str,
+) -> None:
+    stored = _attested_fingerprint(
+        endpoint_sha256=(
+            "6adec51ee15afaf98b7b2a66b53b735fcb8149f0d42b71b3bfd3e5ccc8a6ae08"
+        ),
+        request_params_sha256=(
+            "740688b67b86ba24e9130bba4e0813b4c00176f1f53c6990dfa9465020de1714"
+        ),
+        proxy_route_sha256=(
+            "632d1832fa9c70611097b15f2ce2754c492de1b4dcbfb161cc3d54e1e3c8df44"
+        ),
+        input_manifest_sha256=(
+            "a138f1da73b8d7238ec54f952e8f4a23de9a02a89a2d8adc1c37d902339c7eb2"
+        ),
+        runtime_input_sha256=(
+            "49bdfdd7d575f6289d653b6f65d91e63295a23afadca511ba255dc84d87756a6"
+        ),
+    )
+    current = _attested_fingerprint(
+        endpoint_sha256=stored["ordered_endpoint_urls_sha256"],
+        request_params_sha256=stored["request_params_sha256"],
+        proxy_route_sha256=stored["proxy_route_sha256"],
+        input_manifest_sha256="c" * 64,
+        runtime_input_sha256=stored["runtime_input_sha256"],
+    )
+    run_id = "20260730_082402Z"
+    collection_plan_id = "shevron-four-regions-top1000-v2"
+    effective_sha256 = (
+        "2ff60fcf82e394ef6fed60e468bd983aa46d88d4ee0606ace51995a1960052af"
+    )
+    if mismatch == "run_id":
+        run_id = "20260730_082403Z"
+    elif mismatch == "collection_plan_id":
+        collection_plan_id = "other-plan"
+    elif mismatch == "effective_plan_sha256":
+        effective_sha256 = "d" * 64
+    elif mismatch == "claimed_digest":
+        current["fingerprint_sha256"] = "d" * 64
+    else:
+        field = {
+            "endpoint": "ordered_endpoint_urls_sha256",
+            "request_params": "request_params_sha256",
+            "proxy_route": "proxy_route_sha256",
+            "runtime_input": "runtime_input_sha256",
+        }[mismatch]
+        current[field] = "d" * 64
+        current["fingerprint_sha256"] = runner_module._canonical_sha256(
+            {
+                key: value
+                for key, value in current.items()
+                if key != "fingerprint_sha256"
+            }
+        )
+
+    with pytest.raises(CollectionPlanRunError):
+        runner_module._resume_attestation_transition(
+            stored=stored,
+            current=current,
+            run_id=run_id,
+            collection_plan_id=collection_plan_id,
+            effective_plan_sha256=effective_sha256,
+        )
+
+
+def test_top1000_resume_accepts_only_reviewed_input_attestation_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    monkeypatch.setenv(
+        "PARSER_WB_COORDINATOR_INPUT_MANIFEST_SHA256",
+        "a" * 64,
+    )
+    monkeypatch.setenv(
+        "PARSER_WB_COORDINATOR_RUNTIME_INPUT_SHA256",
+        "b" * 64,
+    )
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=11),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    failed_manifest = _read_json(state_dir / "manifest.json")
+    stored = failed_manifest["transport_fingerprint"]
+    approved_key = (
+        RUN_ID,
+        "shevron-moscow-rostov-top100-pilot-v1",
+        failed_manifest["effective_plan_sha256"],
+        stored["fingerprint_sha256"],
+        stored["input_manifest_sha256"],
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_APPROVED_RESUME_ATTESTATION_TRANSITIONS",
+        {approved_key: "fixture-approved-code-repair-v1"},
+    )
+    monkeypatch.setenv(
+        "PARSER_WB_COORDINATOR_INPUT_MANIFEST_SHA256",
+        "c" * 64,
+    )
+    resume_transport = FakeTransport()
+
+    assert validate_resumable_collection_state(
+        config=config,
+        plan_path=plan_path,
+        run_id=RUN_ID,
+        transport=resume_transport,
+    )
+    assert resume_transport.resolve_calls == []
+    assert resume_transport.search_calls == []
+    assert resume_transport.egress_calls == 0
+
+    manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=resume_transport,
+        resume_run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert manifest["complete"] is True
+    assert len(resume_transport.search_calls) == 50
+    assert len(manifest["resume"]["segments"]) == 6
+    assert len(manifest["transport_attestation_transitions"]) == 1
+    transition = manifest["transport_attestation_transitions"][0]
+    assert transition["transition_id"] == "fixture-approved-code-repair-v1"
+    assert transition["from_input_manifest_sha256"] == "a" * 64
+    assert transition["to_input_manifest_sha256"] == "c" * 64
+
+
+def test_top1000_resume_rejects_tampered_attestation_history_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    monkeypatch.setenv(
+        "PARSER_WB_COORDINATOR_INPUT_MANIFEST_SHA256",
+        "a" * 64,
+    )
+    monkeypatch.setenv(
+        "PARSER_WB_COORDINATOR_RUNTIME_INPUT_SHA256",
+        "b" * 64,
+    )
+    with pytest.raises(ScopedTransportError):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=FakeTransport(failure_call=11),
+            run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / RUN_ID
+    )
+    manifest_path = state_dir / "manifest.json"
+    failed_manifest = _read_json(manifest_path)
+    stored = failed_manifest["transport_fingerprint"]
+    approved_key = (
+        RUN_ID,
+        "shevron-moscow-rostov-top100-pilot-v1",
+        failed_manifest["effective_plan_sha256"],
+        stored["fingerprint_sha256"],
+        stored["input_manifest_sha256"],
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_APPROVED_RESUME_ATTESTATION_TRANSITIONS",
+        {approved_key: "fixture-approved-code-repair-v1"},
+    )
+    failed_manifest["transport_attestation_transitions"] = [
+        {
+            "schema_version": "wb_resume_attestation_transition_v1",
+            "transition_id": "tampered-transition",
+            "from_input_manifest_sha256": "a" * 64,
+            "to_input_manifest_sha256": "c" * 64,
+            "from_transport_fingerprint_sha256": (
+                stored["fingerprint_sha256"]
+            ),
+            "to_transport_fingerprint_sha256": "d" * 64,
+        }
+    ]
+    _write_json(manifest_path, failed_manifest)
+    monkeypatch.setenv(
+        "PARSER_WB_COORDINATOR_INPUT_MANIFEST_SHA256",
+        "c" * 64,
+    )
+    transport = FakeTransport()
+
+    assert not validate_resumable_collection_state(
+        config=config,
+        plan_path=plan_path,
+        run_id=RUN_ID,
+        transport=transport,
+    )
+    with pytest.raises(
+        CollectionPlanRunError,
+        match="attestation history",
+    ):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=transport,
+            resume_run_id=RUN_ID,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+        )
+    assert transport.resolve_calls == []
+    assert transport.search_calls == []
+    assert transport.egress_calls == 0
+
+
 def test_top1000_estimated_window_rejects_before_network(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

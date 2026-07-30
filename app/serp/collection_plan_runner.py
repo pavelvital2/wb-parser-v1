@@ -67,6 +67,21 @@ MINIMUM_START_WINDOW_SECONDS = 300
 FINALIZATION_RESERVE_SECONDS = 5
 NIGHTLY_SAFETY_RESERVE_SECONDS = 900
 ESTIMATED_REQUEST_OVERHEAD_SECONDS = 1.0
+RESUME_ATTESTATION_TRANSITION_SCHEMA_VERSION = (
+    "wb_resume_attestation_transition_v1"
+)
+
+# Reviewed recovery for the interrupted 2026-07-30 production run. The old
+# fingerprint stays immutable; only its code-manifest component may advance.
+_APPROVED_RESUME_ATTESTATION_TRANSITIONS = {
+    (
+        "20260730_082402Z",
+        "shevron-four-regions-top1000-v2",
+        "2ff60fcf82e394ef6fed60e468bd983aa46d88d4ee0606ace51995a1960052af",
+        "6474fc29ce5096a59b1ad028ed9951746ba34f30d7120b498e0f28e6d44a191e",
+        "a138f1da73b8d7238ec54f952e8f4a23de9a02a89a2d8adc1c37d902339c7eb2",
+    ): "wb-20260730-approved-code-repair-v1",
+}
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _RUN_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}Z$")
@@ -744,6 +759,151 @@ def _canonical_sha256(value: Any) -> str:
             "transport fingerprint input is not canonical JSON"
         ) from exc
     return _sha256_bytes(payload)
+
+
+def _validated_transport_fingerprint(value: Any) -> dict[str, str]:
+    base_fields = frozenset(
+        {
+            "schema_version",
+            "ordered_endpoint_urls_sha256",
+            "request_params_sha256",
+            "proxy_route_sha256",
+            "fingerprint_sha256",
+        }
+    )
+    attested_fields = base_fields | {
+        "input_manifest_sha256",
+        "runtime_input_sha256",
+    }
+    if (
+        not isinstance(value, dict)
+        or frozenset(value) not in {base_fields, attested_fields}
+    ):
+        raise CollectionPlanRunError(
+            "transport fingerprint contract is invalid"
+        )
+    normalized = dict(value)
+    if normalized.get("schema_version") != "wb_transport_fingerprint_v1":
+        raise CollectionPlanRunError(
+            "transport fingerprint schema is invalid"
+        )
+    for field in set(normalized) - {"schema_version"}:
+        item = normalized.get(field)
+        if not isinstance(item, str) or not _SHA256_RE.fullmatch(item):
+            raise CollectionPlanRunError(
+                "transport fingerprint hash is invalid"
+            )
+    claimed = normalized.pop("fingerprint_sha256")
+    if claimed != _canonical_sha256(normalized):
+        raise CollectionPlanRunError(
+            "transport fingerprint digest is invalid"
+        )
+    normalized["fingerprint_sha256"] = claimed
+    return normalized
+
+
+def _resume_attestation_transition(
+    *,
+    stored: Any,
+    current: Any,
+    run_id: str,
+    collection_plan_id: str,
+    effective_plan_sha256: str,
+) -> dict[str, str] | None:
+    stored_fingerprint = _validated_transport_fingerprint(stored)
+    current_fingerprint = _validated_transport_fingerprint(current)
+    if stored_fingerprint == current_fingerprint:
+        return None
+    required_fields = {
+        "schema_version",
+        "ordered_endpoint_urls_sha256",
+        "request_params_sha256",
+        "proxy_route_sha256",
+        "input_manifest_sha256",
+        "runtime_input_sha256",
+        "fingerprint_sha256",
+    }
+    if (
+        set(stored_fingerprint) != required_fields
+        or set(current_fingerprint) != required_fields
+    ):
+        raise CollectionPlanRunError(
+            "resume transport fingerprint mismatch"
+        )
+    exact_fields = {
+        "schema_version",
+        "ordered_endpoint_urls_sha256",
+        "request_params_sha256",
+        "proxy_route_sha256",
+        "runtime_input_sha256",
+    }
+    if any(
+        stored_fingerprint[field] != current_fingerprint[field]
+        for field in exact_fields
+    ):
+        raise CollectionPlanRunError(
+            "resume transport fingerprint mismatch"
+        )
+    transition_id = _APPROVED_RESUME_ATTESTATION_TRANSITIONS.get(
+        (
+            run_id,
+            collection_plan_id,
+            effective_plan_sha256,
+            stored_fingerprint["fingerprint_sha256"],
+            stored_fingerprint["input_manifest_sha256"],
+        )
+    )
+    if transition_id is None:
+        raise CollectionPlanRunError(
+            "resume input attestation transition is not approved"
+        )
+    return {
+        "schema_version": RESUME_ATTESTATION_TRANSITION_SCHEMA_VERSION,
+        "transition_id": transition_id,
+        "from_input_manifest_sha256": stored_fingerprint[
+            "input_manifest_sha256"
+        ],
+        "to_input_manifest_sha256": current_fingerprint[
+            "input_manifest_sha256"
+        ],
+        "from_transport_fingerprint_sha256": stored_fingerprint[
+            "fingerprint_sha256"
+        ],
+        "to_transport_fingerprint_sha256": current_fingerprint[
+            "fingerprint_sha256"
+        ],
+    }
+
+
+def _resume_attestation_history(
+    *,
+    value: Any,
+    expected: tuple[dict[str, str] | None, ...],
+    allow_initial_missing: bool,
+) -> list[dict[str, str]]:
+    unique = {
+        _canonical_sha256(item): item
+        for item in expected
+        if item is not None
+    }
+    if len(unique) > 1:
+        raise CollectionPlanRunError(
+            "resume input attestation evidence conflicts"
+    )
+    expected_history = [dict(item) for item in unique.values()]
+    if value is None:
+        if not expected_history or allow_initial_missing:
+            return expected_history
+        raise CollectionPlanRunError(
+            "resume input attestation history is missing"
+        )
+    if value == [] and allow_initial_missing:
+        return expected_history
+    if not isinstance(value, list) or value != expected_history:
+        raise CollectionPlanRunError(
+            "resume input attestation history is invalid"
+        )
+    return [dict(item) for item in value]
 
 
 def _read_regular_bytes(path: Path, *, project_root: Path) -> bytes:
@@ -3353,6 +3513,7 @@ class CollectionPlanRunner:
             )
 
             prior_manifest: dict[str, Any] | None = None
+            attestation_transitions: list[dict[str, str]] = []
             if self.resume:
                 prior_manifest = _json_object_from_bytes(
                     _read_regular_bytes(
@@ -3374,10 +3535,6 @@ class CollectionPlanRunner:
                         )
                 if prior_manifest.get("complete") is True:
                     raise CollectionPlanRunError("completed run cannot be resumed")
-                if prior_manifest.get("transport_fingerprint") != transport_fingerprint:
-                    raise CollectionPlanRunError(
-                        "resume transport fingerprint mismatch"
-                    )
 
             snapshot: dict[str, Any] | None = None
             effective_sha256 = ""
@@ -3394,14 +3551,38 @@ class CollectionPlanRunner:
                     field="effective plan",
                 )
                 effective_sha256 = canonical_effective_plan_sha256(snapshot)
-                if snapshot.get("transport_fingerprint") != transport_fingerprint:
-                    raise CollectionPlanRunError(
-                        "resume effective transport fingerprint mismatch"
-                    )
                 if prior_manifest is None or prior_manifest.get(
                     "effective_plan_sha256"
                 ) != effective_sha256:
                     raise CollectionPlanRunError("resume effective plan hash mismatch")
+                manifest_transition = _resume_attestation_transition(
+                    stored=prior_manifest.get("transport_fingerprint"),
+                    current=transport_fingerprint,
+                    run_id=self.run_id,
+                    collection_plan_id=(
+                        bundle.collection_plan.collection_plan_id
+                    ),
+                    effective_plan_sha256=effective_sha256,
+                )
+                snapshot_transition = _resume_attestation_transition(
+                    stored=snapshot.get("transport_fingerprint"),
+                    current=transport_fingerprint,
+                    run_id=self.run_id,
+                    collection_plan_id=(
+                        bundle.collection_plan.collection_plan_id
+                    ),
+                    effective_plan_sha256=effective_sha256,
+                )
+                attestation_transitions = _resume_attestation_history(
+                    value=prior_manifest.get(
+                        "transport_attestation_transitions"
+                    ),
+                    expected=(
+                        manifest_transition,
+                        snapshot_transition,
+                    ),
+                    allow_initial_missing=manifest_transition is not None,
+                )
                 for key, expected in {
                     "query_pack_sha256": bundle.query_pack_sha256,
                     "collection_plan_sha256": bundle.collection_plan_sha256,
@@ -3581,6 +3762,9 @@ class CollectionPlanRunner:
                     "region_registry_sha256": bundle.region_registry_sha256,
                     "effective_plan_sha256": effective_sha256,
                     "transport_fingerprint": transport_fingerprint,
+                    "transport_attestation_transitions": (
+                        attestation_transitions
+                    ),
                     "effective_plan_snapshot_path": _relative(
                         paths.effective_plan_path,
                         paths.project_root,
@@ -4223,6 +4407,9 @@ class CollectionPlanRunner:
                 "region_registry_sha256": bundle.region_registry_sha256,
                 "effective_plan_sha256": effective_sha256,
                 "transport_fingerprint": transport_fingerprint,
+                "transport_attestation_transitions": (
+                    attestation_transitions
+                ),
                 "effective_plan_snapshot_path": _relative(
                     paths.effective_plan_path,
                     paths.project_root,
@@ -4835,17 +5022,31 @@ def validate_resumable_collection_state(
             != bundle.collection_plan.collection_plan_id
             or manifest.get("complete") is True
             or manifest.get("status") == "success"
-            or manifest.get("transport_fingerprint")
-            != runner._transport_fingerprint()
         ):
             return False
         effective_sha256 = canonical_effective_plan_sha256(snapshot)
-        if (
-            manifest.get("effective_plan_sha256") != effective_sha256
-            or snapshot.get("transport_fingerprint")
-            != runner._transport_fingerprint()
-        ):
+        if manifest.get("effective_plan_sha256") != effective_sha256:
             return False
+        current_fingerprint = runner._transport_fingerprint()
+        manifest_transition = _resume_attestation_transition(
+            stored=manifest.get("transport_fingerprint"),
+            current=current_fingerprint,
+            run_id=run_id,
+            collection_plan_id=bundle.collection_plan.collection_plan_id,
+            effective_plan_sha256=effective_sha256,
+        )
+        snapshot_transition = _resume_attestation_transition(
+            stored=snapshot.get("transport_fingerprint"),
+            current=current_fingerprint,
+            run_id=run_id,
+            collection_plan_id=bundle.collection_plan.collection_plan_id,
+            effective_plan_sha256=effective_sha256,
+        )
+        _resume_attestation_history(
+            value=manifest.get("transport_attestation_transitions"),
+            expected=(manifest_transition, snapshot_transition),
+            allow_initial_missing=manifest_transition is not None,
+        )
         resume = manifest.get("resume")
         refs = resume.get("segments") if isinstance(resume, dict) else None
         if not isinstance(refs, list) or not refs:

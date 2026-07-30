@@ -256,6 +256,22 @@ The successful scoped pilot `20260726_142920Z` is evidence only for Moscow and
 Rostov-on-Don: 6 pages, 600 products and verified constant egress. There is no
 live collection proof for Novosibirsk or Kazan in this activation commit.
 
+## Reviewed Resume Attestation Transition
+
+Run `20260730_082402Z` began under an older, valid coordinator input manifest
+and retained verified query segments while approved parser fixes changed that
+manifest. Its recovery is an incident-scoped exception, not a general
+compatibility rule. The runner accepts only the exact reviewed run, plan,
+effective-plan hash, prior transport fingerprint and prior input-manifest hash.
+Endpoint order, request parameters, proxy-route provenance and runtime-input
+provenance must still match exactly.
+
+The transition is checked before resolver or search traffic and is recorded in
+the child manifest as SHA-256 provenance only. Any unlisted run, malformed
+history or additional transport/runtime drift fails closed. Confirmed segments
+remain reusable; the incomplete segment remains non-reusable and starts again
+from its first page.
+
 ## Cutover Gates
 
 Before coordinator activation:
