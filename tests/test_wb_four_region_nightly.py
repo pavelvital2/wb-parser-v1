@@ -18,6 +18,7 @@ from app.common.exceptions import CriticalPipelineError
 from app.common.run_lock import acquire_advisory_lock
 from app.serp import four_region_nightly as four_region
 from app.serp.collection_plan import (
+    CollectionPlanValidationError,
     EffectiveEndpointPolicy,
     load_collection_plan_bundle,
 )
@@ -80,6 +81,40 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
 def _write_canonical_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_bytes(four_region._json_bytes(payload))
     path.chmod(0o600)
+
+
+def test_safe_root_cause_reports_controlled_validation_detail() -> None:
+    try:
+        try:
+            raise CollectionPlanValidationError(
+                "effective_plan requires distinct dest_id_observed values"
+            )
+        except CollectionPlanValidationError as cause:
+            raise four_region_launcher.ExecutionMatrixRunError(
+                "execution matrix entry failed",
+                resumable=True,
+            ) from cause
+    except four_region_launcher.ExecutionMatrixRunError as exc:
+        assert four_region_launcher._safe_root_cause(exc) == (
+            "CollectionPlanValidationError: "
+            "effective_plan requires distinct dest_id_observed values"
+        )
+
+
+def test_safe_root_cause_does_not_render_unknown_exception_message() -> None:
+    secret = "proxy-password-must-not-appear"
+    try:
+        try:
+            raise RuntimeError(secret)
+        except RuntimeError as cause:
+            raise four_region_launcher.ExecutionMatrixRunError(
+                "execution matrix entry failed",
+                resumable=True,
+            ) from cause
+    except four_region_launcher.ExecutionMatrixRunError as exc:
+        diagnostic = four_region_launcher._safe_root_cause(exc)
+        assert diagnostic == "RuntimeError"
+        assert secret not in diagnostic
 
 
 def _downstream_state_paths(

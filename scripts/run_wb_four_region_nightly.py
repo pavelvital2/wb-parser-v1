@@ -250,6 +250,33 @@ def _is_deferred_error(exc: BaseException) -> bool:
     )
 
 
+def _safe_root_cause(exc: BaseException) -> str:
+    current = exc
+    for _ in range(8):
+        cause = current.__cause__
+        if cause is None:
+            break
+        current = cause
+    allowed = (
+        CollectionPlanValidationError,
+        CollectionPlanRunError,
+        NightlyCoordinatorContractError,
+    )
+    if not isinstance(current, allowed):
+        return current.__class__.__name__
+    message = " ".join(str(current).split())
+    message = "".join(
+        character
+        for character in message
+        if character.isprintable()
+    )[:240]
+    return (
+        f"{current.__class__.__name__}: {message}"
+        if message
+        else current.__class__.__name__
+    )
+
+
 def _is_coordinator_resume_phase() -> bool:
     return os.getenv("MARKETPLACE_COORDINATOR_STAGE", "") == "wb_resume"
 
@@ -403,7 +430,11 @@ def main() -> int:
                 resume_ref=run_id,
                 reason_code="checkpoint_saved",
             )
-            print(f"{exc.__class__.__name__}: operation checkpointed", file=sys.stderr)
+            print(
+                f"{exc.__class__.__name__}: operation checkpointed; "
+                f"root_cause={_safe_root_cause(exc)}",
+                file=sys.stderr,
+            )
             return 76
         if _is_deferred_error(exc):
             _emit_adapter_status(
@@ -420,7 +451,11 @@ def main() -> int:
             resume_ref="",
             reason_code="pipeline_hard_failure",
         )
-        print(f"{exc.__class__.__name__}: operation failed", file=sys.stderr)
+        print(
+            f"{exc.__class__.__name__}: operation failed; "
+            f"root_cause={_safe_root_cause(exc)}",
+            file=sys.stderr,
+        )
         return 2
     try:
         verify_inputs()

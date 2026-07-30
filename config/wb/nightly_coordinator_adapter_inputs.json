@@ -73,7 +73,7 @@
     "scripts/run_wb_collection_plan.py": "c122e51f9bd6a5e27dfa5f87f7cbfdd12bb189a5a96fcd0561238be26e83261a",
     "scripts/run_wb_collection_plan.sh": "50ebff20be310a123a3a034d66fa374673a62ece1d3e274cdc921a80e8bf2e2b",
     "scripts/run_wb_cookie_renewal.sh": "8733833609e68063036c997175279597f417ef77689e825a2462a2b85addcf20",
-    "scripts/run_wb_four_region_nightly.py": "e9117adbe2dfcbe079c0a5deeec41afe1e21113af9c0e3655cc57b8ec426cbc6",
+    "scripts/run_wb_four_region_nightly.py": "e62dc954be58d51ba8d4e8b8ac33fd0fdc3dd4166a5ff53b1ea19f84b958ee68",
     "scripts/run_wb_four_region_nightly.sh": "cd1f73f7bad9d22b991c7a86a19839b061ca5cd498c753243700fdb1232b9094",
     "scripts/run_wb_guarded_regional_pilot.sh": "193377139d896b5b6583d667155ded18e8975795a054df39bad2b041399035bd",
     "scripts/run_wb_live_component.sh": "7fa77ef59c8ddb129d3c861c44ed6478b671ca57daf64b6cf37266aadd37f292",
