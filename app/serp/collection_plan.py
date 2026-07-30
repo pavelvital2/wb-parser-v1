@@ -1425,6 +1425,20 @@ def _validate_effective_plan_snapshot(snapshot: Mapping[str, Any]) -> None:
             snapshot["transport_fingerprint"],
             field="effective_plan.transport_fingerprint",
         )
+        coordinator_provenance_fields = {
+            "input_manifest_sha256",
+            "runtime_input_sha256",
+        }
+        present_coordinator_fields = (
+            coordinator_provenance_fields.intersection(fingerprint)
+        )
+        if present_coordinator_fields and (
+            present_coordinator_fields != coordinator_provenance_fields
+        ):
+            raise CollectionPlanValidationError(
+                "effective_plan.transport_fingerprint coordinator "
+                "provenance must contain both hashes"
+            )
         _require_keys(
             fingerprint,
             required={
@@ -1433,7 +1447,8 @@ def _validate_effective_plan_snapshot(snapshot: Mapping[str, Any]) -> None:
                 "request_params_sha256",
                 "proxy_route_sha256",
                 "fingerprint_sha256",
-            },
+            }
+            | present_coordinator_fields,
             field="effective_plan.transport_fingerprint",
         )
         if fingerprint["schema_version"] != "wb_transport_fingerprint_v1":
@@ -1445,6 +1460,7 @@ def _validate_effective_plan_snapshot(snapshot: Mapping[str, Any]) -> None:
             "request_params_sha256",
             "proxy_route_sha256",
             "fingerprint_sha256",
+            *sorted(present_coordinator_fields),
         ):
             _require_sha256(
                 fingerprint[name],

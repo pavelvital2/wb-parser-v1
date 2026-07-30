@@ -96,6 +96,23 @@ def _endpoint_policy() -> EffectiveEndpointPolicy:
     )
 
 
+def _transport_fingerprint(
+    *,
+    coordinator_provenance: bool = False,
+) -> dict[str, str]:
+    fingerprint = {
+        "schema_version": "wb_transport_fingerprint_v1",
+        "ordered_endpoint_urls_sha256": "1" * 64,
+        "request_params_sha256": "2" * 64,
+        "proxy_route_sha256": "3" * 64,
+    }
+    if coordinator_provenance:
+        fingerprint["input_manifest_sha256"] = "4" * 64
+        fingerprint["runtime_input_sha256"] = "5" * 64
+    fingerprint["fingerprint_sha256"] = "6" * 64
+    return fingerprint
+
+
 def test_committed_stage1_plan_is_disabled_with_active_shared_regions() -> None:
     bundle = _load_bundle(PROJECT_ROOT)
 
@@ -609,6 +626,51 @@ def test_effective_plan_hash_is_canonical_and_secret_free(tmp_path: Path) -> Non
     changed["depth"] = 150
     with pytest.raises(CollectionPlanValidationError, match="depth must be one of"):
         canonical_effective_plan_sha256(changed)
+
+
+def test_effective_plan_accepts_complete_coordinator_transport_provenance(
+    tmp_path: Path,
+) -> None:
+    root = _copy_stage1_config(tmp_path)
+    _enable_pilot(root)
+    snapshot = build_effective_plan_snapshot(
+        _load_bundle(root),
+        resolved_destinations=_resolved_destinations(),
+        page_size=100,
+        endpoint_policy=_endpoint_policy(),
+        transport_fingerprint=_transport_fingerprint(
+            coordinator_provenance=True,
+        ),
+    )
+
+    assert snapshot["transport_fingerprint"]["input_manifest_sha256"] == (
+        "4" * 64
+    )
+    assert snapshot["transport_fingerprint"]["runtime_input_sha256"] == (
+        "5" * 64
+    )
+    assert canonical_effective_plan_sha256(snapshot)
+
+
+def test_effective_plan_rejects_partial_coordinator_transport_provenance(
+    tmp_path: Path,
+) -> None:
+    root = _copy_stage1_config(tmp_path)
+    _enable_pilot(root)
+    fingerprint = _transport_fingerprint()
+    fingerprint["input_manifest_sha256"] = "4" * 64
+
+    with pytest.raises(
+        CollectionPlanValidationError,
+        match="must contain both hashes",
+    ):
+        build_effective_plan_snapshot(
+            _load_bundle(root),
+            resolved_destinations=_resolved_destinations(),
+            page_size=100,
+            endpoint_policy=_endpoint_policy(),
+            transport_fingerprint=fingerprint,
+        )
 
 
 @pytest.mark.parametrize(
