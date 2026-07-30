@@ -22,29 +22,24 @@ created, explicitly proxied marketplace session. The rotation endpoint is not a
 marketplace data endpoint and must never receive query text, cookies, request
 headers or proxy credentials.
 
-Some mobile networks allow WB while blocking neutral public IP-check services.
-When the primary neutral check fails with a network error, the collection-plan
-transport may use the local Proxy Health API as control-plane evidence. This
-fallback:
+Some mobile networks block individual public IP-check services. Regional
+collection therefore uses a bounded ordered list of neutral sources through
+the same explicitly proxied, secret-free session:
 
-- is derived from the ignored `PARSER_WB_PROXY_ROTATE_URL`, but removes its
-  path, query and any token before requesting `/health`;
-- uses a separate direct session with `trust_env=false`, no proxy, cookies,
-  marketplace headers or credentials;
-- requires HTTP 200, JSON `ok=true`,
-  `marketplaceTransportVerified=true` and a syntactically valid
-  `external_ip`;
-- is latched for the remaining lifetime of that transport instance, avoiding a
-  repeated five-second timeout before every segment;
-- never carries WB data and never changes the proxy route used by the resolver
-  or search requests.
+1. the existing plain-IP primary;
+2. Yandex Internetometer, accepting only its explicit IPv4 DOM field;
+3. two plain-IP fallbacks.
 
-An unhealthy/malformed Proxy Health response remains fail-closed. This
-control-plane fallback does not prove the external IP by an independent public
-service when `external_ip_verified=false`; it proves that the managed proxy
-controller reports a valid identity and has verified the marketplace
-transport. A spontaneous upstream IP change not observed by that controller
-remains a documented residual risk.
+Each source gets one request capped at five seconds. A network error, non-200,
+oversized body or invalid IP advances to the next source. There is no retry,
+sleep, rotation or direct request. Exhaustion fails closed before resolver or
+SERP, because constant egress cannot be proved.
+
+The local Proxy Health `/health` response is not an egress-identity fallback.
+Its reviewed contract intentionally avoids neutral IP checks and returns an
+empty `external_ip` with `external_ip_verified=false` while reporting
+marketplace transport separately. It remains useful control-plane diagnostics,
+but cannot satisfy the segment identity or publication gates.
 
 ## Required launch contract
 
@@ -104,7 +99,7 @@ first marketplace request.
 | Regional geo resolver | collection-plan or guarded pilot launcher | one `requests.Session` | required runtime loader and shared guard |
 | Regional scoped SERP | collection-plan launcher | same `requests.Session` | production endpoint order/params/headers through shared guard |
 | Regional probe/search/repeat | guarded pilot launcher | same `requests.Session` | Stage 3.2 contour preflight and shared guard |
-| Regional neutral egress | collection-plan or guarded pilot launcher | same `requests.Session`; bounded local health fallback only after network error | primary check uses the same proxy route/session; fallback is control-plane evidence only |
+| Regional neutral egress | collection-plan or guarded pilot launcher | same explicitly proxied `requests.Session`; bounded ordered neutral sources | each source is secret-free and attempted once; no direct/control-plane identity fallback |
 
 The watchdog's tmux/process checks are local. Any keeper/browser repair it
 starts inherits the required runtime provenance and still passes the component
@@ -148,8 +143,9 @@ Regression tests monkeypatch network/browser constructors and prove:
 - zero marketplace calls without loaded runtime/proxy;
 - explicit proxy assignment on normal requests and Playwright paths;
 - no direct fallback for marketplace data;
-- bounded secret-free Proxy Health fallback only after a neutral-check network
-  error, with unhealthy responses rejected;
+- bounded ordered neutral checks use the same proxied session, accept only
+  strict source-specific IP payloads, and fail closed when exhausted;
+- Proxy Health with an empty identity cannot satisfy egress evidence;
 - one regional session/route;
 - pacing, budget, deadline and terminal rate-limit behavior;
 - local rotation/Telegram/GitHub routing is outside this data-plane guard.

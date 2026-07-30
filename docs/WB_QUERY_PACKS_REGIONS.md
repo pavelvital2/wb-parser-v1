@@ -198,14 +198,13 @@ The runner:
   non-blockingly in that order and retains them through final manifest fsync;
 - resolves all configured `xinfo.dest` values under the held locks, writes the
   immutable effective-plan snapshot, then collects the region scopes serially;
-- checks one unchanged egress identity primarily through the same explicitly
-  configured proxy route and requests session, using secret-free per-request
-  headers, and stores only a masked value plus an experiment-local salted hash;
-- if that neutral public IP service is unavailable with a network error, uses
-  the secret-free local Proxy Health control plane after a bounded five-second
-  primary attempt; the fallback must report `ok=true`,
-  `marketplaceTransportVerified=true` and a valid managed external IP, remains
-  latched for that process, and is never used for resolver or WB search data;
+- checks one unchanged egress identity through the same explicitly configured
+  proxy route and requests session, using secret-free per-request headers, and
+  stores only a masked value plus an experiment-local salted hash;
+- tries a bounded ordered neutral-source list with one five-second request per
+  source; plain sources require a complete IP body and Yandex requires its
+  explicit IPv4 DOM field; all sources exhausted means fail-closed before
+  resolver/search;
 - sends the exact resolved value as the search `dest`;
 - derives pages from the plan depth: supported depth is `100..1000` in
   100-item increments, with exactly 100 unique valid products required per
@@ -253,13 +252,11 @@ start check. Across resumed processes, egress may differ; each segment must
 still be internally constant. Evidence stores only masked identities and
 run-local hashes, never a full IP.
 
-The neutral service remains the preferred independent identity source. On
-mobile routes that block neutral IP-check services while allowing WB, the
-local Proxy Health fallback provides managed control-plane evidence rather
-than independent public verification. It fails closed when marketplace health
-is false or the reported identity is invalid. A spontaneous upstream IP
-change not observed by the proxy controller is the residual limitation of this
-fallback.
+Neutral sources remain independent identity evidence. The local Proxy Health
+API intentionally reports marketplace transport without resolving an external
+IP during `/health`; it cannot replace that evidence. This prevents an empty or
+controller-only identity from being treated as proof that egress stayed
+constant inside a segment.
 
 Pages are first written below `pending_segments`. Only after the segment end
 check succeeds does an immutable segment record authorize idempotent promotion

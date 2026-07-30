@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import html
 import io
 import ipaddress
 import json
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
-from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -59,7 +60,14 @@ REGIONAL_LATEST_REGION_SCHEMA_VERSION = "wb_regional_latest_region_v1"
 COLLECTION_SCOPE = "regional"
 GEO_RESOLVER_URL = "https://user-geo-data.wildberries.ru/get-geo-info"
 EGRESS_CHECK_URL = "https://api.ipify.org"
-EGRESS_FALLBACK_TIMEOUT_SECONDS = 5.0
+EGRESS_CHECK_URLS = (
+    EGRESS_CHECK_URL,
+    "https://yandex.ru/internet/",
+    "https://checkip.amazonaws.com",
+    "https://icanhazip.com",
+)
+EGRESS_CHECK_TIMEOUT_SECONDS = 5.0
+EGRESS_MAX_RESPONSE_BYTES = 512_000
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 NIGHTLY_PREFLIGHT_CUTOFF = time(23, 45)
 NIGHTLY_COLLECTION_START = time(0, 15)
@@ -797,13 +805,26 @@ class RequestsScopedTransport:
         request_headers: Mapping[str, str] | None = None,
         resolver_url: str = GEO_RESOLVER_URL,
         egress_check_url: str = EGRESS_CHECK_URL,
+        egress_check_urls: tuple[str, ...] | None = None,
         egress_session: requests.Session | None = None,
-        egress_fallback_url: str | None = None,
-        egress_fallback_session: requests.Session | None = None,
         retry_http_statuses: frozenset[int] | None = None,
     ) -> None:
         if not endpoint_urls:
             raise CollectionPlanRunError("SERP endpoint list is empty")
+        selected_egress_urls = (
+            (egress_check_url,)
+            if egress_check_urls is None
+            else egress_check_urls
+        )
+        if not selected_egress_urls or any(
+            type(value) is not str or not value.strip()
+            for value in selected_egress_urls
+        ):
+            raise CollectionPlanRunError("egress endpoint list is invalid")
+        if len(set(selected_egress_urls)) != len(selected_egress_urls):
+            raise CollectionPlanRunError(
+                "egress endpoint list contains duplicates"
+            )
         self.session = session
         self.request_params = dict(request_params)
         self.endpoint_urls = endpoint_urls
@@ -811,11 +832,8 @@ class RequestsScopedTransport:
         self.referer_base = referer_base
         self.request_headers = dict(request_headers or {})
         self.resolver_url = resolver_url
-        self.egress_check_url = egress_check_url
+        self.egress_check_urls = tuple(selected_egress_urls)
         self.egress_session = egress_session or session
-        self.egress_fallback_url = egress_fallback_url
-        self.egress_fallback_session = egress_fallback_session
-        self._egress_fallback_active = False
         self.retry_http_statuses = retry_http_statuses or frozenset(
             {429, 498, 500, 502, 503, 504}
         )
@@ -899,14 +917,6 @@ class RequestsScopedTransport:
         if cookie_value:
             headers["cookie"] = cookie_value
         assert_requests_session_proxy(session, route)
-        fallback_url = cls._proxy_health_url(
-            os.getenv("PARSER_WB_PROXY_ROTATE_URL", "")
-        )
-        fallback_session: requests.Session | None = None
-        if fallback_url is not None:
-            fallback_session = requests.Session()
-            fallback_session.trust_env = False
-            fallback_session.proxies.clear()
 
         urls: list[str] = []
         candidates: list[Any] = [serp.get("base_url")]
@@ -930,8 +940,7 @@ class RequestsScopedTransport:
             ),
             request_headers=headers,
             egress_session=session,
-            egress_fallback_url=fallback_url,
-            egress_fallback_session=fallback_session,
+            egress_check_urls=EGRESS_CHECK_URLS,
             retry_http_statuses=frozenset(
                 int(value)
                 for value in (
@@ -942,32 +951,6 @@ class RequestsScopedTransport:
                 and isinstance(value, (int, str))
                 and str(value).isdigit()
             ),
-        )
-
-    @staticmethod
-    def _proxy_health_url(rotate_url: str) -> str | None:
-        if not rotate_url:
-            return None
-        try:
-            parsed = urlsplit(rotate_url)
-            port = parsed.port
-        except ValueError as exc:
-            raise CollectionPlanRunError(
-                "proxy rotation URL is invalid"
-            ) from exc
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or port is None
-        ):
-            raise CollectionPlanRunError("proxy rotation URL is invalid")
-        host = parsed.hostname
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        return urlunsplit(
-            (parsed.scheme, f"{host}:{port}", "/health", "", "")
         )
 
     @staticmethod
@@ -1015,85 +998,49 @@ class RequestsScopedTransport:
         return dest
 
     def egress_identity(self, *, timeout_seconds: float) -> str:
-        if self._egress_fallback_active:
-            return self._fallback_egress_identity(
-                timeout_seconds=timeout_seconds
-            )
-        try:
-            response = self.egress_session.get(
-                self.egress_check_url,
-                headers={
-                    "accept": "text/plain",
-                    "user-agent": "parser-wb-egress-check/1",
-                },
-                timeout=min(
-                    self._network_timeout(timeout_seconds),
-                    EGRESS_FALLBACK_TIMEOUT_SECONDS,
-                ),
-            )
-        except requests.RequestException as exc:
-            if (
-                self.egress_fallback_url is not None
-                and self.egress_fallback_session is not None
-            ):
-                self._egress_fallback_active = True
-                return self._fallback_egress_identity(
-                    timeout_seconds=timeout_seconds
+        for url in self.egress_check_urls:
+            try:
+                response = self.egress_session.get(
+                    url,
+                    headers={
+                        "accept": "text/plain,text/html;q=0.9",
+                        "user-agent": "parser-wb-egress-check/1",
+                    },
+                    timeout=min(
+                        self._network_timeout(timeout_seconds),
+                        EGRESS_CHECK_TIMEOUT_SECONDS,
+                    ),
                 )
-            raise ScopedTransportError("egress_network_error") from exc
-        if response.status_code != 200:
-            raise ScopedTransportError(
-                f"egress_http_{response.status_code}",
-                http_status=response.status_code,
-            )
-        value = str(response.text or "").strip()
-        try:
-            return str(ipaddress.ip_address(value))
-        except ValueError as exc:
-            raise ScopedTransportError("egress_invalid_ip") from exc
+            except requests.RequestException:
+                continue
+            if response.status_code != 200:
+                continue
+            value = self._egress_candidate(url, str(response.text or ""))
+            if value is None:
+                continue
+            try:
+                return str(ipaddress.ip_address(value))
+            except ValueError:
+                continue
+        raise ScopedTransportError("egress_identity_unavailable")
 
-    def _fallback_egress_identity(self, *, timeout_seconds: float) -> str:
-        if (
-            self.egress_fallback_url is None
-            or self.egress_fallback_session is None
-        ):
-            raise ScopedTransportError("egress_fallback_unavailable")
-        try:
-            response = self.egress_fallback_session.get(
-                self.egress_fallback_url,
-                headers={
-                    "accept": "application/json",
-                    "user-agent": "parser-wb-egress-control/1",
-                },
-                timeout=self._network_timeout(timeout_seconds),
+    @staticmethod
+    def _egress_candidate(url: str, body: str) -> str | None:
+        if len(body.encode("utf-8")) > EGRESS_MAX_RESPONSE_BYTES:
+            return None
+        if urlsplit(url).hostname == "yandex.ru":
+            match = re.search(
+                r'''data-title=["']ipv4["'].*?'''
+                r'''general-info__parameter-value[^>]*>(.*?)</div>''',
+                body,
+                flags=re.IGNORECASE | re.DOTALL,
             )
-        except requests.RequestException as exc:
-            raise ScopedTransportError(
-                "egress_fallback_network_error"
-            ) from exc
-        if response.status_code != 200:
-            raise ScopedTransportError(
-                f"egress_fallback_http_{response.status_code}",
-                http_status=response.status_code,
-            )
-        payload = self._response_json(
-            response,
-            code="egress_fallback",
-        )
-        if (
-            payload.get("ok") is not True
-            or payload.get("marketplaceTransportVerified") is not True
-        ):
-            raise ScopedTransportError("egress_fallback_unhealthy")
-        value = payload.get("external_ip")
-        if not isinstance(value, str):
-            raise ScopedTransportError("egress_fallback_invalid_ip")
-        try:
-            return str(ipaddress.ip_address(value.strip()))
-        except ValueError as exc:
-            raise ScopedTransportError(
-                "egress_fallback_invalid_ip"
-            ) from exc
+            if match is None:
+                return None
+            return html.unescape(
+                re.sub(r"<[^>]+>", "", match.group(1))
+            ).strip()
+        return body.strip()
 
     def resolve_destination(
         self,
@@ -1448,12 +1395,6 @@ class RequestsScopedTransport:
         self.session.close()
         if self.egress_session is not self.session:
             self.egress_session.close()
-        if (
-            self.egress_fallback_session is not None
-            and self.egress_fallback_session is not self.session
-            and self.egress_fallback_session is not self.egress_session
-        ):
-            self.egress_fallback_session.close()
 
 
 def _mask_egress(value: str) -> str:

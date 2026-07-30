@@ -378,16 +378,16 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   keep the existing direct route for the local rotation control endpoint, then
   recreate an explicitly proxied session for later WB traffic. See
   `docs/WB_PROXY_ONLY_RUNBOOK.md`. Never print proxy values or credentials.
-- Regional collection must keep the neutral IP check as its primary
-  same-proxy evidence. If that public service fails with a network error, the
-  runner may use only the secret-free `/health` URL derived from the ignored
-  `PARSER_WB_PROXY_ROTATE_URL`: strip path/query/token, use a separate direct
-  session without cookies, marketplace headers, credentials or environment
-  proxies, and require HTTP 200, `ok=true`,
-  `marketplaceTransportVerified=true` and a valid managed external IP. Latch
-  this fallback for the process after the first primary timeout. Never route
-  resolver or search data through it, and fail closed on an unhealthy or
-  malformed response. See `docs/WB_PROXY_ONLY_RUNBOOK.md`.
+- Regional collection must verify egress identity through a bounded ordered
+  list of neutral sources using the same explicitly proxied, secret-free
+  requests session as resolver/search. Plain-IP sources accept only a complete
+  IP body; the Yandex Internetometer source accepts only its explicit IPv4 DOM
+  field. A timeout, non-200 or malformed response advances once to the next
+  source without retry or rotation; exhaustion fails closed before
+  resolver/SERP. The local Proxy Health `/health` endpoint is control-plane
+  diagnostics only: its contract intentionally leaves `external_ip` empty, so
+  it must never satisfy egress identity or publication gates. See
+  `docs/WB_PROXY_ONLY_RUNBOOK.md`.
 - Isolated regional SERP runs must use
   `scripts/run_wb_collection_plan.sh --config ... --plan-file ... --no-publish`.
   The launcher loads the required runtime before Python starts. Query pack,
