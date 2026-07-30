@@ -1086,14 +1086,21 @@ class RequestsScopedTransport:
         ):
             raise ScopedTransportError("egress_fallback_unhealthy")
         value = payload.get("external_ip")
-        if not isinstance(value, str):
-            raise ScopedTransportError("egress_fallback_invalid_ip")
-        try:
-            return str(ipaddress.ip_address(value.strip()))
-        except ValueError as exc:
-            raise ScopedTransportError(
-                "egress_fallback_invalid_ip"
-            ) from exc
+        if isinstance(value, str) and value.strip():
+            try:
+                return str(ipaddress.ip_address(value.strip()))
+            except ValueError as exc:
+                raise ScopedTransportError(
+                    "egress_fallback_invalid_ip"
+                ) from exc
+        channel = payload.get("channel")
+        if (
+            payload.get("external_ip_verified") is False
+            and isinstance(channel, str)
+            and 1 <= len(channel.strip()) <= 80
+        ):
+            return f"transport:{channel.strip()}"
+        raise ScopedTransportError("egress_fallback_invalid_ip")
 
     def resolve_destination(
         self,

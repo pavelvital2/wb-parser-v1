@@ -2667,6 +2667,44 @@ def test_requests_transport_falls_back_to_verified_proxy_health() -> None:
     assert primary.calls[0][1]["timeout"] == 5.0
 
 
+def test_requests_transport_uses_verified_channel_when_ip_services_are_blocked() -> None:
+    fallback = FakeSession(
+        [
+            FakeResponse(
+                payload={
+                    "ok": True,
+                    "marketplaceTransportVerified": True,
+                    "external_ip": "",
+                    "external_ip_verified": False,
+                    "channel": "Ethernet 5",
+                }
+            ),
+            FakeResponse(
+                payload={
+                    "ok": True,
+                    "marketplaceTransportVerified": True,
+                    "external_ip": "",
+                    "external_ip_verified": False,
+                    "channel": "Ethernet 5",
+                }
+            ),
+        ]
+    )
+    transport = RequestsScopedTransport(
+        session=FakeSession([]),  # type: ignore[arg-type]
+        request_params={},
+        endpoint_urls=("https://search.example.test",),
+        timeout_seconds=45,
+        referer_base="https://www.wildberries.ru/search?query=",
+        egress_fallback_url="http://127.0.0.1:9840/health",
+        egress_fallback_session=fallback,  # type: ignore[arg-type]
+    )
+    transport._egress_fallback_active = True
+
+    assert transport.egress_identity(timeout_seconds=10) == "transport:Ethernet 5"
+    assert transport.egress_identity(timeout_seconds=10) == "transport:Ethernet 5"
+
+
 @pytest.mark.parametrize(
     "payload",
     [
