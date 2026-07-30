@@ -472,6 +472,128 @@ def test_bounded_runner_accepts_live_total_change_above_depth(
     } == {1000}
 
 
+def test_bounded_live_total_drift_remains_resumable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["schema_version"] = "wb_collection_plan_v2"
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    plan["runtime_window"] = {
+        "mode": "bounded_resumable",
+        "scheduled_start_msk": "00:15",
+        "new_run_start_grace_seconds": 43200,
+        "max_invocation_runtime_seconds": 21600,
+        "absolute_cutoff_msk": "23:00",
+        "minimum_resume_window_seconds": 1800,
+        "finalization_reserve_seconds": 60,
+    }
+    _write_json(plan_path, plan)
+
+    class LiveTotalTransport(FakeTransport):
+        def search(
+            self,
+            request: ScopedSearchRequest,
+            *,
+            timeout_seconds: float,
+        ) -> ScopedSearchResult:
+            result = super().search(
+                request,
+                timeout_seconds=timeout_seconds,
+            )
+            return ScopedSearchResult(
+                payload={
+                    **result.payload,
+                    "total": (
+                        83_256
+                        if request.task.page % 2
+                        else 83_255
+                    ),
+                },
+                endpoint_id=result.endpoint_id,
+                dest_id_sent=result.dest_id_sent,
+                attempted_endpoint_ids=result.attempted_endpoint_ids,
+            )
+
+    first = LiveTotalTransport(failure_call=11)
+    with pytest.raises(ScopedTransportError, match="search_http_498"):
+        _run(config, plan_path, first)
+
+    assert validate_resumable_collection_state(
+        config=config,
+        plan_path=plan_path,
+        run_id=RUN_ID,
+        transport=LiveTotalTransport(),
+    )
+
+    resumed = LiveTotalTransport()
+    manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=resumed,
+        resume_run_id=RUN_ID,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+        egress_hash_salt=b"test-only-salt",
+    )
+
+    assert manifest["status"] == "success"
+    assert manifest["complete"] is True
+    assert len(resumed.search_calls) == 50
+    assert resumed.search_calls[0].task.query_id == "shevrony"
+
+
+def test_bounded_runner_rejects_total_change_across_depth_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["schema_version"] = "wb_collection_plan_v2"
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    plan["runtime_window"] = {
+        "mode": "bounded_resumable",
+        "scheduled_start_msk": "00:15",
+        "new_run_start_grace_seconds": 43200,
+        "max_invocation_runtime_seconds": 21600,
+        "absolute_cutoff_msk": "23:00",
+        "minimum_resume_window_seconds": 1800,
+        "finalization_reserve_seconds": 60,
+    }
+    _write_json(plan_path, plan)
+
+    class ChangedCapTransport(FakeTransport):
+        def search(
+            self,
+            request: ScopedSearchRequest,
+            *,
+            timeout_seconds: float,
+        ) -> ScopedSearchResult:
+            result = super().search(
+                request,
+                timeout_seconds=timeout_seconds,
+            )
+            return ScopedSearchResult(
+                payload={
+                    **result.payload,
+                    "total": 83_256 if request.task.page == 1 else 999,
+                },
+                endpoint_id=result.endpoint_id,
+                dest_id_sent=result.dest_id_sent,
+                attempted_endpoint_ids=result.attempted_endpoint_ids,
+            )
+
+    with pytest.raises(
+        CollectionPlanRunError,
+        match="search_capped_total_changed_between_pages",
+    ):
+        _run(config, plan_path, ChangedCapTransport())
+
+
 def test_runner_honors_plan_depth_with_distinct_page_identity_and_positions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2437,6 +2559,84 @@ def test_ordered_search_falls_back_for_production_nested_promo_anomaly() -> None
 
     assert result.endpoint_id == "fallback-1"
     assert result.attempted_endpoint_ids == ("primary", "fallback-1")
+
+
+def test_ordered_search_falls_back_for_same_page_duplicate_payload() -> None:
+    duplicate_products = _products(1_000)
+    duplicate_products[-2]["id"] = duplicate_products[0]["id"]
+    duplicate_products[-1]["id"] = duplicate_products[1]["id"]
+    session = FakeSession(
+        [
+            FakeResponse(payload={"products": duplicate_products}),
+            FakeResponse(payload={"products": _products(2_000)}),
+        ]
+    )
+    transport = _ordered_requests_transport(session)
+
+    result = transport.search_ordered(
+        _scoped_search_request("primary"),
+        timeout_seconds=10,
+    )
+
+    assert result.endpoint_id == "fallback-1"
+    assert result.attempted_endpoint_ids == ("primary", "fallback-1")
+    assert len(session.calls) == 2
+
+
+def test_ordered_search_rejects_duplicate_payload_from_all_endpoints() -> None:
+    duplicate_products = _products(1_000)
+    duplicate_products[-1]["id"] = duplicate_products[0]["id"]
+    session = FakeSession(
+        [
+            FakeResponse(payload={"products": duplicate_products}),
+            FakeResponse(payload={"products": duplicate_products}),
+        ]
+    )
+    transport = _ordered_requests_transport(session)
+
+    with pytest.raises(ScopedTransportError) as caught:
+        transport.search_ordered(
+            _scoped_search_request("primary"),
+            timeout_seconds=10,
+        )
+
+    assert caught.value.code == "search_product_duplicate"
+    assert caught.value.attempted_endpoint_ids == (
+        "primary",
+        "fallback-1",
+    )
+    assert len(session.calls) == 2
+
+
+def test_ordered_search_duplicate_then_rate_limit_retains_all_attempts() -> None:
+    duplicate_products = _products(1_000)
+    duplicate_products[-1]["id"] = duplicate_products[0]["id"]
+    session = FakeSession(
+        [
+            FakeResponse(payload={"products": duplicate_products}),
+            FakeResponse(status_code=498),
+        ]
+    )
+    transport = _ordered_requests_transport(session)
+    transport.endpoint_policy = EffectiveEndpointPolicy(
+        selection_mode="ordered_fallbacks",
+        endpoint_ids=("primary", "fallback-1"),
+        pinned_endpoint_id="fallback-1",
+    )
+
+    with pytest.raises(ScopedTransportError) as caught:
+        transport.search_ordered(
+            _scoped_search_request("fallback-1"),
+            timeout_seconds=10,
+        )
+
+    assert caught.value.code == "search_product_duplicate"
+    assert caught.value.endpoint_id == "fallback-1"
+    assert caught.value.attempted_endpoint_ids == (
+        "fallback-1",
+        "primary",
+    )
+    assert len(session.calls) == 2
 
 
 def test_ordered_search_rechecks_runtime_deadline_before_each_endpoint_attempt() -> None:

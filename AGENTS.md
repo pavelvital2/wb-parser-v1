@@ -536,8 +536,11 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   regional warehouse. Historical global WB warehouse rows are assigned
   `region_id=yaroslavl` during regional migration; Yaroslavl is historical
   provenance, not a future collection region. Depth 1000 is a maximum:
-  bounded v2 query segments require consistent payload-total evidence and may
-  complete in 1-10 pages. Position facts use
+  bounded v2 query segments require stable `min(payload_total, depth)`, while
+  retaining and validating each page's exact payload total, and may complete
+  in 1-10 pages. A same-page duplicate product remains malformed. The ordered
+  transport may reject that endpoint response and try the next configured
+  endpoint once; duplicates from every endpoint fail closed. Position facts use
   `(run_id, region_id, query_id, absolute_position)` and preserve repeated
   product IDs; deduplication is seller-input-only. Legacy Yaroslavl import is
   an incremental set-based sync with row hashes, not a whole-file hash gate.

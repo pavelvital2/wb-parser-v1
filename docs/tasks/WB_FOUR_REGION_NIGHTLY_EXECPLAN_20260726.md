@@ -109,6 +109,13 @@ warehouse remain blocked until all 120 verified segments are complete.
 Observed durations from run reports may be reported, but never replace this
 hard runtime contract.
 
+For depth-capped queries, WB's uncapped payload total may drift between pages.
+The segment remains valid only while `min(payload_total, depth)` is constant;
+every page checkpoint still pins its exact observed total and checksum. A
+same-page duplicate product is never a position fact. It makes that endpoint
+response unsuitable, permits only the existing ordered endpoint fallback and
+fails the segment when no configured endpoint returns a valid page.
+
 Downstream uses a separate bounded invocation under the same absolute cutoff.
 Its seller checkpoint is rechecked before every seller HTTP attempt, and
 warehouse/final pointer publication recheck the deadline. A completed SERP run

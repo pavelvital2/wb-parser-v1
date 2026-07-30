@@ -1414,11 +1414,22 @@ class RequestsScopedTransport:
                     attempted_endpoint_ids=tuple(attempted),
                 ) from exc
             try:
-                _extract_products(payload)
+                products = _extract_products(payload)
+                product_ids = [
+                    _normalize_product_id(product) for product in products
+                ]
+                if len(product_ids) != len(set(product_ids)):
+                    raise CollectionPlanRunError(
+                        "search_product_duplicate"
+                    )
             except CollectionPlanRunError as exc:
-                if str(exc) != "retryable_payload_anomaly_nested_promo":
+                error_code = str(exc)
+                if error_code not in {
+                    "retryable_payload_anomaly_nested_promo",
+                    "search_product_duplicate",
+                }:
                     raise ScopedTransportError(
-                        str(exc),
+                        error_code,
                         request_sent=True,
                         dest_id_sent=request.dest_id_observed,
                         http_status=200,
@@ -1426,7 +1437,12 @@ class RequestsScopedTransport:
                         attempted_endpoint_ids=tuple(attempted),
                     ) from exc
                 last_payload_anomaly = ScopedTransportError(
-                    "search_payload_anomaly_nested_promo",
+                    (
+                        "search_payload_anomaly_nested_promo"
+                        if error_code
+                        == "retryable_payload_anomaly_nested_promo"
+                        else error_code
+                    ),
                     request_sent=True,
                     dest_id_sent=request.dest_id_observed,
                     http_status=200,
@@ -1448,7 +1464,14 @@ class RequestsScopedTransport:
             )
 
         if last_payload_anomaly is not None:
-            raise last_payload_anomaly
+            raise ScopedTransportError(
+                last_payload_anomaly.code,
+                request_sent=True,
+                dest_id_sent=request.dest_id_observed,
+                http_status=last_payload_anomaly.http_status,
+                endpoint_id=last_payload_anomaly.endpoint_id,
+                attempted_endpoint_ids=tuple(attempted),
+            )
         if last_rate_limited is not None:
             raise last_rate_limited
         raise ScopedTransportError(
@@ -3058,6 +3081,7 @@ class CollectionPlanRunner:
             if bounded:
                 actual_product_ids: list[str] = []
                 observed_total: int | None = None
+                observed_capped_total: int | None = None
                 for page_ref in normalized_pages:
                     page = int(page_ref["page"])
                     raw_bytes = _read_regular_bytes(
@@ -3078,13 +3102,15 @@ class CollectionPlanRunner:
                         depth=bundle.collection_plan.depth,
                     )
                     if (
-                        observed_total is not None
-                        and observed_total != page_contract.payload_total
+                        observed_capped_total is not None
+                        and observed_capped_total
+                        != page_contract.capped_total
                     ):
                         raise CollectionPlanRunError(
-                            "bounded segment payload total changed"
+                            "bounded segment capped total changed"
                         )
                     observed_total = page_contract.payload_total
+                    observed_capped_total = page_contract.capped_total
                     page_product_ids = [
                         _normalize_product_id(product)
                         for product in page_contract.products
@@ -3129,10 +3155,7 @@ class CollectionPlanRunner:
                             )
                 actual_completion = {
                     "payload_total": observed_total,
-                    "capped_total": min(
-                        int(observed_total),
-                        bundle.collection_plan.depth,
-                    ),
+                    "capped_total": observed_capped_total,
                     "pages_count": len(normalized_pages),
                     "products_count": len(actual_product_ids),
                     "terminal_page": len(normalized_pages),
