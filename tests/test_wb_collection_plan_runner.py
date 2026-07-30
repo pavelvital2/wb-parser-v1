@@ -401,22 +401,24 @@ def test_successful_runner_writes_only_scoped_outputs_and_provenance(
     assert "proxy_url" not in serialized.lower()
 
 
-def test_successful_runner_accepts_verified_transport_identity(
+def test_runner_rejects_transport_channel_as_egress_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _root, config, plan_path = _project(tmp_path, monkeypatch)
     transport = FakeTransport(
-        egress_values=["transport:Ethernet 5"] * 3,
+        egress_values=["transport:test-channel"],
     )
 
-    manifest = _run(config, plan_path, transport)
+    with pytest.raises(
+        CollectionPlanRunError,
+        match="egress identity is not an IP address",
+    ):
+        _run(config, plan_path, transport)
 
-    assert manifest["status"] == "success"
-    assert manifest["egress"]["masked"] == "transport:x"
-    assert manifest["egress"]["verification_status"] == "verified_constant"
-    assert manifest["egress"]["constant"] is True
-    assert "Ethernet 5" not in json.dumps(manifest)
+    assert transport.egress_calls == 1
+    assert transport.resolve_calls == []
+    assert transport.search_calls == []
 
 
 def test_runner_honors_plan_depth_with_distinct_page_identity_and_positions(
