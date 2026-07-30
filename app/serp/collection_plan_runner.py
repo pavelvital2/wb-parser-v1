@@ -3814,13 +3814,15 @@ class CollectionPlanRunner:
                                             "capped_total": page_contract.capped_total,
                                         }
                                     elif (
-                                        bounded_completion["payload_total"]
-                                        != page_contract.payload_total
-                                        or bounded_completion["capped_total"]
+                                        bounded_completion["capped_total"]
                                         != page_contract.capped_total
                                     ):
                                         raise CollectionPlanRunError(
-                                            "search_payload_total_changed_between_pages"
+                                            "search_capped_total_changed_between_pages"
+                                        )
+                                    else:
+                                        bounded_completion["payload_total"] = (
+                                            page_contract.payload_total
                                         )
                                     if page_contract.terminal:
                                         bounded_completion.update(
