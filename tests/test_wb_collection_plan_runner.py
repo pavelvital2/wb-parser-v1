@@ -2037,7 +2037,7 @@ def test_matrix_continuation_uses_shared_deadline_after_new_run_window(
         plan_path=plan_path,
         region_registry_path=root / REGIONS_RELATIVE,
     )
-    current = datetime(2026, 7, 26, 1, 0, tzinfo=timezone.utc)
+    current = datetime(2026, 7, 26, 9, 16, tzinfo=timezone.utc)
     absolute_deadline = current + timedelta(hours=2)
     normal = CollectionPlanRunner(
         config=config,

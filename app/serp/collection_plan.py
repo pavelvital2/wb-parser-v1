@@ -685,7 +685,7 @@ def _load_runtime_window(value: Any) -> CollectionRuntimeWindow:
             window["new_run_start_grace_seconds"],
             field=f"{field}.new_run_start_grace_seconds",
             minimum=0,
-            maximum=7200,
+            maximum=43200,
         ),
         max_invocation_runtime_seconds=max_invocation_runtime_seconds,
         absolute_cutoff_msk=absolute_cutoff_msk,

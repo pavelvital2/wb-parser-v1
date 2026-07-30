@@ -24,6 +24,7 @@ from app.serp.collection_plan import (
 from app.serp.collection_plan_runner import (
     CollectionPlanRunner,
     CollectionPlanRunError,
+    DeadlineGuard,
     PRODUCT_FIELDS,
     ScopedPaths,
     ScopedSearchRequest,
@@ -769,7 +770,7 @@ def test_bounded_plan_rejects_late_new_start_before_network(
 ) -> None:
     _root, config, plan_path = _project(tmp_path, monkeypatch)
     transport = FourRegionFakeTransport()
-    now = datetime(2026, 7, 25, 21, 46, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 26, 9, 16, tzinfo=timezone.utc)
     runner = CollectionPlanRunner(
         config=config,
         plan_path=plan_path,
@@ -783,6 +784,17 @@ def test_bounded_plan_rejects_late_new_start_before_network(
     assert transport.resolve_calls == []
     assert transport.search_calls == []
     assert transport.egress_calls == 0
+
+
+def test_bounded_plan_allows_recovery_start_within_twelve_hours(
+) -> None:
+    now = datetime(2026, 7, 26, 3, 30, tzinfo=timezone.utc)
+    guard = DeadlineGuard.for_runtime_window(
+        REVIEWED_FOUR_REGION_RUNTIME_WINDOW,
+        resume=False,
+        now=lambda: now,
+    )
+    assert guard.remaining_seconds() == 21600
 
 
 def test_cutoff_keeps_verified_segment_and_resume_starts_next_query(
