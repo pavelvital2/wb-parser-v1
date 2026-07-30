@@ -78,6 +78,10 @@ _MASKED_IPV4_RE = re.compile(
     r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.x\.x$"
 )
 _MASKED_IPV6_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{4}::x$")
+_TRANSPORT_IDENTITY_RE = re.compile(
+    r"^transport:[A-Za-z0-9][A-Za-z0-9 ._()-]{0,79}$"
+)
+_MASKED_TRANSPORT_RE = re.compile(r"^transport:x$")
 
 LockEventHook = Callable[[str, str, Path], None]
 WriteEventHook = Callable[[str, Path], None]
@@ -1097,7 +1101,9 @@ class RequestsScopedTransport:
         if (
             payload.get("external_ip_verified") is False
             and isinstance(channel, str)
-            and 1 <= len(channel.strip()) <= 80
+            and _TRANSPORT_IDENTITY_RE.fullmatch(
+                f"transport:{channel.strip()}"
+            )
         ):
             return f"transport:{channel.strip()}"
         raise ScopedTransportError("egress_fallback_invalid_ip")
@@ -1463,8 +1469,17 @@ class RequestsScopedTransport:
             self.egress_fallback_session.close()
 
 
+def _normalize_egress_identity(value: str) -> str:
+    if _TRANSPORT_IDENTITY_RE.fullmatch(value):
+        return value
+    return str(ipaddress.ip_address(value))
+
+
 def _mask_egress(value: str) -> str:
-    parsed = ipaddress.ip_address(value)
+    normalized = _normalize_egress_identity(value)
+    if normalized.startswith("transport:"):
+        return "transport:x"
+    parsed = ipaddress.ip_address(normalized)
     if parsed.version == 4:
         first, second, *_rest = parsed.exploded.split(".")
         return f"{first}.{second}.x.x"
@@ -1767,9 +1782,11 @@ class CollectionPlanRunner:
             )
         )
         try:
-            normalized = str(ipaddress.ip_address(value))
+            normalized = _normalize_egress_identity(value)
         except ValueError as exc:
-            raise CollectionPlanRunError("egress identity is not an IP address") from exc
+            raise CollectionPlanRunError(
+                "egress identity is neither an IP address nor a verified transport"
+            ) from exc
         if expected is not None and normalized != expected:
             raise EgressIdentityChangedError(
                 "egress identity changed during scoped run"
@@ -2715,6 +2732,7 @@ class CollectionPlanRunner:
                 or not (
                     _MASKED_IPV4_RE.fullmatch(masked)
                     or _MASKED_IPV6_RE.fullmatch(masked)
+                    or _MASKED_TRANSPORT_RE.fullmatch(masked)
                 )
                 or type(digest) is not str
                 or not _SHA256_RE.fullmatch(digest)

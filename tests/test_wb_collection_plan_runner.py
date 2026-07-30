@@ -341,7 +341,6 @@ def test_successful_runner_writes_only_scoped_outputs_and_provenance(
                 "1",
             )
         )
-
     for region_id in ("moscow", "rostov-on-don"):
         raw_dir = (
             root
@@ -400,6 +399,24 @@ def test_successful_runner_writes_only_scoped_outputs_and_provenance(
     assert "cookie" not in serialized.lower()
     assert "authorization" not in serialized.lower()
     assert "proxy_url" not in serialized.lower()
+
+
+def test_successful_runner_accepts_verified_transport_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    transport = FakeTransport(
+        egress_values=["transport:Ethernet 5"] * 3,
+    )
+
+    manifest = _run(config, plan_path, transport)
+
+    assert manifest["status"] == "success"
+    assert manifest["egress"]["masked"] == "transport:x"
+    assert manifest["egress"]["verification_status"] == "verified_constant"
+    assert manifest["egress"]["constant"] is True
+    assert "Ethernet 5" not in json.dumps(manifest)
 
 
 def test_runner_honors_plan_depth_with_distinct_page_identity_and_positions(
