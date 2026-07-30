@@ -187,9 +187,12 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   The interrupted production run `20260730_082402Z` also has one reviewed
   hash-only input-attestation transition for approved parser code repairs.
   It is bound to the exact run, plan, effective-plan hash, prior transport
-  fingerprint and prior input-manifest hash. Endpoint order, request params,
-  proxy route and runtime-input hashes must remain exact; any other run or
-  provenance drift remains fail-closed before network I/O.
+  fingerprint, prior input-manifest hash, target manifest byte template and
+  target runner source byte template. The target projections normalize only
+  their mutually dependent SHA fields, avoiding self-reference without
+  accepting later code changes. Endpoint order, request params, proxy route
+  and runtime-input hashes must remain exact; any other run or provenance
+  drift remains fail-closed before network I/O.
   The audited one-plan `--plan-file` mode remains available for manual
   compatibility but is not the coordinator schedule projection.
 - A new four-region run may start during the reviewed 12-hour recovery window

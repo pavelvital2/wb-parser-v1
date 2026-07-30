@@ -1639,13 +1639,19 @@ def test_reviewed_production_attestation_transition_is_hash_only() -> None:
         endpoint_sha256=stored["ordered_endpoint_urls_sha256"],
         request_params_sha256=stored["request_params_sha256"],
         proxy_route_sha256=stored["proxy_route_sha256"],
-        input_manifest_sha256="c" * 64,
+        input_manifest_sha256=hashlib.sha256(
+            (
+                PROJECT_ROOT
+                / "config/wb/nightly_coordinator_adapter_inputs.json"
+            ).read_bytes()
+        ).hexdigest(),
         runtime_input_sha256=stored["runtime_input_sha256"],
     )
 
     transition = runner_module._resume_attestation_transition(
         stored=stored,
         current=current,
+        project_root=PROJECT_ROOT,
         run_id="20260730_082402Z",
         collection_plan_id="shevron-four-regions-top1000-v2",
         effective_plan_sha256=(
@@ -1676,6 +1682,7 @@ def test_reviewed_production_attestation_transition_is_hash_only() -> None:
         "proxy_route",
         "runtime_input",
         "claimed_digest",
+        "other_current_input_manifest",
     ],
 )
 def test_reviewed_attestation_transition_rejects_other_drift(
@@ -1702,7 +1709,12 @@ def test_reviewed_attestation_transition_rejects_other_drift(
         endpoint_sha256=stored["ordered_endpoint_urls_sha256"],
         request_params_sha256=stored["request_params_sha256"],
         proxy_route_sha256=stored["proxy_route_sha256"],
-        input_manifest_sha256="c" * 64,
+        input_manifest_sha256=hashlib.sha256(
+            (
+                PROJECT_ROOT
+                / "config/wb/nightly_coordinator_adapter_inputs.json"
+            ).read_bytes()
+        ).hexdigest(),
         runtime_input_sha256=stored["runtime_input_sha256"],
     )
     run_id = "20260730_082402Z"
@@ -1718,6 +1730,15 @@ def test_reviewed_attestation_transition_rejects_other_drift(
         effective_sha256 = "d" * 64
     elif mismatch == "claimed_digest":
         current["fingerprint_sha256"] = "d" * 64
+    elif mismatch == "other_current_input_manifest":
+        current["input_manifest_sha256"] = "d" * 64
+        current["fingerprint_sha256"] = runner_module._canonical_sha256(
+            {
+                key: value
+                for key, value in current.items()
+                if key != "fingerprint_sha256"
+            }
+        )
     else:
         field = {
             "endpoint": "ordered_endpoint_urls_sha256",
@@ -1738,9 +1759,97 @@ def test_reviewed_attestation_transition_rejects_other_drift(
         runner_module._resume_attestation_transition(
             stored=stored,
             current=current,
+            project_root=PROJECT_ROOT,
             run_id=run_id,
             collection_plan_id=collection_plan_id,
             effective_plan_sha256=effective_sha256,
+        )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["other_manifest_input", "runner_source", "manifest_format"],
+)
+def test_reviewed_attestation_transition_rejects_other_target_manifest(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    root = tmp_path / "project"
+    manifest_path = (
+        root / "config/wb/nightly_coordinator_adapter_inputs.json"
+    )
+    runner_path = root / "app/serp/collection_plan_runner.py"
+    manifest_path.parent.mkdir(parents=True)
+    runner_path.parent.mkdir(parents=True)
+    shutil.copy2(
+        PROJECT_ROOT / "config/wb/nightly_coordinator_adapter_inputs.json",
+        manifest_path,
+    )
+    shutil.copy2(
+        PROJECT_ROOT / "app/serp/collection_plan_runner.py",
+        runner_path,
+    )
+    manifest = _read_json(manifest_path)
+    if drift == "other_manifest_input":
+        manifest["file_sha256"]["app/common/cli.py"] = "d" * 64
+        _write_json(manifest_path, manifest)
+    elif drift == "runner_source":
+        runner_path.write_bytes(
+            runner_path.read_bytes() + b"\n# unapproved change\n"
+        )
+        manifest["file_sha256"][
+            "app/serp/collection_plan_runner.py"
+        ] = hashlib.sha256(runner_path.read_bytes()).hexdigest()
+        _write_json(manifest_path, manifest)
+    else:
+        manifest_path.write_text(
+            json.dumps(
+                manifest,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    stored = _attested_fingerprint(
+        endpoint_sha256=(
+            "6adec51ee15afaf98b7b2a66b53b735fcb8149f0d42b71b3bfd3e5ccc8a6ae08"
+        ),
+        request_params_sha256=(
+            "740688b67b86ba24e9130bba4e0813b4c00176f1f53c6990dfa9465020de1714"
+        ),
+        proxy_route_sha256=(
+            "632d1832fa9c70611097b15f2ce2754c492de1b4dcbfb161cc3d54e1e3c8df44"
+        ),
+        input_manifest_sha256=(
+            "a138f1da73b8d7238ec54f952e8f4a23de9a02a89a2d8adc1c37d902339c7eb2"
+        ),
+        runtime_input_sha256=(
+            "49bdfdd7d575f6289d653b6f65d91e63295a23afadca511ba255dc84d87756a6"
+        ),
+    )
+    current = _attested_fingerprint(
+        endpoint_sha256=stored["ordered_endpoint_urls_sha256"],
+        request_params_sha256=stored["request_params_sha256"],
+        proxy_route_sha256=stored["proxy_route_sha256"],
+        input_manifest_sha256=hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest(),
+        runtime_input_sha256=stored["runtime_input_sha256"],
+    )
+
+    with pytest.raises(CollectionPlanRunError):
+        runner_module._resume_attestation_transition(
+            stored=stored,
+            current=current,
+            project_root=root,
+            run_id="20260730_082402Z",
+            collection_plan_id="shevron-four-regions-top1000-v2",
+            effective_plan_sha256=(
+                "2ff60fcf82e394ef6fed60e468bd983aa46d88d4ee0606ace51995a1960052af"
+            ),
         )
 
 
@@ -1749,6 +1858,12 @@ def test_top1000_resume_accepts_only_reviewed_input_attestation_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, config, plan_path = _project(tmp_path, monkeypatch)
+    runner_path = root / "app/serp/collection_plan_runner.py"
+    runner_path.parent.mkdir(parents=True)
+    shutil.copy2(
+        PROJECT_ROOT / "app/serp/collection_plan_runner.py",
+        runner_path,
+    )
     plan = _read_json(plan_path)
     plan["depth"] = 1000
     plan["quality"]["expected_pages_per_query"] = 10
@@ -1790,11 +1905,34 @@ def test_top1000_resume_accepts_only_reviewed_input_attestation_transition(
     monkeypatch.setattr(
         runner_module,
         "_APPROVED_RESUME_ATTESTATION_TRANSITIONS",
-        {approved_key: "fixture-approved-code-repair-v1"},
+        {
+            approved_key: {
+                "transition_id": "fixture-approved-code-repair-v1",
+                "target_manifest_projection_sha256": (
+                    runner_module._target_manifest_projection(
+                        (
+                            root
+                            / "config/wb/"
+                            "nightly_coordinator_adapter_inputs.json"
+                        ).read_bytes()
+                    )
+                ),
+                "target_runner_projection_sha256": (
+                    runner_module._target_runner_projection(
+                        runner_path.read_bytes()
+                    )
+                ),
+            }
+        },
     )
+    target_manifest_sha256 = hashlib.sha256(
+        (
+            root / "config/wb/nightly_coordinator_adapter_inputs.json"
+        ).read_bytes()
+    ).hexdigest()
     monkeypatch.setenv(
         "PARSER_WB_COORDINATOR_INPUT_MANIFEST_SHA256",
-        "c" * 64,
+        target_manifest_sha256,
     )
     resume_transport = FakeTransport()
 
@@ -1825,7 +1963,10 @@ def test_top1000_resume_accepts_only_reviewed_input_attestation_transition(
     transition = manifest["transport_attestation_transitions"][0]
     assert transition["transition_id"] == "fixture-approved-code-repair-v1"
     assert transition["from_input_manifest_sha256"] == "a" * 64
-    assert transition["to_input_manifest_sha256"] == "c" * 64
+    assert (
+        transition["to_input_manifest_sha256"]
+        == target_manifest_sha256
+    )
 
 
 def test_top1000_resume_rejects_tampered_attestation_history_before_network(
@@ -1833,6 +1974,12 @@ def test_top1000_resume_rejects_tampered_attestation_history_before_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, config, plan_path = _project(tmp_path, monkeypatch)
+    runner_path = root / "app/serp/collection_plan_runner.py"
+    runner_path.parent.mkdir(parents=True)
+    shutil.copy2(
+        PROJECT_ROOT / "app/serp/collection_plan_runner.py",
+        runner_path,
+    )
     plan = _read_json(plan_path)
     plan["depth"] = 1000
     plan["quality"]["expected_pages_per_query"] = 10
@@ -1874,14 +2021,37 @@ def test_top1000_resume_rejects_tampered_attestation_history_before_network(
     monkeypatch.setattr(
         runner_module,
         "_APPROVED_RESUME_ATTESTATION_TRANSITIONS",
-        {approved_key: "fixture-approved-code-repair-v1"},
+        {
+            approved_key: {
+                "transition_id": "fixture-approved-code-repair-v1",
+                "target_manifest_projection_sha256": (
+                    runner_module._target_manifest_projection(
+                        (
+                            root
+                            / "config/wb/"
+                            "nightly_coordinator_adapter_inputs.json"
+                        ).read_bytes()
+                    )
+                ),
+                "target_runner_projection_sha256": (
+                    runner_module._target_runner_projection(
+                        runner_path.read_bytes()
+                    )
+                ),
+            }
+        },
     )
+    target_manifest_sha256 = hashlib.sha256(
+        (
+            root / "config/wb/nightly_coordinator_adapter_inputs.json"
+        ).read_bytes()
+    ).hexdigest()
     failed_manifest["transport_attestation_transitions"] = [
         {
             "schema_version": "wb_resume_attestation_transition_v1",
             "transition_id": "tampered-transition",
             "from_input_manifest_sha256": "a" * 64,
-            "to_input_manifest_sha256": "c" * 64,
+            "to_input_manifest_sha256": target_manifest_sha256,
             "from_transport_fingerprint_sha256": (
                 stored["fingerprint_sha256"]
             ),
@@ -1891,7 +2061,7 @@ def test_top1000_resume_rejects_tampered_attestation_history_before_network(
     _write_json(manifest_path, failed_manifest)
     monkeypatch.setenv(
         "PARSER_WB_COORDINATOR_INPUT_MANIFEST_SHA256",
-        "c" * 64,
+        target_manifest_sha256,
     )
     transport = FakeTransport()
 

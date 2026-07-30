@@ -70,6 +70,12 @@ ESTIMATED_REQUEST_OVERHEAD_SECONDS = 1.0
 RESUME_ATTESTATION_TRANSITION_SCHEMA_VERSION = (
     "wb_resume_attestation_transition_v1"
 )
+_RESUME_ATTESTATION_MANIFEST_RELATIVE = Path(
+    "config/wb/nightly_coordinator_adapter_inputs.json"
+)
+_RESUME_ATTESTATION_RUNNER_RELATIVE = Path(
+    "app/serp/collection_plan_runner.py"
+)
 
 # Reviewed recovery for the interrupted 2026-07-30 production run. The old
 # fingerprint stays immutable; only its code-manifest component may advance.
@@ -80,7 +86,15 @@ _APPROVED_RESUME_ATTESTATION_TRANSITIONS = {
         "2ff60fcf82e394ef6fed60e468bd983aa46d88d4ee0606ace51995a1960052af",
         "6474fc29ce5096a59b1ad028ed9951746ba34f30d7120b498e0f28e6d44a191e",
         "a138f1da73b8d7238ec54f952e8f4a23de9a02a89a2d8adc1c37d902339c7eb2",
-    ): "wb-20260730-approved-code-repair-v1",
+    ): {
+        "transition_id": "wb-20260730-approved-code-repair-v1",
+        "target_manifest_projection_sha256": (
+            "304a5245ed6e6e83aff079cf47d4a1d7f4b9a39112889545387bbf07628a9b9d"
+        ),
+        "target_runner_projection_sha256": (
+            "ba5ed67724a6165f5bd66afe7fd87837bb20c898e035acb905b6e92b8b711f18"
+        ),
+    },
 }
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -802,10 +816,125 @@ def _validated_transport_fingerprint(value: Any) -> dict[str, str]:
     return normalized
 
 
+def _single_projection_substitution(
+    payload: bytes,
+    *,
+    pattern: bytes,
+    field: str,
+) -> bytes:
+    projected, substitutions = re.subn(
+        pattern,
+        rb"\g<1>"
+        + (b"0" * 64)
+        + rb"\g<2>",
+        payload,
+    )
+    if substitutions != 1:
+        raise CollectionPlanRunError(
+            f"{field} projection contract is invalid"
+        )
+    return projected
+
+
+def _target_manifest_projection(payload: bytes) -> str:
+    projected = _single_projection_substitution(
+        payload,
+        pattern=(
+            rb'("app/serp/collection_plan_runner\.py": ")'
+            rb"[0-9a-f]{64}"
+            rb'(")'
+        ),
+        field="resume target manifest",
+    )
+    return _sha256_bytes(projected)
+
+
+def _target_runner_projection(payload: bytes) -> str:
+    projected = payload
+    for field in (
+        b"target_manifest_projection_sha256",
+        b"target_runner_projection_sha256",
+    ):
+        projected = _single_projection_substitution(
+            projected,
+            pattern=(
+                rb'("' + field + rb'": \(\s*")'
+                rb"[0-9a-f]{64}"
+                rb'("\s*\))'
+            ),
+            field="resume target runner",
+        )
+    return _sha256_bytes(projected)
+
+
+def _validate_approved_resume_target(
+    *,
+    project_root: Path,
+    current_fingerprint: dict[str, str],
+    approval: Mapping[str, str],
+) -> None:
+    if set(approval) != {
+        "transition_id",
+        "target_manifest_projection_sha256",
+        "target_runner_projection_sha256",
+    }:
+        raise CollectionPlanRunError(
+            "resume input attestation approval is invalid"
+        )
+    for field in (
+        "target_manifest_projection_sha256",
+        "target_runner_projection_sha256",
+    ):
+        if not _SHA256_RE.fullmatch(approval.get(field, "")):
+            raise CollectionPlanRunError(
+                "resume input attestation approval is invalid"
+            )
+    manifest_payload = _read_regular_bytes(
+        project_root / _RESUME_ATTESTATION_MANIFEST_RELATIVE,
+        project_root=project_root,
+    )
+    runner_payload = _read_regular_bytes(
+        project_root / _RESUME_ATTESTATION_RUNNER_RELATIVE,
+        project_root=project_root,
+    )
+    if (
+        _sha256_bytes(manifest_payload)
+        != current_fingerprint["input_manifest_sha256"]
+    ):
+        raise CollectionPlanRunError(
+            "resume target input manifest digest is invalid"
+        )
+    manifest = _json_object_from_bytes(
+        manifest_payload,
+        field="resume target input manifest",
+    )
+    file_sha256 = manifest.get("file_sha256")
+    if (
+        not isinstance(file_sha256, dict)
+        or file_sha256.get(
+            _RESUME_ATTESTATION_RUNNER_RELATIVE.as_posix()
+        )
+        != _sha256_bytes(runner_payload)
+    ):
+        raise CollectionPlanRunError(
+            "resume target runner attestation is invalid"
+        )
+    if (
+        _target_manifest_projection(manifest_payload)
+        != approval["target_manifest_projection_sha256"]
+        or _target_runner_projection(runner_payload)
+        != approval["target_runner_projection_sha256"]
+    ):
+        raise CollectionPlanRunError(
+            "resume target input attestation is not approved"
+        )
+
+
 def _resume_attestation_transition(
     *,
     stored: Any,
     current: Any,
+    project_root: Path,
     run_id: str,
     collection_plan_id: str,
     effective_plan_sha256: str,
@@ -844,7 +973,7 @@ def _resume_attestation_transition(
         raise CollectionPlanRunError(
             "resume transport fingerprint mismatch"
         )
-    transition_id = _APPROVED_RESUME_ATTESTATION_TRANSITIONS.get(
+    approval = _APPROVED_RESUME_ATTESTATION_TRANSITIONS.get(
         (
             run_id,
             collection_plan_id,
@@ -853,13 +982,18 @@ def _resume_attestation_transition(
             stored_fingerprint["input_manifest_sha256"],
         )
     )
-    if transition_id is None:
+    if approval is None:
         raise CollectionPlanRunError(
             "resume input attestation transition is not approved"
         )
+    _validate_approved_resume_target(
+        project_root=project_root,
+        current_fingerprint=current_fingerprint,
+        approval=approval,
+    )
     return {
         "schema_version": RESUME_ATTESTATION_TRANSITION_SCHEMA_VERSION,
-        "transition_id": transition_id,
+        "transition_id": approval["transition_id"],
         "from_input_manifest_sha256": stored_fingerprint[
             "input_manifest_sha256"
         ],
@@ -3558,6 +3692,7 @@ class CollectionPlanRunner:
                 manifest_transition = _resume_attestation_transition(
                     stored=prior_manifest.get("transport_fingerprint"),
                     current=transport_fingerprint,
+                    project_root=paths.project_root,
                     run_id=self.run_id,
                     collection_plan_id=(
                         bundle.collection_plan.collection_plan_id
@@ -3567,6 +3702,7 @@ class CollectionPlanRunner:
                 snapshot_transition = _resume_attestation_transition(
                     stored=snapshot.get("transport_fingerprint"),
                     current=transport_fingerprint,
+                    project_root=paths.project_root,
                     run_id=self.run_id,
                     collection_plan_id=(
                         bundle.collection_plan.collection_plan_id
@@ -5031,6 +5167,7 @@ def validate_resumable_collection_state(
         manifest_transition = _resume_attestation_transition(
             stored=manifest.get("transport_fingerprint"),
             current=current_fingerprint,
+            project_root=config.project_root,
             run_id=run_id,
             collection_plan_id=bundle.collection_plan.collection_plan_id,
             effective_plan_sha256=effective_sha256,
@@ -5038,6 +5175,7 @@ def validate_resumable_collection_state(
         snapshot_transition = _resume_attestation_transition(
             stored=snapshot.get("transport_fingerprint"),
             current=current_fingerprint,
+            project_root=config.project_root,
             run_id=run_id,
             collection_plan_id=bundle.collection_plan.collection_plan_id,
             effective_plan_sha256=effective_sha256,

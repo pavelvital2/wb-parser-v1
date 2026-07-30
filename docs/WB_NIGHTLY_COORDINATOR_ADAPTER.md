@@ -266,6 +266,13 @@ effective-plan hash, prior transport fingerprint and prior input-manifest hash.
 Endpoint order, request parameters, proxy-route provenance and runtime-input
 provenance must still match exactly.
 
+The approved target is also exact. The runner verifies the current manifest
+bytes and its attested runner source against two reviewed byte projections.
+Only the manifest's runner-file hash and the runner's two projection constants
+are normalized before hashing. This removes the unavoidable mutual
+self-reference while ensuring that a later manifest, another influencing file,
+another runner source, or even different manifest serialization is rejected.
+
 The transition is checked before resolver or search traffic and is recorded in
 the child manifest as SHA-256 provenance only. Any unlisted run, malformed
 history or additional transport/runtime drift fails closed. Confirmed segments
