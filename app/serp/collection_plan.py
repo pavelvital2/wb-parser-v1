@@ -1434,18 +1434,34 @@ def _validate_effective_plan_snapshot(snapshot: Mapping[str, Any]) -> None:
                 "proxy_route_sha256",
                 "fingerprint_sha256",
             },
+            optional={
+                "input_manifest_sha256",
+                "runtime_input_sha256",
+            },
             field="effective_plan.transport_fingerprint",
         )
+        attestation_fields = {
+            "input_manifest_sha256",
+            "runtime_input_sha256",
+        }
+        present_attestation_fields = attestation_fields.intersection(fingerprint)
+        if present_attestation_fields and present_attestation_fields != attestation_fields:
+            raise CollectionPlanValidationError(
+                "effective_plan.transport_fingerprint attestation hashes "
+                "must be provided together"
+            )
         if fingerprint["schema_version"] != "wb_transport_fingerprint_v1":
             raise CollectionPlanValidationError(
                 "effective_plan.transport_fingerprint schema is unsupported"
             )
-        for name in (
+        hash_fields = [
             "ordered_endpoint_urls_sha256",
             "request_params_sha256",
             "proxy_route_sha256",
             "fingerprint_sha256",
-        ):
+        ]
+        hash_fields.extend(sorted(present_attestation_fields))
+        for name in hash_fields:
             _require_sha256(
                 fingerprint[name],
                 field=f"effective_plan.transport_fingerprint.{name}",

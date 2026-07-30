@@ -742,6 +742,45 @@ def test_effective_plan_rejects_duplicate_destinations(tmp_path: Path) -> None:
         )
 
 
+def test_effective_plan_accepts_coordinator_attested_transport_fingerprint(
+    tmp_path: Path,
+) -> None:
+    root = _copy_stage1_config(tmp_path)
+    _enable_pilot(root)
+    fingerprint = {
+        "schema_version": "wb_transport_fingerprint_v1",
+        "ordered_endpoint_urls_sha256": hashlib.sha256(b"endpoints").hexdigest(),
+        "request_params_sha256": hashlib.sha256(b"request-params").hexdigest(),
+        "proxy_route_sha256": hashlib.sha256(b"proxy-route").hexdigest(),
+        "input_manifest_sha256": hashlib.sha256(b"input-manifest").hexdigest(),
+        "runtime_input_sha256": hashlib.sha256(b"runtime-input").hexdigest(),
+    }
+    fingerprint["fingerprint_sha256"] = hashlib.sha256(
+        json.dumps(
+            fingerprint,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    snapshot = build_effective_plan_snapshot(
+        _load_bundle(root),
+        resolved_destinations=_resolved_destinations(),
+        page_size=100,
+        endpoint_policy=_endpoint_policy(),
+        transport_fingerprint=fingerprint,
+    )
+
+    assert canonical_effective_plan_sha256(snapshot)
+    assert snapshot["transport_fingerprint"] == fingerprint
+
+    missing_pair = copy.deepcopy(snapshot)
+    del missing_pair["transport_fingerprint"]["runtime_input_sha256"]
+    with pytest.raises(CollectionPlanValidationError, match="provided together"):
+        canonical_effective_plan_sha256(missing_pair)
+
+
 @pytest.mark.parametrize(
     "invalid_timestamp",
     [
