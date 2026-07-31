@@ -1613,7 +1613,8 @@ def _attested_fingerprint(
     return fingerprint
 
 
-def test_reviewed_production_attestation_transition_is_hash_only() -> None:
+def test_retired_production_attestation_transition_rejects_old_fingerprint(
+) -> None:
     stored = _attested_fingerprint(
         endpoint_sha256=(
             "6adec51ee15afaf98b7b2a66b53b735fcb8149f0d42b71b3bfd3e5ccc8a6ae08"
@@ -1648,27 +1649,20 @@ def test_reviewed_production_attestation_transition_is_hash_only() -> None:
         runtime_input_sha256=stored["runtime_input_sha256"],
     )
 
-    transition = runner_module._resume_attestation_transition(
-        stored=stored,
-        current=current,
-        project_root=PROJECT_ROOT,
-        run_id="20260730_082402Z",
-        collection_plan_id="shevron-four-regions-top1000-v2",
-        effective_plan_sha256=(
-            "2ff60fcf82e394ef6fed60e468bd983aa46d88d4ee0606ace51995a1960052af"
-        ),
-    )
-
-    assert transition == {
-        "schema_version": "wb_resume_attestation_transition_v1",
-        "transition_id": "wb-20260730-approved-code-repair-v1",
-        "from_input_manifest_sha256": stored["input_manifest_sha256"],
-        "to_input_manifest_sha256": current["input_manifest_sha256"],
-        "from_transport_fingerprint_sha256": stored["fingerprint_sha256"],
-        "to_transport_fingerprint_sha256": current["fingerprint_sha256"],
-    }
-    assert "url" not in json.dumps(transition).lower()
-    assert "proxy_route_sha256" not in transition
+    with pytest.raises(
+        CollectionPlanRunError,
+        match="resume input attestation transition is not approved",
+    ):
+        runner_module._resume_attestation_transition(
+            stored=stored,
+            current=current,
+            project_root=PROJECT_ROOT,
+            run_id="20260730_082402Z",
+            collection_plan_id="shevron-four-regions-top1000-v2",
+            effective_plan_sha256=(
+                "2ff60fcf82e394ef6fed60e468bd983aa46d88d4ee0606ace51995a1960052af"
+            ),
+        )
 
 
 @pytest.mark.parametrize(

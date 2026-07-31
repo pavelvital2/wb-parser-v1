@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import stat
 import sys
 import csv
 from concurrent.futures import ThreadPoolExecutor
@@ -1285,6 +1287,69 @@ def test_launcher_blocks_downstream_for_partial_collection(
     assert attempt["authoritative_state_changed"] is False
 
 
+def test_completed_collection_resume_skips_serp_collection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = {"downstream": 0}
+    bundle = SimpleNamespace(
+        collection_plan=SimpleNamespace(collection_plan_id=FOUR_REGION_PLAN_ID)
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "load_collection_plan_bundle",
+        lambda **_kwargs: bundle,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "_completed_collection_manifest",
+        lambda *_args: {
+            "schema_version": "wb_collection_plan_manifest_v2",
+            "run_id": RUN_ID,
+            "collection_plan_id": FOUR_REGION_PLAN_ID,
+            "status": "success",
+            "complete": True,
+        },
+    )
+
+    def forbidden_collection(**_kwargs):
+        raise AssertionError("completed resume must not invoke SERP collection")
+
+    def completed_downstream(**kwargs):
+        called["downstream"] += 1
+        assert kwargs["run_id"] == RUN_ID
+        return {"run_id": RUN_ID, "status": "success", "complete": True}
+
+    monkeypatch.setattr(
+        four_region_launcher,
+        "run_collection_plan",
+        forbidden_collection,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "run_four_region_downstream",
+        completed_downstream,
+    )
+
+    manifest, downstream = four_region_launcher.execute_four_region_plan(
+        config=SimpleNamespace(project_root=tmp_path),
+        plan_path=tmp_path / "plan.json",
+        run_id=RUN_ID,
+        resume=True,
+        downstream_only=False,
+        absolute_deadline_utc=None,
+        input_integrity_gate=lambda: None,
+    )
+
+    assert manifest == {
+        "run_id": RUN_ID,
+        "status": "previously_completed",
+        "complete": True,
+    }
+    assert downstream["status"] == "success"
+    assert called["downstream"] == 1
+
+
 def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1311,7 +1376,11 @@ def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
     bridge.write_text("bridge\n", encoding="utf-8")
     seller_output.write_text("sellers\n", encoding="utf-8")
     for path in (seller_input, bridge, seller_output):
-        path.chmod(0o600)
+        path.chmod(0o664)
+    artifact_bytes = {
+        path: path.read_bytes()
+        for path in (seller_input, bridge, seller_output)
+    }
     inputs = FourRegionInputs(
         root=artifact_root,
         seller_input_path=seller_input,
@@ -1401,6 +1470,41 @@ def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
         / "latest.json"
     )
     assert latest["run_id"] == RUN_ID
+    for path, expected_bytes in artifact_bytes.items():
+        assert path.read_bytes() == expected_bytes
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_downstream_artifact_finalization_rejects_unsafe_identity(
+    tmp_path: Path,
+) -> None:
+    regular = tmp_path / "regular.csv"
+    regular.write_bytes(b"safe\n")
+    regular.chmod(0o664)
+    alias = tmp_path / "alias.csv"
+    os.link(regular, alias)
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="metadata cannot be safely finalized",
+    ):
+        four_region._finalize_downstream_artifact(
+            regular,
+            project_root=tmp_path,
+        )
+    assert stat.S_IMODE(regular.stat().st_mode) == 0o664
+
+    alias.unlink()
+    regular.chmod(0o666)
+    with pytest.raises(
+        CriticalPipelineError,
+        match="metadata cannot be safely finalized",
+    ):
+        four_region._finalize_downstream_artifact(
+            regular,
+            project_root=tmp_path,
+        )
+    assert stat.S_IMODE(regular.stat().st_mode) == 0o666
 
 
 def test_downstream_failure_leaves_previous_scoped_latest_unchanged(

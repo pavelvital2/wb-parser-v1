@@ -327,6 +327,141 @@ def _safe_project_file(root: Path, relative: str, *, suffix: str) -> Path:
     return lexical
 
 
+def _fd_sha256(descriptor: int, *, size: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < size:
+        chunk = os.pread(descriptor, min(1024 * 1024, size - offset), offset)
+        if not chunk:
+            raise CriticalPipelineError(
+                "downstream artifact changed during permission finalization"
+            )
+        digest.update(chunk)
+        offset += len(chunk)
+    if os.pread(descriptor, 1, size):
+        raise CriticalPipelineError(
+            "downstream artifact changed during permission finalization"
+        )
+    return digest.hexdigest()
+
+
+def _finalize_downstream_artifact(
+    path: Path,
+    *,
+    project_root: Path,
+    expected_sha256: str | None = None,
+    integrity_gate: Callable[[], None] = lambda: None,
+) -> str:
+    try:
+        relative = path.relative_to(project_root).as_posix()
+    except ValueError as exc:
+        raise CriticalPipelineError(
+            "downstream artifact escapes project root"
+        ) from exc
+    safe_path = _safe_project_file(project_root, relative, suffix=".csv")
+    flags = os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(safe_path, flags)
+    except OSError as exc:
+        raise CriticalPipelineError(
+            "downstream artifact permission finalization failed"
+        ) from exc
+    changed_mode = False
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or before.st_mode & 0o002
+            or before.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+        ):
+            raise CriticalPipelineError(
+                "downstream artifact metadata cannot be safely finalized"
+            )
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            before.st_gid,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        digest = _fd_sha256(descriptor, size=before.st_size)
+        after_read = os.fstat(descriptor)
+        if before_identity != (
+            after_read.st_dev,
+            after_read.st_ino,
+            after_read.st_uid,
+            after_read.st_gid,
+            after_read.st_size,
+            after_read.st_mtime_ns,
+        ):
+            raise CriticalPipelineError(
+                "downstream artifact changed during permission finalization"
+            )
+        if expected_sha256 is not None and digest != _strict_sha256(
+            expected_sha256,
+            field="downstream artifact sha256",
+        ):
+            raise CriticalPipelineError("downstream artifact hash mismatch")
+
+        integrity_gate()
+        if stat.S_IMODE(after_read.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            changed_mode = True
+        after = os.fstat(descriptor)
+        if (
+            before_identity
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_uid,
+                after.st_gid,
+                after.st_size,
+                after.st_mtime_ns,
+            )
+            or stat.S_IMODE(after.st_mode) != 0o600
+            or after.st_nlink != 1
+            or _fd_sha256(descriptor, size=after.st_size) != digest
+        ):
+            raise CriticalPipelineError(
+                "downstream artifact permission finalization failed"
+            )
+    finally:
+        os.close(descriptor)
+
+    try:
+        current = safe_path.lstat()
+    except OSError as exc:
+        raise CriticalPipelineError(
+            "downstream artifact changed during permission finalization"
+        ) from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_dev != after.st_dev
+        or current.st_ino != after.st_ino
+        or current.st_uid != after.st_uid
+        or current.st_nlink != 1
+        or stat.S_IMODE(current.st_mode) != 0o600
+    ):
+        raise CriticalPipelineError(
+            "downstream artifact changed during permission finalization"
+        )
+    if changed_mode:
+        _fsync_directory(safe_path.parent)
+    integrity_gate()
+    verified = _trusted_file_snapshot(safe_path)
+    if verified is None or verified.sha256 != digest:
+        raise CriticalPipelineError(
+            "downstream artifact permission finalization failed"
+        )
+    return digest
+
+
 def _fsync_directory(path: Path) -> None:
     directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -2104,6 +2239,18 @@ def _run_locked_four_region_downstream(
             bundle=bundle,
             run_id=run_id,
         )
+        _finalize_downstream_artifact(
+            inputs.bridge_path,
+            project_root=config.project_root,
+            expected_sha256=inputs.bridge_sha256,
+            integrity_gate=input_integrity_gate,
+        )
+        _finalize_downstream_artifact(
+            inputs.seller_input_path,
+            project_root=config.project_root,
+            expected_sha256=inputs.seller_input_sha256,
+            integrity_gate=input_integrity_gate,
+        )
         db = StateDB(state_dir / "sellers.sqlite")
         db.init_schema()
         context = RunContext(
@@ -2162,7 +2309,11 @@ def _run_locked_four_region_downstream(
             seller_output_relative,
             suffix=".csv",
         )
-        seller_output_sha256 = _sha256(seller_output_path)
+        seller_output_sha256 = _finalize_downstream_artifact(
+            seller_output_path,
+            project_root=config.project_root,
+            integrity_gate=input_integrity_gate,
+        )
         deadline.ensure_active()
         stage = "warehouse"
         input_integrity_gate()

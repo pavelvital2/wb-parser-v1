@@ -77,25 +77,11 @@ _RESUME_ATTESTATION_RUNNER_RELATIVE = Path(
     "app/serp/collection_plan_runner.py"
 )
 
-# Reviewed recovery for the interrupted 2026-07-30 production run. The old
-# fingerprint stays immutable; only its code-manifest component may advance.
-_APPROVED_RESUME_ATTESTATION_TRANSITIONS = {
-    (
-        "20260730_082402Z",
-        "shevron-four-regions-top1000-v2",
-        "2ff60fcf82e394ef6fed60e468bd983aa46d88d4ee0606ace51995a1960052af",
-        "6474fc29ce5096a59b1ad028ed9951746ba34f30d7120b498e0f28e6d44a191e",
-        "a138f1da73b8d7238ec54f952e8f4a23de9a02a89a2d8adc1c37d902339c7eb2",
-    ): {
-        "transition_id": "wb-20260730-approved-code-repair-v1",
-        "target_manifest_projection_sha256": (
-            "304a5245ed6e6e83aff079cf47d4a1d7f4b9a39112889545387bbf07628a9b9d"
-        ),
-        "target_runner_projection_sha256": (
-            "ba5ed67724a6165f5bd66afe7fd87837bb20c898e035acb905b6e92b8b711f18"
-        ),
-    },
-}
+# Run-scoped repair exceptions are retired once their immutable collection
+# manifest is complete. Any future attestation drift therefore fails closed.
+_APPROVED_RESUME_ATTESTATION_TRANSITIONS: dict[
+    tuple[str, str, str, str, str], dict[str, str]
+] = {}
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _RUN_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}Z$")
@@ -851,18 +837,24 @@ def _target_manifest_projection(payload: bytes) -> str:
 
 def _target_runner_projection(payload: bytes) -> str:
     projected = payload
+    substitution_counts: list[int] = []
     for field in (
         b"target_manifest_projection_sha256",
         b"target_runner_projection_sha256",
     ):
-        projected = _single_projection_substitution(
-            projected,
-            pattern=(
+        projected, substitutions = re.subn(
+            (
                 rb'("' + field + rb'": \(\s*")'
                 rb"[0-9a-f]{64}"
                 rb'("\s*\))'
             ),
-            field="resume target runner",
+            rb"\g<1>" + (b"0" * 64) + rb"\g<2>",
+            projected,
+        )
+        substitution_counts.append(substitutions)
+    if substitution_counts not in ([0, 0], [1, 1]):
+        raise CollectionPlanRunError(
+            "resume target runner projection contract is invalid"
         )
     return _sha256_bytes(projected)
 
