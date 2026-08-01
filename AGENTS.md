@@ -552,11 +552,11 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   provenance, not a future collection region. Depth 1000 is a maximum:
   bounded v2 query segments require stable `min(payload_total, depth)`, while
   retaining and validating each page's exact payload total, and may complete
-  in 1-10 pages. A same-page duplicate product remains malformed. The ordered
-  transport may reject that endpoint response and try the next configured
-  endpoint once; duplicates from every endpoint fail closed. Position facts use
-  `(run_id, region_id, query_id, absolute_position)` and preserve repeated
-  product IDs; deduplication is seller-input-only. Legacy Yaroslavl import is
+  in 1-10 pages. Repeated product IDs, including same-page repeats, are
+  separate position facts and remain separate rows with distinct
+  `absolute_position`; they do not trigger endpoint fallback. Position facts
+  use `(run_id, region_id, query_id, absolute_position)` and deduplication is
+  seller-input-only. Legacy Yaroslavl import is
   an incremental set-based sync with row hashes, not a whole-file hash gate.
   Regional warehouse must retain the current analytical query/seller fields
   and materialize run/query quality facts inside DuckDB; future API readers

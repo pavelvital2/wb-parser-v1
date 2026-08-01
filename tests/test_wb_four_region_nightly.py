@@ -438,6 +438,7 @@ class FourRegionFakeTransport:
         totals_by_query: Mapping[str, int] | None = None,
         repeat_first_product_across_pages: bool = False,
         duplicate_within_page: bool = False,
+        duplicate_within_page_at: int | None = None,
     ) -> None:
         self.clock = clock
         self.advance_per_search = advance_per_search
@@ -445,6 +446,7 @@ class FourRegionFakeTransport:
         self.totals_by_query = dict(totals_by_query or {})
         self.repeat_first_product_across_pages = repeat_first_product_across_pages
         self.duplicate_within_page = duplicate_within_page
+        self.duplicate_within_page_at = duplicate_within_page_at
         self.resolve_calls: list[str] = []
         self.search_calls: list[ScopedSearchRequest] = []
         self.egress_calls = 0
@@ -524,7 +526,10 @@ class FourRegionFakeTransport:
             products[0]["id"] = (
                 region_index * 1_000_000_000 + query_seed * 100_000 + 101
             )
-        if self.duplicate_within_page and len(products) >= 2:
+        if (
+            self.duplicate_within_page
+            or self.duplicate_within_page_at == request.task.page
+        ) and len(products) >= 2:
             products[1]["id"] = products[0]["id"]
         return ScopedSearchResult(
             payload={"total": total, "products": products},
@@ -602,11 +607,11 @@ def test_bounded_payload_rejects_inconsistent_short_and_empty() -> None:
         )
 
 
-def test_bounded_same_page_duplicate_rejected_but_cross_page_preserved(
+def test_bounded_same_and_cross_page_duplicates_are_position_facts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _root, config, plan_path, query_ids = _small_bounded_project(
+    root, config, plan_path, query_ids = _small_bounded_project(
         tmp_path,
         monkeypatch,
     )
@@ -614,19 +619,37 @@ def test_bounded_same_page_duplicate_rejected_but_cross_page_preserved(
     plan["query_ids"] = plan["query_ids"][:1]
     plan["quality"]["expected_queries_per_region"] = 1
     _write_json(plan_path, plan)
-    with pytest.raises(CollectionPlanRunError, match="search_product_duplicate"):
-        CollectionPlanRunner(
-            config=config,
-            plan_path=plan_path,
-            transport=FourRegionFakeTransport(
-                totals_by_query={query_ids[0]: 217},
-                duplicate_within_page=True,
-            ),
-            no_publish=True,
-            run_id=RUN_ID,
-            now=lambda: datetime(2026, 7, 25, 21, 16, tzinfo=timezone.utc),
-            sleeper=lambda _seconds: None,
-        ).run()
+    same_page_result = CollectionPlanRunner(
+        config=config,
+        plan_path=plan_path,
+        transport=FourRegionFakeTransport(
+            totals_by_query={query_ids[0]: 217},
+            duplicate_within_page=True,
+        ),
+        no_publish=True,
+        run_id=RUN_ID,
+        now=lambda: datetime(2026, 7, 25, 21, 16, tzinfo=timezone.utc),
+        sleeper=lambda _seconds: None,
+    ).run()
+    assert same_page_result["totals"]["products_ok"] == 217
+    assert same_page_result["totals"]["duplicate_product_positions"] == 3
+    same_page_mart = (
+        root
+        / "data/marts/serp_scoped"
+        / FOUR_REGION_PLAN_ID
+        / "moscow"
+        / RUN_ID
+        / "products_daily.csv"
+    )
+    same_page_rows = list(
+        csv.DictReader(same_page_mart.open(encoding="utf-8", newline=""))
+    )
+    first_page_rows = [row for row in same_page_rows if row["page"] == "1"]
+    assert len(first_page_rows) == 100
+    assert first_page_rows[0]["nmId"] == first_page_rows[1]["nmId"]
+    assert [int(row["absolute_position"]) for row in first_page_rows] == list(
+        range(1, 101)
+    )
 
     root2, config2, plan_path2, query_ids2 = _small_bounded_project(
         tmp_path / "cross",
@@ -674,6 +697,59 @@ def test_bounded_same_page_duplicate_rejected_but_cross_page_preserved(
             page=1,
             depth=1000,
         )
+
+
+def test_depth1000_page10_duplicate_completes_exact_position_segment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path, query_ids = _small_bounded_project(
+        tmp_path,
+        monkeypatch,
+    )
+    plan = _read_json(plan_path)
+    plan["query_ids"] = plan["query_ids"][:1]
+    plan["quality"]["expected_queries_per_region"] = 1
+    _write_json(plan_path, plan)
+
+    result = CollectionPlanRunner(
+        config=config,
+        plan_path=plan_path,
+        transport=FourRegionFakeTransport(
+            totals_by_query={query_ids[0]: 1000},
+            duplicate_within_page_at=10,
+        ),
+        no_publish=True,
+        run_id=RUN_ID,
+        now=lambda: datetime(2026, 7, 25, 21, 16, tzinfo=timezone.utc),
+        sleeper=lambda _seconds: None,
+    ).run()
+
+    assert result["totals"] == {
+        "regions_ok": 1,
+        "pages_ok": 10,
+        "products_ok": 1000,
+        "queries_ok": 1,
+        "duplicate_product_positions": 1,
+    }
+    segment = result["resume"]["segments"][0]
+    assert segment["pages_count"] == 10
+    assert segment["completion"]["duplicate_product_positions"] == 1
+    mart_path = (
+        root
+        / "data/marts/serp_scoped"
+        / FOUR_REGION_PLAN_ID
+        / "moscow"
+        / RUN_ID
+        / "products_daily.csv"
+    )
+    rows = list(csv.DictReader(mart_path.open(encoding="utf-8", newline="")))
+    page10 = [row for row in rows if row["page"] == "10"]
+    assert len(page10) == 100
+    assert page10[0]["nmId"] == page10[1]["nmId"]
+    assert [int(row["absolute_position"]) for row in page10] == list(
+        range(901, 1001)
+    )
 
 
 def test_variable_length_segments_complete_and_resume_repeats_only_failed_query(

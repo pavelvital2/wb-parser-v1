@@ -1497,14 +1497,8 @@ class RequestsScopedTransport:
             products = _extract_products(payload)
             if len(products) != request.task.page_size:
                 raise CollectionPlanRunError("endpoint_probe_products_count_invalid")
-            seen: set[str] = set()
             for product in products:
-                product_id = _normalize_product_id(product)
-                if product_id in seen:
-                    raise CollectionPlanRunError(
-                        "endpoint_probe_product_duplicate"
-                    )
-                seen.add(product_id)
+                _normalize_product_id(product)
         except (CollectionPlanRunError, ScopedTransportError) as exc:
             error_code = str(
                 getattr(exc, "code", "endpoint_probe_payload_invalid")
@@ -1701,19 +1695,11 @@ class RequestsScopedTransport:
                 ) from exc
             try:
                 products = _extract_products(payload)
-                product_ids = [
-                    _normalize_product_id(product) for product in products
-                ]
-                if len(product_ids) != len(set(product_ids)):
-                    raise CollectionPlanRunError(
-                        "search_product_duplicate"
-                    )
+                for product in products:
+                    _normalize_product_id(product)
             except CollectionPlanRunError as exc:
                 error_code = str(exc)
-                if error_code not in {
-                    "retryable_payload_anomaly_nested_promo",
-                    "search_product_duplicate",
-                }:
+                if error_code != "retryable_payload_anomaly_nested_promo":
                     raise ScopedTransportError(
                         error_code,
                         request_sent=True,
@@ -1723,12 +1709,7 @@ class RequestsScopedTransport:
                         attempted_endpoint_ids=tuple(attempted),
                     ) from exc
                 last_payload_anomaly = ScopedTransportError(
-                    (
-                        "search_payload_anomaly_nested_promo"
-                        if error_code
-                        == "retryable_payload_anomaly_nested_promo"
-                        else error_code
-                    ),
+                    "search_payload_anomaly_nested_promo",
                     request_sent=True,
                     dest_id_sent=request.dest_id_observed,
                     http_status=200,
@@ -2576,15 +2557,11 @@ class CollectionPlanRunner:
             raise CollectionPlanRunError(
                 f"search_products_short expected={expected_count} actual={len(products)}"
             )
-        seen: set[str] = set()
         rows: list[dict[str, Any]] = []
         raw_file = _relative(raw_path, self.config.project_root)
         collected_at_utc = _utc_iso(self.now())
         for index, product in enumerate(products, start=1):
             product_id = _normalize_product_id(product)
-            if product_id in seen:
-                raise CollectionPlanRunError("search_product_duplicate")
-            seen.add(product_id)
             final_price, price, sale_price = _product_prices(product)
             rows.append(
                 {
@@ -3401,10 +3378,6 @@ class CollectionPlanRunner:
                         _normalize_product_id(product)
                         for product in page_contract.products
                     ]
-                    if len(page_product_ids) != len(set(page_product_ids)):
-                        raise CollectionPlanRunError(
-                            "bounded segment contains duplicate product on one page"
-                        )
                     actual_product_ids.extend(page_product_ids)
                     checkpoint_bytes = _read_regular_bytes(
                         paths.project_root

@@ -934,7 +934,6 @@ def test_malformed_truthy_probe_never_pins_or_starts_regional_search(
         "wrong_status",
         "wrong_task",
         "short_payload",
-        "duplicate_products",
         "non_mapping_payload",
     ],
 )
@@ -968,12 +967,6 @@ def test_successful_looking_probe_requires_valid_reusable_page_before_pin(
             reusable_result = replace(
                 reusable_result,
                 payload={"products": _products(list(range(1, 100)))},
-            )
-        elif malformation == "duplicate_products":
-            product_ids = list(range(1, 100)) + [1]
-            reusable_result = replace(
-                reusable_result,
-                payload={"products": _products(product_ids)},
             )
         elif malformation == "non_mapping_payload":
             reusable_result = replace(  # type: ignore[arg-type]
@@ -1013,6 +1006,45 @@ def test_successful_looking_probe_requires_valid_reusable_page_before_pin(
         for path in _state_dir(root).rglob("*.json")
     )
     assert '"products"' not in serialized_state
+
+
+def test_reusable_probe_preserves_same_page_duplicate_positions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+
+    def duplicate_probe(request: ScopedSearchRequest) -> EndpointProbeResult:
+        product_ids = list(range(100_001, 100_101))
+        product_ids[1] = product_ids[0]
+        return _usable_probe_result(
+            request,
+            payload={"products": _products(product_ids)},
+        )
+
+    transport = PilotFakeTransport(
+        probe_results={"primary": duplicate_probe},
+    )
+    manifest = _run(config, plan_path, transport, root=root)
+
+    assert manifest["complete"] is True
+    assert transport.probe_calls == ["primary"]
+    assert transport.pin_calls == ["primary"]
+    mart_path = (
+        root
+        / "data/marts/serp_scoped"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / "moscow"
+        / RUN_ID
+        / "products_daily.csv"
+    )
+    rows = list(csv.DictReader(mart_path.open(encoding="utf-8", newline="")))
+    first_query = [row for row in rows if row["query_id"] == "shevron"]
+    assert len(first_query) == 100
+    assert first_query[0]["nmId"] == first_query[1]["nmId"]
+    assert [int(row["absolute_position"]) for row in first_query] == list(
+        range(1, 101)
+    )
 
 
 def test_budget_exceed_fails_before_the_disallowed_search_http(
@@ -1079,7 +1111,6 @@ def test_control_jaccard_gates_regional_comparison(
     [
         ({"repeat_failure": True}, "search_http_498"),
         ({"repeat_product_count": 99}, "search_products_short"),
-        ({"repeat_duplicate": True}, "search_product_duplicate"),
     ],
 )
 def test_repeat_failure_cannot_complete(
@@ -1102,6 +1133,24 @@ def test_repeat_failure_cannot_complete(
         4 if transport_kwargs.get("repeat_failure") else 3
     )
     assert not (_state_dir(root) / "control/moscow_repeat.json").exists()
+
+
+def test_repeat_duplicate_position_remains_eligible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    manifest = _run(
+        config,
+        plan_path,
+        PilotFakeTransport(repeat_duplicate=True),
+        root=root,
+    )
+
+    assert manifest["complete"] is True
+    control = _read_json(_state_dir(root) / "control/moscow_repeat.json")
+    assert control["status"] == "eligible"
+    assert control["jaccard"] == 0.99
 
 
 @pytest.mark.parametrize(

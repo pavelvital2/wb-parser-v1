@@ -1154,22 +1154,12 @@ class GuardedRegionalPilotRunner(CollectionPlanRunner):
             raise CollectionPlanRunError(
                 "endpoint probe reusable products count is invalid"
             )
-        product_ids: set[str] = set()
         for product in products:
             if not isinstance(product, Mapping):
                 raise CollectionPlanRunError(
                     "endpoint probe reusable product is invalid"
                 )
-            product_id = _normalize_product_id(product)
-            if product_id in product_ids:
-                raise CollectionPlanRunError(
-                    "endpoint probe reusable product ID is duplicated"
-                )
-            product_ids.add(product_id)
-        if len(product_ids) != 100:
-            raise CollectionPlanRunError(
-                "endpoint probe reusable product IDs are incomplete"
-            )
+            _normalize_product_id(product)
         return ReusableProbePage(request=request, result=result)
 
     def _validate_search_result(

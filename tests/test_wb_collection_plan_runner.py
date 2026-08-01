@@ -2526,11 +2526,6 @@ def test_partial_http_failure_has_no_retry_and_cannot_be_complete(
             "search_products_short expected=100 actual=99",
         ),
         (
-            FakeTransport(duplicate=True),
-            "product_duplicate",
-            "search_product_duplicate",
-        ),
-        (
             FakeTransport(malformed=True),
             "product_id_malformed",
             "search_product_id_malformed",
@@ -2967,13 +2962,37 @@ def _ordered_requests_transport(session: FakeSession) -> RequestsScopedTransport
 
 
 def _scoped_search_request(endpoint_id: str = "primary") -> ScopedSearchRequest:
-    task = type("Task", (), {"query": "шеврон"})()
+    task = type("Task", (), {"query": "шеврон", "page_size": 100})()
     return ScopedSearchRequest(
         task=task,  # type: ignore[arg-type]
         dest_id_observed="-535680",
         endpoint_id=endpoint_id,
         params={"query": "шеврон", "page": "1", "dest": "-535680"},
     )
+
+
+def test_endpoint_probe_accepts_same_page_duplicate_positions() -> None:
+    duplicate_products = _products(1_000)
+    duplicate_products[1]["id"] = duplicate_products[0]["id"]
+    session = FakeSession(
+        [FakeResponse(payload={"products": duplicate_products})]
+    )
+    transport = _ordered_requests_transport(session)
+    request = _scoped_search_request("primary")
+
+    result = transport.probe_endpoint(
+        request,
+        endpoint_id="primary",
+        timeout_seconds=10,
+    )
+
+    assert result.suitable is True
+    assert result.reusable_request is request
+    assert result.reusable_result is not None
+    products = result.reusable_result.payload["products"]
+    assert len(products) == 100
+    assert products[0]["id"] == products[1]["id"]
+    assert len(session.calls) == 1
 
 
 def test_ordered_search_uses_production_endpoint_order_and_promotes_success() -> None:
@@ -3053,7 +3072,7 @@ def test_ordered_search_falls_back_for_production_nested_promo_anomaly() -> None
     assert result.attempted_endpoint_ids == ("primary", "fallback-1")
 
 
-def test_ordered_search_falls_back_for_same_page_duplicate_payload() -> None:
+def test_ordered_search_accepts_same_page_duplicate_without_fallback() -> None:
     duplicate_products = _products(1_000)
     duplicate_products[-2]["id"] = duplicate_products[0]["id"]
     duplicate_products[-1]["id"] = duplicate_products[1]["id"]
@@ -3070,12 +3089,15 @@ def test_ordered_search_falls_back_for_same_page_duplicate_payload() -> None:
         timeout_seconds=10,
     )
 
-    assert result.endpoint_id == "fallback-1"
-    assert result.attempted_endpoint_ids == ("primary", "fallback-1")
-    assert len(session.calls) == 2
+    assert result.endpoint_id == "primary"
+    assert result.attempted_endpoint_ids == ("primary",)
+    assert len(session.calls) == 1
+    products = result.payload["products"]
+    assert products[0]["id"] == products[-2]["id"]
+    assert products[1]["id"] == products[-1]["id"]
 
 
-def test_ordered_search_rejects_duplicate_payload_from_all_endpoints() -> None:
+def test_ordered_search_does_not_consume_fallback_for_duplicate_payload() -> None:
     duplicate_products = _products(1_000)
     duplicate_products[-1]["id"] = duplicate_products[0]["id"]
     session = FakeSession(
@@ -3086,21 +3108,17 @@ def test_ordered_search_rejects_duplicate_payload_from_all_endpoints() -> None:
     )
     transport = _ordered_requests_transport(session)
 
-    with pytest.raises(ScopedTransportError) as caught:
-        transport.search_ordered(
-            _scoped_search_request("primary"),
-            timeout_seconds=10,
-        )
-
-    assert caught.value.code == "search_product_duplicate"
-    assert caught.value.attempted_endpoint_ids == (
-        "primary",
-        "fallback-1",
+    result = transport.search_ordered(
+        _scoped_search_request("primary"),
+        timeout_seconds=10,
     )
-    assert len(session.calls) == 2
+
+    assert result.endpoint_id == "primary"
+    assert result.attempted_endpoint_ids == ("primary",)
+    assert len(session.calls) == 1
 
 
-def test_ordered_search_duplicate_then_rate_limit_retains_all_attempts() -> None:
+def test_ordered_search_accepts_duplicate_on_pinned_fallback() -> None:
     duplicate_products = _products(1_000)
     duplicate_products[-1]["id"] = duplicate_products[0]["id"]
     session = FakeSession(
@@ -3116,19 +3134,14 @@ def test_ordered_search_duplicate_then_rate_limit_retains_all_attempts() -> None
         pinned_endpoint_id="fallback-1",
     )
 
-    with pytest.raises(ScopedTransportError) as caught:
-        transport.search_ordered(
-            _scoped_search_request("fallback-1"),
-            timeout_seconds=10,
-        )
-
-    assert caught.value.code == "search_product_duplicate"
-    assert caught.value.endpoint_id == "fallback-1"
-    assert caught.value.attempted_endpoint_ids == (
-        "fallback-1",
-        "primary",
+    result = transport.search_ordered(
+        _scoped_search_request("fallback-1"),
+        timeout_seconds=10,
     )
-    assert len(session.calls) == 2
+
+    assert result.endpoint_id == "fallback-1"
+    assert result.attempted_endpoint_ids == ("fallback-1",)
+    assert len(session.calls) == 1
 
 
 def test_ordered_search_rechecks_runtime_deadline_before_each_endpoint_attempt() -> None:

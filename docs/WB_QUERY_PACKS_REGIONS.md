@@ -208,8 +208,8 @@ The runner:
   latched for that process, and is never used for resolver or WB search data;
 - sends the exact resolved value as the search `dest`;
 - derives pages from the plan depth: supported depth is `100..1000` in
-  100-item increments, with exactly 100 unique valid products required per
-  page;
+  100-item increments, with exactly 100 valid position rows required per page;
+  repeated product IDs remain separate rows with distinct absolute positions;
 - uses the production-configured primary/fallback endpoint list in the same
   active-first order as `SerpEngine`; retryable production statuses may advance
   once through the remaining configured endpoints for that page, while a
@@ -460,9 +460,9 @@ uncapped `total` between pages, so the
 run and resume contracts require stable `min(total, 1000)` and retain each
 page's exact `total` in its checkpoint. A terminal short page is valid only
 when it exactly completes `min(total, 1000)`; empty or inconsistent payloads
-fail closed. A duplicate product within one page is also invalid. The ordered
-transport may try the next configured endpoint for that page, but no duplicate
-payload is promoted; if every endpoint is unsuitable, the segment fails.
+fail closed. A repeated product within one page is a valid separate position
+fact; every occurrence is retained under its distinct absolute position and
+does not trigger endpoint fallback.
 
 The compatible one-plan full-pipeline launcher is:
 

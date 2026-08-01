@@ -672,7 +672,8 @@ Collection completeness:
 - 3/3 queries attempted for each region;
 - 6/6 regional pages HTTP 200;
 - exactly 100 product rows per query/region;
-- no duplicate `(region_id, query_id, product_id)` within a page;
+- unique `(region_id, query_id, absolute_position)` for every row; repeated
+  product IDs are retained as separate position facts;
 - no malformed product IDs;
 - endpoint, pack version, all provenance hashes and destination-resolution
   evidence recorded;
@@ -698,8 +699,8 @@ Comparison quality:
 Failure policy:
 
 - fail closed on any missing destination-resolution evidence, changed egress,
-  HTTP error, payload anomaly, duplicate row, short page or protected SHA
-  change;
+  HTTP error, payload anomaly, duplicate absolute position, short page or
+  protected SHA change;
 - retain scoped diagnostics only;
 - do not continue to the other region after a channel/identity failure.
 
