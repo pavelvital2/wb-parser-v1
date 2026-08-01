@@ -801,6 +801,96 @@ def test_top1000_resume_repeats_only_unfinished_query_segment(
     assert resumed.egress_calls == 5
 
 
+class _ExactCutoffTransitionFixture:
+    def validate_invocation(self, **_kwargs: Any) -> None:
+        return None
+
+    def validate_bundle(self, _bundle: Any) -> None:
+        return None
+
+    def runtime_window(self, window: Any) -> Any:
+        return window
+
+    def validated_evidence(self, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema_version": "wb_resume_cutoff_transition_v1",
+            "transition_id": "fixture-exact-cutoff-transition",
+            "validation_status": "validated_before_resume_network",
+            "evidence_sha256": "a" * 64,
+        }
+
+
+def test_exact_cutoff_transition_resume_preserves_verified_segments_and_repeats_first_unfinished(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["depth"] = 1000
+    plan["quality"]["expected_pages_per_query"] = 10
+    _write_json(plan_path, plan)
+    exact_run_id = "20260801_183812Z"
+
+    first = FakeTransport(failure_call=25, failure_code="search_http_498")
+    with pytest.raises(ScopedTransportError, match="search_http_498"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=first,
+            run_id=exact_run_id,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            egress_hash_salt=b"exact-cutoff-test",
+        )
+
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-moscow-rostov-top100-pilot-v1"
+        / exact_run_id
+    )
+    verified_before = {
+        path.relative_to(state_dir).as_posix(): path.read_bytes()
+        for path in state_dir.rglob("*")
+        if path.is_file()
+        and (
+            "segments/segment-00" in path.as_posix()
+            or "/checkpoints/moscow/shevron" in path.as_posix()
+            or "/checkpoints/moscow/shevrony" in path.as_posix()
+        )
+    }
+    assert len(_read_json(state_dir / "manifest.json")["resume"]["segments"]) == 2
+
+    resumed = FakeTransport(egress_values=["198.51.100.20"] * 8)
+    manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=resumed,
+        resume_run_id=exact_run_id,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+        egress_hash_salt=b"exact-cutoff-test",
+        resume_cutoff_transition=_ExactCutoffTransitionFixture(),
+    )
+
+    assert manifest["complete"] is True
+    assert len(resumed.search_calls) == 40
+    assert [
+        (call.task.region_id, call.task.query_id, call.task.page)
+        for call in resumed.search_calls[:10]
+    ] == [
+        ("moscow", "shevron-na-lipuchke", page)
+        for page in range(1, 11)
+    ]
+    assert manifest["resume_cutoff_transitions"] == [
+        _ExactCutoffTransitionFixture().validated_evidence()
+    ]
+    for relative, payload in verified_before.items():
+        assert (state_dir / relative).read_bytes() == payload
+
+
 def test_top1000_empty_checkpoint_is_not_resumable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

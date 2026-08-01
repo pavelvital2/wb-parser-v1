@@ -22,6 +22,11 @@ from app.serp.collection_plan_runner import (
     DeadlineGuard,
     validate_resumable_collection_state,
 )
+from app.serp.resume_cutoff_transition import (
+    ApprovedResumeCutoffTransition,
+    MATRIX_RUN_ID as CUTOFF_TRANSITION_RUN_ID,
+    canonical_transition_bytes,
+)
 from app.serp.execution_matrix import (
     ExecutionMatrix,
     ExecutionMatrixEntry,
@@ -588,11 +593,15 @@ def _entry_is_resumable(
     config: AppConfig,
     entry: ExecutionMatrixEntry,
     plan_run_id: str,
+    resume_cutoff_transition: ApprovedResumeCutoffTransition | None = None,
+    absolute_deadline_utc: datetime | None = None,
 ) -> bool:
     if validate_resumable_collection_state(
         config=config,
         plan_path=config.project_root / entry.plan_file,
         run_id=plan_run_id,
+        resume_cutoff_transition=resume_cutoff_transition,
+        absolute_deadline_utc=absolute_deadline_utc,
     ):
         return True
     manifest_path = (
@@ -769,6 +778,7 @@ def run_execution_matrix(
     resumable_probe: Callable[[ExecutionMatrixEntry, str], bool] | None = None,
     pristine_probe: Callable[[ExecutionMatrixEntry, str], bool] | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    resume_cutoff_transition: ApprovedResumeCutoffTransition | None = None,
 ) -> dict[str, Any]:
     matrix = load_execution_matrix(
         project_root=config.project_root,
@@ -780,6 +790,22 @@ def run_execution_matrix(
         raise ExecutionMatrixRunError(
             "execution matrix has no enabled entries"
         )
+    if matrix_run_id == CUTOFF_TRANSITION_RUN_ID and resume:
+        if resume_cutoff_transition is None:
+            raise ExecutionMatrixRunError(
+                "exact matrix run requires approved resume cutoff transition"
+            )
+    elif resume_cutoff_transition is not None:
+        raise ExecutionMatrixRunError(
+            "resume cutoff transition matrix scope is invalid"
+        )
+    if resume_cutoff_transition is not None:
+        resume_cutoff_transition.validate_invocation(
+            run_id=matrix_run_id,
+            resume=resume,
+            absolute_deadline_utc=absolute_deadline_utc,
+        )
+        resume_cutoff_transition.validate_matrix(matrix)
     runtime_window = (
         matrix.enabled_entries[0].bundle.collection_plan.runtime_window
     )
@@ -789,6 +815,10 @@ def run_execution_matrix(
     ):
         raise ExecutionMatrixRunError(
             "execution matrix runtime contracts differ"
+        )
+    if resume_cutoff_transition is not None:
+        runtime_window = resume_cutoff_transition.runtime_window(
+            runtime_window
         )
     matrix_deadline = DeadlineGuard.for_runtime_window(
         runtime_window,
@@ -918,6 +948,8 @@ def run_execution_matrix(
             config=config,
             entry=entry,
             plan_run_id=child_run_id,
+            resume_cutoff_transition=resume_cutoff_transition,
+            absolute_deadline_utc=matrix_deadline,
         )
     )
     is_pristine = pristine_probe or (
@@ -1029,6 +1061,26 @@ def run_execution_matrix(
                 before_execution=True,
                 resumable_entry=is_resume,
             )
+            if resume_cutoff_transition is not None:
+                if not is_resume or not can_resume(entry, plan_run_id):
+                    raise ExecutionMatrixRunError(
+                        "resume cutoff transition child checkpoint is invalid"
+                    )
+                evidence = resume_cutoff_transition.authorization_evidence()
+                evidence_path = run_root / "resume_cutoff_transition.json"
+                encoded_evidence = canonical_transition_bytes(evidence)
+                existing_evidence = _read_regular(evidence_path)
+                if existing_evidence is None:
+                    _write_json(
+                        evidence_path,
+                        evidence,
+                        integrity_gate=attest,
+                        require_absent=True,
+                    )
+                elif existing_evidence != encoded_evidence:
+                    raise ExecutionMatrixRunError(
+                        "resume cutoff transition evidence mismatch"
+                    )
             attest()
             entry_state["attempts"] += 1
             state["status"] = "running"

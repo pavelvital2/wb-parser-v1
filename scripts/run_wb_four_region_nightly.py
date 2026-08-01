@@ -41,6 +41,10 @@ from app.serp.four_region_nightly import (
     run_four_region_downstream,
     write_four_region_failure_attempt,
 )
+from app.serp.resume_cutoff_transition import (
+    ApprovedResumeCutoffTransition,
+    resolve_resume_cutoff_transition,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -177,6 +181,7 @@ def execute_four_region_plan(
     input_integrity_gate: Any,
     on_downstream_start: Callable[[], None] = lambda: None,
     matrix_continuation: bool = False,
+    resume_cutoff_transition: ApprovedResumeCutoffTransition | None = None,
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     bundle = load_collection_plan_bundle(
         project_root=config.project_root,
@@ -193,6 +198,17 @@ def execute_four_region_plan(
         if resume or downstream_only
         else None
     )
+    if completed_manifest is not None and resume_cutoff_transition is not None:
+        if not validate_resumable_collection_state(
+            config=config,
+            plan_path=plan_path,
+            run_id=run_id,
+            resume_cutoff_transition=resume_cutoff_transition,
+            absolute_deadline_utc=absolute_deadline_utc,
+        ):
+            raise CriticalPipelineError(
+                "completed collection cutoff transition validation failed"
+            )
     if downstream_only or completed_manifest is not None:
         manifest: Mapping[str, Any] = {
             "run_id": run_id,
@@ -209,6 +225,7 @@ def execute_four_region_plan(
             absolute_deadline_utc=absolute_deadline_utc,
             input_integrity_gate=input_integrity_gate,
             matrix_continuation=matrix_continuation,
+            resume_cutoff_transition=resume_cutoff_transition,
         )
         if (
             manifest.get("status") != "success"
@@ -225,6 +242,7 @@ def execute_four_region_plan(
         execution_mode=PRE_CUTOVER_DOWNSTREAM_MODE,
         absolute_deadline_utc=absolute_deadline_utc,
         input_integrity_gate=input_integrity_gate,
+        resume_cutoff_transition=resume_cutoff_transition,
     )
     return manifest, downstream
 
@@ -311,6 +329,23 @@ def main() -> int:
         absolute_deadline_utc = _adapter_deadline()
         if not args.downstream_only_run_id and not args.resume_run_id:
             run_id = _adapter_run_ref(now)
+        resume_cutoff_transition = resolve_resume_cutoff_transition(
+            run_id=run_id,
+            resume=bool(args.resume_run_id),
+            coordinator_run_id=os.getenv(
+                "MARKETPLACE_COORDINATOR_RUN_ID",
+                "",
+            ),
+            coordinator_stage=os.getenv(
+                "MARKETPLACE_COORDINATOR_STAGE",
+                "",
+            ),
+            transition_id=os.getenv(
+                "MARKETPLACE_COORDINATOR_CUTOFF_TRANSITION_ID",
+                "",
+            ),
+            absolute_deadline_utc=absolute_deadline_utc,
+        )
         config = load_config(args.config)
         if args.matrix_file:
             matrix_path = Path(args.matrix_file)
@@ -332,6 +367,7 @@ def main() -> int:
                     absolute_deadline_utc=matrix_deadline_utc,
                     input_integrity_gate=verify_inputs,
                     matrix_continuation=not resume,
+                    resume_cutoff_transition=resume_cutoff_transition,
                 )
 
             matrix_state = run_execution_matrix(
@@ -342,6 +378,7 @@ def main() -> int:
                 execute_entry=execute_entry,
                 absolute_deadline_utc=absolute_deadline_utc,
                 input_integrity_gate=verify_inputs,
+                resume_cutoff_transition=resume_cutoff_transition,
             )
             manifest = {
                 "run_id": run_id,
@@ -368,6 +405,7 @@ def main() -> int:
                     "downstream_started",
                     True,
                 ),
+                resume_cutoff_transition=resume_cutoff_transition,
             )
     except (
         CriticalPipelineError,
@@ -395,6 +433,8 @@ def main() -> int:
                     config=config,
                     plan_path=plan_path,
                     run_id=run_id,
+                    resume_cutoff_transition=resume_cutoff_transition,
+                    absolute_deadline_utc=absolute_deadline_utc,
                 )
                 or (
                     bool(collection_plan_id)

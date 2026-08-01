@@ -35,6 +35,10 @@ from app.serp.collection_plan_runner import (
     ScopedPaths,
     acquire_collection_plan_locks,
 )
+from app.serp.resume_cutoff_transition import (
+    ApprovedResumeCutoffTransition,
+    COLLECTION_RUN_ID as CUTOFF_TRANSITION_RUN_ID,
+)
 from app.warehouse.wb_regional import ingest_regional_run
 
 
@@ -2492,6 +2496,7 @@ def run_four_region_downstream(
     execution_mode: str = PRE_CUTOVER_DOWNSTREAM_MODE,
     absolute_deadline_utc: datetime | None = None,
     input_integrity_gate: Callable[[], None] | None = None,
+    resume_cutoff_transition: ApprovedResumeCutoffTransition | None = None,
 ) -> dict[str, Any]:
     integrity_gate = input_integrity_gate or (lambda: None)
     execution_contract = DownstreamExecutionContract.pre_cutover()
@@ -2526,6 +2531,25 @@ def run_four_region_downstream(
         if execution_mode != execution_contract.mode:
             raise CriticalPipelineError(
                 "downstream execution mode is not approved"
+            )
+        if run_id == CUTOFF_TRANSITION_RUN_ID:
+            if resume_cutoff_transition is None:
+                raise CriticalPipelineError(
+                    "exact run requires approved resume cutoff transition"
+                )
+        elif resume_cutoff_transition is not None:
+            raise CriticalPipelineError(
+                "resume cutoff transition downstream scope is invalid"
+            )
+        if resume_cutoff_transition is not None:
+            resume_cutoff_transition.validate_invocation(
+                run_id=run_id,
+                resume=True,
+                absolute_deadline_utc=absolute_deadline_utc,
+            )
+            resume_cutoff_transition.validate_bundle(bundle)
+            runtime_window = resume_cutoff_transition.runtime_window(
+                runtime_window
             )
         execution_contract.ensure_start_allowed(now())
         deadline = DeadlineGuard.for_runtime_window(

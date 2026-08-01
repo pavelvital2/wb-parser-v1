@@ -44,6 +44,11 @@ from app.serp.collection_plan import (
     load_collection_plan_bundle,
     register_query_pack_provenance,
 )
+from app.serp.resume_cutoff_transition import (
+    ApprovedResumeCutoffTransition,
+    COLLECTION_RUN_ID as CUTOFF_TRANSITION_RUN_ID,
+    TRANSITION_ID as CUTOFF_TRANSITION_ID,
+)
 
 
 MANIFEST_SCHEMA_VERSION = "wb_collection_plan_manifest_v1"
@@ -77,11 +82,25 @@ _RESUME_ATTESTATION_RUNNER_RELATIVE = Path(
     "app/serp/collection_plan_runner.py"
 )
 
-# Run-scoped repair exceptions are retired once their immutable collection
-# manifest is complete. Any future attestation drift therefore fails closed.
 _APPROVED_RESUME_ATTESTATION_TRANSITIONS: dict[
     tuple[str, str, str, str, str], dict[str, str]
-] = {}
+] = {
+    (
+        "20260801_183812Z",
+        "shevron-four-regions-top1000-v2",
+        "0b37ed2c84f50a79f69f89c769ee3823055bbea9394f56d1baa1b7e77d03443e",
+        "7bcd2d7b3c4d4ff4b5a925b2b2d9015bc5083659607a93bb6ff63012294b5021",
+        "ae7780b166a4be2945792286042c918029b88a71f186e135909c95eb87c2a925",
+    ): {
+        "transition_id": CUTOFF_TRANSITION_ID,
+        "target_manifest_projection_sha256": (
+            "d6ad0c4334a54a03be7752346c1779f65b7504887f7df2d61ef409e73d4715f1"
+        ),
+        "target_runner_projection_sha256": (
+            "9d850f5d824ec68604b44202600dee6d9a0b269db8a9976b145669d74abdf277"
+        ),
+    }
+}
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _RUN_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}Z$")
@@ -1973,6 +1992,7 @@ class CollectionPlanRunner:
         absolute_deadline_utc: datetime | None = None,
         input_integrity_gate: Callable[[], None] | None = None,
         matrix_continuation: bool = False,
+        resume_cutoff_transition: ApprovedResumeCutoffTransition | None = None,
     ) -> None:
         self.config = config
         self.plan_path = plan_path
@@ -1997,6 +2017,15 @@ class CollectionPlanRunner:
         self.run_id = _safe_run_id(
             resume_run_id or run_id or _default_run_id(started)
         )
+        if self.run_id == CUTOFF_TRANSITION_RUN_ID and self.resume:
+            if resume_cutoff_transition is None:
+                raise CollectionPlanRunError(
+                    "exact run requires approved resume cutoff transition"
+                )
+        elif resume_cutoff_transition is not None:
+            raise CollectionPlanRunError(
+                "resume cutoff transition scope is invalid"
+            )
         self.started_at_utc = _utc_iso(started)
         self.deadline = DeadlineGuard.for_current_day(now=now)
         self.lock_event_hook = lock_event_hook
@@ -2005,10 +2034,19 @@ class CollectionPlanRunner:
         self.sleeper = sleeper
         self.absolute_deadline_utc = absolute_deadline_utc
         self.input_integrity_gate = input_integrity_gate or (lambda: None)
+        self.resume_cutoff_transition = resume_cutoff_transition
 
     def _configure_runtime_deadline(self, bundle: CollectionPlanBundle) -> None:
         window = bundle.collection_plan.runtime_window
         if window is not None:
+            if self.resume_cutoff_transition is not None:
+                self.resume_cutoff_transition.validate_invocation(
+                    run_id=self.run_id,
+                    resume=self.resume,
+                    absolute_deadline_utc=self.absolute_deadline_utc,
+                )
+                self.resume_cutoff_transition.validate_bundle(bundle)
+                window = self.resume_cutoff_transition.runtime_window(window)
             self.deadline = DeadlineGuard.for_runtime_window(
                 window,
                 resume=self.resume or self.matrix_continuation,
@@ -3613,6 +3651,7 @@ class CollectionPlanRunner:
 
             prior_manifest: dict[str, Any] | None = None
             attestation_transitions: list[dict[str, str]] = []
+            resume_cutoff_transitions: list[dict[str, Any]] = []
             if self.resume:
                 prior_manifest = _json_object_from_bytes(
                     _read_regular_bytes(
@@ -3684,6 +3723,37 @@ class CollectionPlanRunner:
                     ),
                     allow_initial_missing=manifest_transition is not None,
                 )
+                if self.resume_cutoff_transition is not None:
+                    cutoff_evidence = (
+                        self.resume_cutoff_transition.validated_evidence(
+                            bundle=bundle,
+                            effective_plan_sha256=effective_sha256,
+                            prior_manifest=prior_manifest,
+                            effective_plan=snapshot,
+                            current_transport_fingerprint=transport_fingerprint,
+                            attestation_transition=(
+                                manifest_transition or snapshot_transition
+                            ),
+                        )
+                    )
+                    stored_cutoff_evidence = prior_manifest.get(
+                        "resume_cutoff_transitions"
+                    )
+                    if stored_cutoff_evidence in (None, []):
+                        resume_cutoff_transitions = [cutoff_evidence]
+                    elif stored_cutoff_evidence == [cutoff_evidence]:
+                        resume_cutoff_transitions = [cutoff_evidence]
+                    else:
+                        raise CollectionPlanRunError(
+                            "resume cutoff transition evidence is invalid"
+                        )
+                elif prior_manifest.get("resume_cutoff_transitions") not in (
+                    None,
+                    [],
+                ):
+                    raise CollectionPlanRunError(
+                        "unexpected resume cutoff transition evidence"
+                    )
                 for key, expected in {
                     "query_pack_sha256": bundle.query_pack_sha256,
                     "collection_plan_sha256": bundle.collection_plan_sha256,
@@ -3866,6 +3936,7 @@ class CollectionPlanRunner:
                     "transport_attestation_transitions": (
                         attestation_transitions
                     ),
+                    "resume_cutoff_transitions": resume_cutoff_transitions,
                     "effective_plan_snapshot_path": _relative(
                         paths.effective_plan_path,
                         paths.project_root,
@@ -4511,6 +4582,7 @@ class CollectionPlanRunner:
                 "transport_attestation_transitions": (
                     attestation_transitions
                 ),
+                "resume_cutoff_transitions": resume_cutoff_transitions,
                 "effective_plan_snapshot_path": _relative(
                     paths.effective_plan_path,
                     paths.project_root,
@@ -5038,6 +5110,7 @@ def run_collection_plan(
     absolute_deadline_utc: datetime | None = None,
     input_integrity_gate: Callable[[], None] | None = None,
     matrix_continuation: bool = False,
+    resume_cutoff_transition: ApprovedResumeCutoffTransition | None = None,
 ) -> dict[str, Any]:
     owned_transport = False
     active_transport = transport
@@ -5069,6 +5142,7 @@ def run_collection_plan(
             absolute_deadline_utc=absolute_deadline_utc,
             input_integrity_gate=input_integrity_gate,
             matrix_continuation=matrix_continuation,
+            resume_cutoff_transition=resume_cutoff_transition,
         ).run()
     finally:
         if owned_transport:
@@ -5081,6 +5155,8 @@ def validate_resumable_collection_state(
     plan_path: Path,
     run_id: str,
     transport: ScopedTransport | None = None,
+    resume_cutoff_transition: ApprovedResumeCutoffTransition | None = None,
+    absolute_deadline_utc: datetime | None = None,
 ) -> bool:
     active_transport: ScopedTransport | None = transport
     owned_transport = transport is None
@@ -5093,6 +5169,7 @@ def validate_resumable_collection_state(
             transport=active_transport,
             no_publish=True,
             resume_run_id=run_id,
+            resume_cutoff_transition=resume_cutoff_transition,
         )
         bundle = runner._load_bundle()
         runner._validate_mode(bundle)
@@ -5121,8 +5198,14 @@ def validate_resumable_collection_state(
             or manifest.get("run_id") != run_id
             or manifest.get("collection_plan_id")
             != bundle.collection_plan.collection_plan_id
-            or manifest.get("complete") is True
-            or manifest.get("status") == "success"
+            or (
+                manifest.get("complete") is True
+                and resume_cutoff_transition is None
+            )
+            or (
+                manifest.get("status") == "success"
+                and resume_cutoff_transition is None
+            )
         ):
             return False
         effective_sha256 = canonical_effective_plan_sha256(snapshot)
@@ -5150,6 +5233,35 @@ def validate_resumable_collection_state(
             expected=(manifest_transition, snapshot_transition),
             allow_initial_missing=manifest_transition is not None,
         )
+        if resume_cutoff_transition is not None:
+            resume_cutoff_transition.validate_invocation(
+                run_id=run_id,
+                resume=True,
+                absolute_deadline_utc=absolute_deadline_utc,
+            )
+            cutoff_evidence = resume_cutoff_transition.validated_evidence(
+                bundle=bundle,
+                effective_plan_sha256=effective_sha256,
+                prior_manifest=manifest,
+                effective_plan=snapshot,
+                current_transport_fingerprint=current_fingerprint,
+                attestation_transition=(
+                    manifest_transition or snapshot_transition
+                ),
+                allow_completed=(
+                    manifest.get("status") == "success"
+                    and manifest.get("complete") is True
+                ),
+            )
+            stored_cutoff_evidence = manifest.get(
+                "resume_cutoff_transitions"
+            )
+            if stored_cutoff_evidence not in (
+                None,
+                [],
+                [cutoff_evidence],
+            ):
+                return False
         resume = manifest.get("resume")
         refs = resume.get("segments") if isinstance(resume, dict) else None
         if not isinstance(refs, list) or not refs:
@@ -5174,10 +5286,16 @@ def validate_resumable_collection_state(
         expected_scopes = len(bundle.enabled_regions) * len(
             bundle.enabled_queries
         )
-        return (
-            len(verified) < expected_scopes
-            or manifest.get("status") == "publication_pending"
-        )
+        if manifest.get("status") == "success" or manifest.get("complete") is True:
+            return (
+                manifest.get("status") == "success"
+                and manifest.get("complete") is True
+                and len(verified) == expected_scopes
+                and failed_segment is None
+            )
+        return len(verified) < expected_scopes or manifest.get(
+            "status"
+        ) == "publication_pending"
     except (
         CollectionPlanRunError,
         CollectionPlanValidationError,
