@@ -88,7 +88,8 @@ one day and makes a resumable plan impossible to start.
 
 The reviewed v2 contract is:
 
-- new run start: 00:15 MSK through 00:45 MSK;
+- new run admission: 00:15 MSK through the existing 23:00 MSK cutoff
+  (`new_run_start_grace_seconds=81900`);
 - maximum one invocation: 21600 seconds (6 hours);
 - absolute cutoff: 23:00 MSK, 75 minutes before the next 00:15 boundary;
 - resume start requires at least 1800 seconds before the effective deadline;
@@ -132,12 +133,12 @@ collection-plan fields and is recorded as
 `legacy_boundary_source=pre_cutover_contract_v1`.
 
 The v2 four-region plan is separately required to match the complete reviewed
-runtime contract exactly: `bounded_resumable`, `00:15`, 1800-second new-run
-grace, 21600-second invocation cap, `23:00` cutoff, 1800-second resume window
-and 60-second finalization reserve. Valid but unreviewed runtime drift fails
-before shared lock acquisition. The final supervisor/cutover must replace the
-pre-cutover mode in a separate reviewed change; it must not silently bypass
-the guard.
+runtime contract exactly: `bounded_resumable`, `00:15`, 81900-second new-run
+grace ending at the `23:00` cutoff, 21600-second invocation cap, 1800-second
+resume window and 60-second finalization reserve. Valid but unreviewed runtime
+drift fails before shared lock acquisition. The final supervisor/cutover must
+replace the pre-cutover mode in a separate reviewed change; it must not silently
+bypass the guard.
 
 Downstream `runs/<run_id>/state.json` is authoritative and may be written only
 while all collection-plan exclusion locks are held. A successful or complete

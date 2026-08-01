@@ -883,7 +883,7 @@ def test_bounded_plan_rejects_late_new_start_before_network(
 ) -> None:
     _root, config, plan_path = _project(tmp_path, monkeypatch)
     transport = FourRegionFakeTransport()
-    now = datetime(2026, 7, 26, 9, 16, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 26, 20, 1, tzinfo=timezone.utc)
     runner = CollectionPlanRunner(
         config=config,
         plan_path=plan_path,
@@ -899,15 +899,36 @@ def test_bounded_plan_rejects_late_new_start_before_network(
     assert transport.egress_calls == 0
 
 
-def test_bounded_plan_allows_recovery_start_within_twelve_hours(
+def test_bounded_plan_allows_new_start_after_previous_twelve_hour_window(
 ) -> None:
-    now = datetime(2026, 7, 26, 3, 30, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 26, 11, 50, tzinfo=timezone.utc)
     guard = DeadlineGuard.for_runtime_window(
         REVIEWED_FOUR_REGION_RUNTIME_WINDOW,
         resume=False,
         now=lambda: now,
     )
     assert guard.remaining_seconds() == 21600
+
+
+def test_four_region_grace_drift_rejected_by_exact_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, _config, plan_path = _project(tmp_path, monkeypatch)
+    plan = _read_json(plan_path)
+    plan["runtime_window"]["new_run_start_grace_seconds"] = 43200
+    _write_json(plan_path, plan)
+    bundle = load_collection_plan_bundle(
+        project_root=plan_path.parents[3],
+        plan_path=plan_path,
+        region_registry_path=plan_path.parents[1] / "regions.json",
+    )
+
+    with pytest.raises(
+        CriticalPipelineError,
+        match="reviewed runtime contract mismatch",
+    ):
+        validate_four_region_bundle(bundle)
 
 
 def test_cutoff_keeps_verified_segment_and_resume_starts_next_query(
@@ -1752,6 +1773,7 @@ def test_pre_cutover_runtime_drift_rejected_before_lock(
     latest_before = latest_path.read_bytes()
     plan = _read_json(plan_path)
     plan["runtime_window"]["scheduled_start_msk"] = "01:00"
+    plan["runtime_window"]["new_run_start_grace_seconds"] = 79200
     _write_json(plan_path, plan)
     lock_calls = 0
 
@@ -2025,6 +2047,7 @@ def test_attempt_artifact_failure_does_not_mask_preflight_error(
     _root, config, plan_path = _project(tmp_path, monkeypatch)
     plan = _read_json(plan_path)
     plan["runtime_window"]["scheduled_start_msk"] = "01:00"
+    plan["runtime_window"]["new_run_start_grace_seconds"] = 79200
     _write_json(plan_path, plan)
     monkeypatch.setattr(
         "app.serp.four_region_nightly._immutable_json",

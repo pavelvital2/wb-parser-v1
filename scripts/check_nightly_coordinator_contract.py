@@ -461,6 +461,16 @@ def _validate_sources() -> list[dict[str, str]]:
         or plan.get("publication_mode") != "none"
         or plan.get("sellers_mode") != "disabled"
         or plan.get("proxy_rotation_mode") != "disabled"
+        or plan.get("runtime_window")
+        != {
+            "mode": "bounded_resumable",
+            "scheduled_start_msk": "00:15",
+            "new_run_start_grace_seconds": 81900,
+            "max_invocation_runtime_seconds": 21600,
+            "absolute_cutoff_msk": "23:00",
+            "minimum_resume_window_seconds": 1800,
+            "finalization_reserve_seconds": 60,
+        }
     ):
         raise CheckError("plan contract mismatch")
     queries = pack.get("queries")

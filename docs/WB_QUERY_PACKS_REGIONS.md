@@ -491,12 +491,14 @@ runtime cutoff, use the same launcher with `--downstream-only-run-id`. It
 revalidates the immutable scoped generation and resumes seller checkpoints
 without another SERP request.
 
-The v2 runtime window is bounded and resumable. A new run can start only in its
-reviewed 00:15-00:45 MSK window. One invocation is capped at six hours and at
-23:00 MSK. The runner estimates the next atomic 10-page query segment, checks
-the deadline before every network attempt and repeats at most the unfinished
-segment after interruption. It does not lower the production timeout and uses
-only production SERP page/query pacing.
+The v2 runtime window is bounded and resumable. A new run may be admitted from
+00:15 MSK until the existing 23:00 MSK absolute cutoff; the exact grace is
+81900 seconds. One invocation remains capped at six hours and at 23:00 MSK.
+Admission does not bypass the next-segment estimate: a start too close to the
+cutoff still fails before network I/O. The runner checks the deadline before
+every network attempt and repeats at most the unfinished segment after
+interruption. It does not lower the production timeout and uses only production
+SERP page/query pacing.
 
 Position facts are keyed by run, region, query and absolute position. Repeated
 product IDs at different positions remain separate facts; only seller input is

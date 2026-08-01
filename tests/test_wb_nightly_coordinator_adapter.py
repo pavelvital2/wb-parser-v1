@@ -329,6 +329,35 @@ def test_checker_dry_run_is_exact_and_no_network(
         assert f"scripts/{name}" in manifest["files"]
 
 
+def test_checker_rejects_four_region_runtime_window_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        os,
+        "environ",
+        _checker_environment("wb_initial"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "verify_input_manifest",
+        lambda _root: "a" * 64,
+    )
+
+    def read_with_runtime_drift(path: Path, **_kwargs: object) -> bytes:
+        encoded = path.read_bytes()
+        if path == checker.PLAN:
+            plan = json.loads(encoded.decode("utf-8"))
+            plan["runtime_window"]["new_run_start_grace_seconds"] = 43200
+            return json.dumps(plan).encode("utf-8")
+        return encoded
+
+    monkeypatch.setattr(checker, "_read_safe", read_with_runtime_drift)
+
+    assert checker.main() == 2
+    assert "wb_coordinator_contract_check_failed" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("stage", ("wb_initial", "wb_resume"))
 def test_exact_checker_command_uses_approved_python_with_restricted_path(
     stage: str,

@@ -674,6 +674,26 @@ def _load_runtime_window(value: Any) -> CollectionRuntimeWindow:
         minimum=minimum_resume_window_seconds,
         maximum=43200,
     )
+    new_run_start_grace_seconds = _require_int(
+        window["new_run_start_grace_seconds"],
+        field=f"{field}.new_run_start_grace_seconds",
+        minimum=0,
+        maximum=86400,
+    )
+    start_hour, start_minute = (
+        int(item) for item in scheduled_start_msk.split(":", 1)
+    )
+    cutoff_hour, cutoff_minute = (
+        int(item) for item in absolute_cutoff_msk.split(":", 1)
+    )
+    seconds_until_cutoff = (
+        (cutoff_hour * 60 + cutoff_minute)
+        - (start_hour * 60 + start_minute)
+    ) * 60
+    if new_run_start_grace_seconds > seconds_until_cutoff:
+        raise CollectionPlanValidationError(
+            f"{field}.new_run_start_grace_seconds must not extend past absolute cutoff"
+        )
     if minimum_resume_window_seconds <= finalization_reserve_seconds:
         raise CollectionPlanValidationError(
             f"{field}.minimum_resume_window_seconds must exceed finalization reserve"
@@ -681,12 +701,7 @@ def _load_runtime_window(value: Any) -> CollectionRuntimeWindow:
     return CollectionRuntimeWindow(
         mode=mode,
         scheduled_start_msk=scheduled_start_msk,
-        new_run_start_grace_seconds=_require_int(
-            window["new_run_start_grace_seconds"],
-            field=f"{field}.new_run_start_grace_seconds",
-            minimum=0,
-            maximum=43200,
-        ),
+        new_run_start_grace_seconds=new_run_start_grace_seconds,
         max_invocation_runtime_seconds=max_invocation_runtime_seconds,
         absolute_cutoff_msk=absolute_cutoff_msk,
         minimum_resume_window_seconds=minimum_resume_window_seconds,

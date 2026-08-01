@@ -195,11 +195,13 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   drift remains fail-closed before network I/O.
   The audited one-plan `--plan-file` mode remains available for manual
   compatibility but is not the coordinator schedule projection.
-- A new four-region run may start during the reviewed 12-hour recovery window
-  after the scheduled `00:15 MSK` start. The per-invocation limit remains six
-  hours and the absolute cutoff remains `23:00 MSK`. This window exists so a
-  transient coordinator, host-lock or access failure does not permanently
-  discard the daily regional collection.
+- A new four-region run may be admitted from the scheduled `00:15 MSK` start
+  through the existing `23:00 MSK` absolute cutoff; the reviewed
+  `new_run_start_grace_seconds` is `81900`. The per-invocation limit remains six
+  hours, and the next-segment estimate may still reject a start too close to
+  cutoff before network I/O. This window exists so a transient coordinator,
+  host-lock or access failure does not permanently discard the daily regional
+  collection.
 - Regional WB position facts use `marketplace=wb` and preserve
   query-pack/version, query group, query, run/date, region ID/name,
   displayed-region label and absolute position. Historical global WB facts are

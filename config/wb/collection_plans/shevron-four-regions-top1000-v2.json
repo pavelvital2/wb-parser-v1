@@ -56,7 +56,7 @@
   "runtime_window": {
     "mode": "bounded_resumable",
     "scheduled_start_msk": "00:15",
-    "new_run_start_grace_seconds": 43200,
+    "new_run_start_grace_seconds": 81900,
     "max_invocation_runtime_seconds": 21600,
     "absolute_cutoff_msk": "23:00",
     "minimum_resume_window_seconds": 1800,

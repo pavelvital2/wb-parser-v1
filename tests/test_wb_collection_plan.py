@@ -30,6 +30,9 @@ PACK_RELATIVE = Path("config/wb/query_packs/shevron-core/2026-07-26.1.json")
 PLAN_RELATIVE = Path(
     "config/wb/collection_plans/shevron-moscow-rostov-top100-pilot-v1.json"
 )
+FOUR_REGION_PLAN_RELATIVE = Path(
+    "config/wb/collection_plans/shevron-four-regions-top1000-v2.json"
+)
 REGIONS_RELATIVE = Path("config/wb/regions.json")
 
 
@@ -692,6 +695,26 @@ def test_collection_plan_accepts_page_aligned_depths(
 
     assert loaded.depth == depth
     assert loaded.quality.expected_pages_per_query == depth // 100
+
+
+def test_new_run_grace_may_reach_but_not_pass_absolute_cutoff(
+    tmp_path: Path,
+) -> None:
+    root = _copy_stage1_config(tmp_path)
+    plan_path = root / FOUR_REGION_PLAN_RELATIVE
+
+    loaded = load_collection_plan(plan_path)
+    assert loaded.runtime_window is not None
+    assert loaded.runtime_window.new_run_start_grace_seconds == 81900
+
+    plan = _read_json(plan_path)
+    plan["runtime_window"]["new_run_start_grace_seconds"] = 81901
+    _write_json(plan_path, plan)
+    with pytest.raises(
+        CollectionPlanValidationError,
+        match="must not extend past absolute cutoff",
+    ):
+        load_collection_plan(plan_path)
 
 
 def test_tracked_top1000_plan_covers_exact_pack_order_and_600_pages() -> None:

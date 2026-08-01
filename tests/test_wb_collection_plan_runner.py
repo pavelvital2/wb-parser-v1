@@ -2711,6 +2711,7 @@ def test_matrix_continuation_uses_shared_deadline_after_new_run_window(
     )
     plan = _read_json(plan_path)
     plan["enabled"] = True
+    plan["runtime_window"]["new_run_start_grace_seconds"] = 43200
     _write_json(plan_path, plan)
     bundle = load_collection_plan_bundle(
         project_root=root,
