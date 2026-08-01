@@ -94,7 +94,7 @@ _APPROVED_RESUME_ATTESTATION_TRANSITIONS: dict[
     ): {
         "transition_id": CUTOFF_TRANSITION_ID,
         "target_manifest_projection_sha256": (
-            "d6ad0c4334a54a03be7752346c1779f65b7504887f7df2d61ef409e73d4715f1"
+            "4d136a99a69cec259ae400f3bf07d2ae8436707e9e67d975660bdca7cf7462aa"
         ),
         "target_runner_projection_sha256": (
             "9d850f5d824ec68604b44202600dee6d9a0b269db8a9976b145669d74abdf277"

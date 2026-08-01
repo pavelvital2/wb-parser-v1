@@ -4,10 +4,12 @@
 
 This is a one-run recovery contract. It applies only to:
 
-- coordinator run `nightly-20260801-66cbc819ed0f`;
+- successor coordinator run `nightly-20260801-49b1d183812f`;
+- predecessor coordinator run `nightly-20260801-66cbc819ed0f` (terminal and
+  immutable);
 - coordinator stage `wb_resume`;
 - WB matrix and collection run `20260801_183812Z`;
-- transition ID `wb-20260801-183812Z-cutoff-2300-2359-v1`;
+- transition ID `wb-20260801-183812Z-successor-2300-2359-v2`;
 - deadline change `2026-08-01T20:00:00Z` to `2026-08-01T20:59:00Z`.
 
 It does not change the tracked collection plan, immutable effective plan,

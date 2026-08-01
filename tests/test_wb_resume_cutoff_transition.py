@@ -28,6 +28,7 @@ from app.serp.resume_cutoff_transition import (
     EXECUTION_MATRIX_ID,
     FROM_CUTOFF_MSK,
     MATRIX_RUN_ID,
+    PREDECESSOR_COORDINATOR_RUN_ID,
     STORED_TRANSPORT_FINGERPRINT,
     TO_CUTOFF_MSK,
     TO_DEADLINE_UTC,
@@ -259,6 +260,9 @@ def test_authorization_evidence_is_deterministic_and_run_scoped() -> None:
     assert first == second
     assert canonical_transition_bytes(first) == canonical_transition_bytes(second)
     assert first["coordinator_run_id"] == COORDINATOR_RUN_ID
+    assert first["predecessor_coordinator_run_id"] == (
+        PREDECESSOR_COORDINATOR_RUN_ID
+    )
     assert first["matrix_run_id"] == MATRIX_RUN_ID
     assert first["collection_run_id"] == COLLECTION_RUN_ID
     with pytest.raises(ResumeCutoffTransitionError, match="ID mismatch"):

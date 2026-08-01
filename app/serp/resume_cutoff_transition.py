@@ -11,8 +11,9 @@ from app.serp.collection_plan import CollectionPlanBundle, CollectionRuntimeWind
 
 
 SCHEMA_VERSION = "wb_resume_cutoff_transition_v1"
-TRANSITION_ID = "wb-20260801-183812Z-cutoff-2300-2359-v1"
-COORDINATOR_RUN_ID = "nightly-20260801-66cbc819ed0f"
+TRANSITION_ID = "wb-20260801-183812Z-successor-2300-2359-v2"
+COORDINATOR_RUN_ID = "nightly-20260801-49b1d183812f"
+PREDECESSOR_COORDINATOR_RUN_ID = "nightly-20260801-66cbc819ed0f"
 COORDINATOR_STAGE = "wb_resume"
 MATRIX_RUN_ID = "20260801_183812Z"
 COLLECTION_RUN_ID = MATRIX_RUN_ID
@@ -209,6 +210,9 @@ class ApprovedResumeCutoffTransition:
             "authorization_scope": "exact_resume_only",
             "deadline_scope": "same_day_collection_and_downstream",
             "coordinator_run_id": COORDINATOR_RUN_ID,
+            "predecessor_coordinator_run_id": (
+                PREDECESSOR_COORDINATOR_RUN_ID
+            ),
             "coordinator_stage": COORDINATOR_STAGE,
             "matrix_run_id": MATRIX_RUN_ID,
             "collection_run_id": COLLECTION_RUN_ID,
