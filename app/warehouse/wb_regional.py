@@ -10,7 +10,7 @@ import tempfile
 import time
 import uuid
 from contextlib import ExitStack, contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -106,6 +106,21 @@ def _run_date(run_id: str) -> str:
         return ""
     value = run_id[:8]
     return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
+
+
+def _effective_run_date(run_id: str, value: str | None) -> str:
+    candidate = _run_date(run_id) if value is None else value
+    if not isinstance(candidate, str):
+        raise CriticalPipelineError("regional warehouse run date is invalid")
+    try:
+        parsed = date.fromisoformat(candidate)
+    except ValueError as exc:
+        raise CriticalPipelineError(
+            "regional warehouse run date is invalid"
+        ) from exc
+    if parsed.isoformat() != candidate:
+        raise CriticalPipelineError("regional warehouse run date is invalid")
+    return candidate
 
 
 def _safe_temp_root(project_root: Path) -> Path:
@@ -1634,12 +1649,14 @@ def ingest_regional_run(
     *,
     project_root: Path,
     run_id: str,
+    run_date: str | None = None,
     collection_plan_id: str,
     bridge_path: Path,
     sellers_path: Path,
     collection_manifest_path: Path | None = None,
     integrity_gate: Callable[[], None] = lambda: None,
 ) -> dict[str, Any]:
+    effective_run_date = _effective_run_date(run_id, run_date)
     if collection_manifest_path is None:
         collection_manifest_path = bridge_path.parent / "collection_manifest.json"
     bridge_sha256 = _sha256(bridge_path)
@@ -1692,6 +1709,24 @@ def ingest_regional_run(
             ):
                 raise CriticalPipelineError(
                     "regional warehouse source hash mismatch for existing run"
+                )
+            stored_dates = connection.execute(
+                "SELECT DISTINCT run_date FROM ("
+                "SELECT run_date FROM regional_query_positions WHERE run_id = ? "
+                "UNION ALL "
+                "SELECT run_date FROM regional_seller_snapshots WHERE run_id = ? "
+                "UNION ALL "
+                "SELECT run_date FROM regional_run_quality WHERE run_id = ? "
+                "UNION ALL "
+                "SELECT run_date FROM regional_query_quality WHERE run_id = ? "
+                "UNION ALL "
+                "SELECT run_date FROM regional_query_generations WHERE run_id = ?"
+                ") ORDER BY run_date",
+                [run_id, run_id, run_id, run_id, run_id],
+            ).fetchall()
+            if stored_dates != [(effective_run_date,)]:
+                raise CriticalPipelineError(
+                    "regional warehouse run date mismatch for existing run"
                 )
             return {
                 "status": "already_ingested",
@@ -1763,7 +1798,7 @@ def ingest_regional_run(
                     [
                         "wb",
                         run_id,
-                        _run_date(run_id),
+                        effective_run_date,
                         row.get("collected_at_utc", ""),
                         region_id,
                         row.get("region_name", ""),
@@ -1831,7 +1866,7 @@ def ingest_regional_run(
                         """,
                         [
                             run_id,
-                            _run_date(run_id),
+                            effective_run_date,
                             seller.get("collected_at_utc", ""),
                             region_id,
                             region_names.get(region_id, ""),
@@ -1938,7 +1973,7 @@ def ingest_regional_run(
                       AND query_id = ?
                     """,
                     [
-                        _run_date(run_id),
+                        effective_run_date,
                         query_pack_id,
                         query_pack_version,
                         region_id,
@@ -1978,7 +2013,7 @@ def ingest_regional_run(
                 ]
                 run_quality_payload = {
                     "run_id": run_id,
-                    "run_date": _run_date(run_id),
+                    "run_date": effective_run_date,
                     "region_id": region_id,
                     "region_provenance": COLLECTED_REGION_PROVENANCE,
                     "collection_plan_id": collection_plan_id,
@@ -2053,7 +2088,7 @@ def ingest_regional_run(
                     )
                     """,
                     [
-                        _run_date(run_id),
+                        effective_run_date,
                         query_pack_id,
                         query_pack_version,
                         region_id,
@@ -2084,7 +2119,7 @@ def ingest_regional_run(
                     """,
                     [
                         run_id,
-                        _run_date(run_id),
+                        effective_run_date,
                         row["region_id"],
                         collection_plan_id,
                         collection_manifest.get("query_pack_id", ""),

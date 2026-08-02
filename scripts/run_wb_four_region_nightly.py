@@ -20,6 +20,7 @@ from app.common.nightly_coordinator import (
     ADAPTER_STATUS_SCHEMA_VERSION,
     NightlyCoordinatorContractError,
     WB_RUN_REF,
+    coordinator_invocation_from_environment,
     parse_utc,
     require_official_live_entry_lease,
 )
@@ -78,6 +79,19 @@ def _adapter_run_ref(now: datetime) -> str:
             )
         return value
     return now.strftime("%Y%m%d_%H%M%SZ")
+
+
+def _coordinator_invocation_under_validated_lease() -> Any:
+    validation_fd = require_official_live_entry_lease(environment=os.environ)
+    invocation = coordinator_invocation_from_environment(os.environ)
+    if invocation is not None and (
+        type(validation_fd) is not int or validation_fd < 3
+    ):
+        raise NightlyCoordinatorContractError(
+            "coordinator_schedule_date_requires_lock_v3",
+            outcome="hard_failure",
+        )
+    return invocation
 
 
 def _emit_adapter_status(
@@ -179,6 +193,7 @@ def execute_four_region_plan(
     downstream_only: bool,
     absolute_deadline_utc: datetime | None,
     input_integrity_gate: Any,
+    generation_date: str | None = None,
     on_downstream_start: Callable[[], None] = lambda: None,
     matrix_continuation: bool = False,
     resume_cutoff_transition: ApprovedResumeCutoffTransition | None = None,
@@ -239,6 +254,7 @@ def execute_four_region_plan(
         config=config,
         plan_path=plan_path,
         run_id=str(manifest["run_id"]),
+        generation_date=generation_date,
         execution_mode=PRE_CUTOVER_DOWNSTREAM_MODE,
         absolute_deadline_utc=absolute_deadline_utc,
         input_integrity_gate=input_integrity_gate,
@@ -324,7 +340,7 @@ def main() -> int:
     collection_plan_id = FOUR_REGION_PLAN_ID
     plan_path: Path | None = None
     try:
-        require_official_live_entry_lease(environment=os.environ)
+        coordinator_invocation = _coordinator_invocation_under_validated_lease()
         verify_inputs = integrity_gate(PROJECT_ROOT)
         absolute_deadline_utc = _adapter_deadline()
         if not args.downstream_only_run_id and not args.resume_run_id:
@@ -366,6 +382,11 @@ def main() -> int:
                     downstream_only=False,
                     absolute_deadline_utc=matrix_deadline_utc,
                     input_integrity_gate=verify_inputs,
+                    generation_date=(
+                        coordinator_invocation.schedule_date
+                        if coordinator_invocation is not None
+                        else None
+                    ),
                     matrix_continuation=not resume,
                     resume_cutoff_transition=resume_cutoff_transition,
                 )
@@ -374,6 +395,11 @@ def main() -> int:
                 config=config,
                 matrix_path=matrix_path,
                 matrix_run_id=run_id,
+                generation_date=(
+                    coordinator_invocation.schedule_date
+                    if coordinator_invocation is not None
+                    else None
+                ),
                 resume=bool(args.resume_run_id),
                 execute_entry=execute_entry,
                 absolute_deadline_utc=absolute_deadline_utc,
@@ -401,6 +427,11 @@ def main() -> int:
                 downstream_only=bool(args.downstream_only_run_id),
                 absolute_deadline_utc=absolute_deadline_utc,
                 input_integrity_gate=verify_inputs,
+                generation_date=(
+                    coordinator_invocation.schedule_date
+                    if coordinator_invocation is not None
+                    else None
+                ),
                 on_downstream_start=lambda: stage_marker.__setitem__(
                     "downstream_started",
                     True,

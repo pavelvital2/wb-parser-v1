@@ -69,6 +69,10 @@ run IDs. It executes enabled entries serially through the existing four-region
 pipeline, persists a durable checkpoint after each entry, validates regional
 warehouse generation keys, and skips completed entries on resume. It publishes
 the matrix-level latest pointer only after all enabled entries are complete.
+The authenticated coordinator `schedule_date` is also the daily generation
+date used by matrix deduplication and regional Warehouse ingestion. It is
+validated under the inherited lock-v3 lease before use, so a 01:00 MSK run is
+not misclassified by the previous UTC calendar date in its `run_ref`.
 Adding another approved query pack is a versioned matrix/plan/query-pack config
 change; it does not require a coordinator command change.
 

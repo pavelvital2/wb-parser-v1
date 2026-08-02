@@ -6,7 +6,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -114,6 +114,26 @@ def _run_date(run_id: str) -> str:
     return (
         f"{run_id[0:4]}-{run_id[4:6]}-{run_id[6:8]}"
     )
+
+
+def _generation_date(run_id: str, value: str | None) -> str:
+    if value is None:
+        return _run_date(run_id)
+    if not isinstance(value, str):
+        raise ExecutionMatrixRunError(
+            "execution matrix generation date is invalid"
+        )
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ExecutionMatrixRunError(
+            "execution matrix generation date is invalid"
+        ) from exc
+    if parsed.isoformat() != value:
+        raise ExecutionMatrixRunError(
+            "execution matrix generation date is invalid"
+        )
+    return value
 
 
 def _entry_run_id(matrix_run_id: str, index: int) -> str:
@@ -334,9 +354,9 @@ def _new_state(
     matrix: ExecutionMatrix,
     *,
     matrix_run_id: str,
+    run_date: str,
     started_at_utc: str,
 ) -> dict[str, Any]:
-    run_date = _run_date(matrix_run_id)
     return {
         "schema_version": MATRIX_RUN_SCHEMA_VERSION,
         "execution_matrix_id": matrix.execution_matrix_id,
@@ -367,6 +387,7 @@ def _validate_state(
     *,
     matrix: ExecutionMatrix,
     matrix_run_id: str,
+    run_date: str,
 ) -> dict[str, Any]:
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version",
@@ -392,7 +413,7 @@ def _validate_state(
         or payload.get("execution_matrix_sha256") != matrix.source_sha256
         or payload.get("marketplace") != MARKETPLACE
         or payload.get("run_id") != matrix_run_id
-        or payload.get("run_date") != _run_date(matrix_run_id)
+        or payload.get("run_date") != run_date
         or payload.get("status")
         not in {"running", "checkpoint", "failed", "success"}
         or type(payload.get("complete")) is not bool
@@ -412,6 +433,7 @@ def _validate_state(
     expected_entries = _new_state(
         matrix,
         matrix_run_id=matrix_run_id,
+        run_date=run_date,
         started_at_utc=str(payload.get("started_at_utc", "")),
     )["entries"]
     for actual, expected in zip(entries, expected_entries, strict=True):
@@ -469,6 +491,7 @@ def _load_state(
     *,
     matrix: ExecutionMatrix,
     matrix_run_id: str,
+    run_date: str,
 ) -> dict[str, Any] | None:
     encoded = _read_regular(state_path)
     if encoded is None:
@@ -487,6 +510,7 @@ def _load_state(
         payload,
         matrix=matrix,
         matrix_run_id=matrix_run_id,
+        run_date=run_date,
     )
 
 
@@ -765,6 +789,7 @@ def run_execution_matrix(
     config: AppConfig,
     matrix_path: Path,
     matrix_run_id: str,
+    generation_date: str | None = None,
     resume: bool,
     execute_entry: EntryExecutor,
     absolute_deadline_utc: datetime | None = None,
@@ -826,7 +851,7 @@ def run_execution_matrix(
         now=now,
         absolute_deadline_utc=absolute_deadline_utc,
     ).deadline_utc
-    run_date = _run_date(matrix_run_id)
+    run_date = _generation_date(matrix_run_id, generation_date)
     all_scopes: set[ScopeKey] = set()
     for entry in matrix.enabled_entries:
         scopes = _scope_keys(entry, run_date)
@@ -842,7 +867,6 @@ def run_execution_matrix(
         / matrix.execution_matrix_id
     )
     run_root = state_root / "runs" / matrix_run_id
-    _ensure_state_directory(config.project_root, run_root)
     state_path = run_root / "state.json"
     latest_path = state_root / "latest.json"
     prior_latest = _read_regular(latest_path)
@@ -863,10 +887,15 @@ def run_execution_matrix(
             != matrix.source_sha256
             or not isinstance(prior_pointer.get("run_id"), str)
             or not _RUN_ID_RE.fullmatch(prior_pointer["run_id"])
+            or not isinstance(prior_pointer.get("run_date"), str)
         ):
             raise ExecutionMatrixRunError(
                 "execution matrix latest contract mismatch"
             )
+        _generation_date(
+            prior_pointer["run_id"],
+            prior_pointer["run_date"],
+        )
         if (
             not resume
             and prior_pointer.get("run_id") != matrix_run_id
@@ -881,10 +910,12 @@ def run_execution_matrix(
         _reload_exact_matrix(matrix, project_root=config.project_root)
 
     attest()
+    _ensure_state_directory(config.project_root, run_root)
     state = _load_state(
         state_path,
         matrix=matrix,
         matrix_run_id=matrix_run_id,
+        run_date=run_date,
     )
     if resume:
         if state is None or state["status"] not in {
@@ -905,6 +936,7 @@ def run_execution_matrix(
         state = _new_state(
             matrix,
             matrix_run_id=matrix_run_id,
+            run_date=run_date,
             started_at_utc=started,
         )
         _write_json(
@@ -1219,6 +1251,7 @@ def run_execution_matrix(
             or prior.get("schema_version") != MATRIX_LATEST_SCHEMA_VERSION
             or prior.get("execution_matrix_id")
             != matrix.execution_matrix_id
+            or not isinstance(prior.get("run_date"), str)
         ):
             raise ExecutionMatrixRunError(
                 "execution matrix latest contract mismatch"
@@ -1235,6 +1268,7 @@ def run_execution_matrix(
             raise ExecutionMatrixRunError(
                 "execution matrix latest is newer than candidate"
             )
+        _generation_date(prior_run_id, prior["run_date"])
         if prior_run_id == matrix_run_id:
             expected = _canonical_json(pointer)
             if current_latest != expected:

@@ -495,7 +495,12 @@ def test_launcher_refuses_exact_resume_without_transition_before_config_load(
     monkeypatch.setattr(
         four_region_launcher,
         "require_official_live_entry_lease",
-        lambda **_kwargs: None,
+        lambda **_kwargs: 9,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "coordinator_invocation_from_environment",
+        lambda _environment: SimpleNamespace(schedule_date="2026-08-01"),
     )
     monkeypatch.setattr(
         four_region_launcher,
@@ -546,7 +551,12 @@ def test_launcher_passes_exact_transition_to_matrix_runner(
     monkeypatch.setattr(
         four_region_launcher,
         "require_official_live_entry_lease",
-        lambda **_kwargs: None,
+        lambda **_kwargs: 9,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "coordinator_invocation_from_environment",
+        lambda _environment: SimpleNamespace(schedule_date="2026-08-01"),
     )
     monkeypatch.setattr(
         four_region_launcher,
@@ -597,3 +607,4 @@ def test_launcher_passes_exact_transition_to_matrix_runner(
     assert isinstance(transition, ApprovedResumeCutoffTransition)
     assert captured["absolute_deadline_utc"] == TO_DEADLINE_UTC
     assert captured["resume"] is True
+    assert captured["generation_date"] == "2026-08-01"

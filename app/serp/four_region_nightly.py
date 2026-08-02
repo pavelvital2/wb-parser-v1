@@ -2155,6 +2155,7 @@ def _run_locked_four_region_downstream(
     state_path: Path,
     latest_path: Path,
     run_id: str,
+    generation_date: str | None,
     deadline: DeadlineGuard,
     execution_contract: DownstreamExecutionContract,
     sellers_factory: Callable[..., SellersEngine],
@@ -2324,6 +2325,7 @@ def _run_locked_four_region_downstream(
         warehouse_result = warehouse_ingest(
             project_root=config.project_root,
             run_id=run_id,
+            run_date=generation_date,
             collection_plan_id=plan_spec.collection_plan_id,
             bridge_path=inputs.bridge_path,
             sellers_path=Path(
@@ -2490,6 +2492,7 @@ def run_four_region_downstream(
     config: AppConfig,
     plan_path: Path,
     run_id: str,
+    generation_date: str | None = None,
     sellers_factory: Callable[..., SellersEngine] = SellersEngine,
     warehouse_ingest: Callable[..., dict[str, Any]] = ingest_regional_run,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -2573,6 +2576,7 @@ def run_four_region_downstream(
                 state_path=state_path,
                 latest_path=latest_path,
                 run_id=run_id,
+                generation_date=generation_date,
                 deadline=deadline,
                 execution_contract=execution_contract,
                 sellers_factory=sellers_factory,

@@ -318,11 +318,13 @@ def _run_matrix(
     harness: _MatrixHarness,
     resume: bool,
     run_id: str = "20260728_211500Z",
+    generation_date: str | None = None,
 ) -> dict[str, Any]:
     return run_execution_matrix(
         config=SimpleNamespace(project_root=root),
         matrix_path=matrix_path,
         matrix_run_id=run_id,
+        generation_date=generation_date,
         resume=resume,
         execute_entry=harness.execute,
         input_integrity_gate=lambda: None,
@@ -765,6 +767,101 @@ def test_matrix_blocks_second_successful_run_for_same_date(
             run_id="20260728_220000Z",
         )
     assert second.calls == []
+
+
+def test_matrix_uses_authenticated_local_generation_date_across_utc_midnight(
+    tmp_path: Path,
+) -> None:
+    root, matrix_path = _enabled_matrix_root(tmp_path)
+    first = _MatrixHarness()
+    _run_matrix(
+        root=root,
+        matrix_path=matrix_path,
+        harness=first,
+        resume=False,
+        run_id="20260802_031937Z",
+        generation_date="2026-08-02",
+    )
+
+    crossing = _MatrixHarness()
+    state = _run_matrix(
+        root=root,
+        matrix_path=matrix_path,
+        harness=crossing,
+        resume=False,
+        run_id="20260802_220018Z",
+        generation_date="2026-08-03",
+    )
+
+    assert state["run_date"] == "2026-08-03"
+    assert len(crossing.calls) == 1
+    latest = json.loads(
+        (
+            root
+            / "state/wb_execution_matrices/four-region-nightly-v1/latest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert latest["run_id"] == "20260802_220018Z"
+    assert latest["run_date"] == "2026-08-03"
+
+
+def test_matrix_blocks_duplicate_authenticated_local_generation_date(
+    tmp_path: Path,
+) -> None:
+    root, matrix_path = _enabled_matrix_root(tmp_path)
+    first = _MatrixHarness()
+    _run_matrix(
+        root=root,
+        matrix_path=matrix_path,
+        harness=first,
+        resume=False,
+        run_id="20260802_220018Z",
+        generation_date="2026-08-03",
+    )
+
+    duplicate = _MatrixHarness()
+    with pytest.raises(ExecutionMatrixRunError, match="date"):
+        _run_matrix(
+            root=root,
+            matrix_path=matrix_path,
+            harness=duplicate,
+            resume=False,
+            run_id="20260803_010000Z",
+            generation_date="2026-08-03",
+        )
+    assert duplicate.calls == []
+    assert not (
+        root
+        / "state/wb_execution_matrices/four-region-nightly-v1/runs/"
+        "20260803_010000Z"
+    ).exists()
+
+
+def test_matrix_resume_rejects_generation_date_mismatch_before_entry(
+    tmp_path: Path,
+) -> None:
+    root, matrix_path = _enabled_matrix_root(tmp_path)
+    harness = _MatrixHarness()
+    _run_matrix(
+        root=root,
+        matrix_path=matrix_path,
+        harness=harness,
+        resume=False,
+        run_id="20260802_220018Z",
+        generation_date="2026-08-03",
+    )
+    calls_before = list(harness.calls)
+
+    with pytest.raises(ExecutionMatrixRunError, match="identity"):
+        _run_matrix(
+            root=root,
+            matrix_path=matrix_path,
+            harness=harness,
+            resume=True,
+            run_id="20260802_220018Z",
+            generation_date="2026-08-02",
+        )
+    assert harness.calls == calls_before
 
 
 def test_matrix_plan_or_pack_mutation_fails_before_next_entry(

@@ -424,6 +424,68 @@ def test_same_pack_query_region_date_generation_is_rejected(
         database.close()
 
 
+def test_regional_warehouse_uses_explicit_coordinator_generation_date(
+    tmp_path: Path,
+) -> None:
+    bridge_path, sellers_path = _sources(tmp_path)
+    result = ingest_regional_run(
+        project_root=tmp_path,
+        run_id="20260726_001600Z",
+        run_date="2026-07-27",
+        collection_plan_id="shevron-four-regions-top1000-v2",
+        bridge_path=bridge_path,
+        sellers_path=sellers_path,
+    )
+    database = duckdb.connect(result["database_path"], read_only=True)
+    try:
+        dates = {
+            row[0]
+            for table in (
+                "regional_query_positions",
+                "regional_seller_snapshots",
+                "regional_run_quality",
+                "regional_query_quality",
+                "regional_query_generations",
+            )
+            for row in database.execute(
+                f"SELECT DISTINCT run_date FROM {table} "
+                "WHERE run_id = '20260726_001600Z'"
+            ).fetchall()
+        }
+    finally:
+        database.close()
+    assert dates == {"2026-07-27"}
+
+    with pytest.raises(CriticalPipelineError, match="run date mismatch"):
+        ingest_regional_run(
+            project_root=tmp_path,
+            run_id="20260726_001600Z",
+            run_date="2026-07-26",
+            collection_plan_id="shevron-four-regions-top1000-v2",
+            bridge_path=bridge_path,
+            sellers_path=sellers_path,
+        )
+
+    database = duckdb.connect(result["database_path"])
+    try:
+        database.execute(
+            "UPDATE regional_query_generations "
+            "SET run_date = '2026-07-28' "
+            "WHERE run_id = '20260726_001600Z'"
+        )
+    finally:
+        database.close()
+    with pytest.raises(CriticalPipelineError, match="run date mismatch"):
+        ingest_regional_run(
+            project_root=tmp_path,
+            run_id="20260726_001600Z",
+            run_date="2026-07-27",
+            collection_plan_id="shevron-four-regions-top1000-v2",
+            bridge_path=bridge_path,
+            sellers_path=sellers_path,
+        )
+
+
 def test_regional_warehouse_rechecks_integrity_inside_transaction(
     tmp_path: Path,
 ) -> None:

@@ -119,6 +119,163 @@ def test_safe_root_cause_does_not_render_unknown_exception_message() -> None:
         assert secret not in diagnostic
 
 
+def test_coordinator_schedule_date_is_passed_to_matrix_and_downstream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    invocation = SimpleNamespace(schedule_date="2026-08-03")
+    monkeypatch.setattr(
+        four_region_launcher,
+        "coordinator_invocation_from_environment",
+        lambda _environment: invocation,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "require_official_live_entry_lease",
+        lambda **_kwargs: 9,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "integrity_gate",
+        lambda _root: lambda: None,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "load_config",
+        lambda _path: SimpleNamespace(project_root=tmp_path),
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "resolve_resume_cutoff_transition",
+        lambda **_kwargs: None,
+    )
+
+    def fake_matrix(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"status": "success", "complete": True}
+
+    monkeypatch.setattr(
+        four_region_launcher,
+        "run_execution_matrix",
+        fake_matrix,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "_adapter_run_ref",
+        lambda _now: "20260802_220018Z",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_wb_four_region_nightly.py",
+            "--config",
+            "config/config.yaml",
+            "--matrix-file",
+            "config/wb/execution_matrices/four-region-nightly-v1.json",
+            "--no-publish",
+        ],
+    )
+
+    assert four_region_launcher.main() == 0
+    assert captured["matrix_run_id"] == "20260802_220018Z"
+    assert captured["generation_date"] == "2026-08-03"
+
+    child_calls: dict[str, Any] = {}
+    monkeypatch.setattr(
+        four_region_launcher,
+        "execute_four_region_plan",
+        lambda **kwargs: child_calls.update(kwargs),
+    )
+    captured["execute_entry"](
+        SimpleNamespace(
+            plan_file=(
+                "config/wb/collection_plans/"
+                "shevron-four-regions-top1000-v2.json"
+            )
+        ),
+        "20260802_220018Z",
+        False,
+        datetime(2026, 8, 3, 6, 0, tzinfo=timezone.utc),
+    )
+    assert child_calls["generation_date"] == "2026-08-03"
+
+
+def test_coordinator_schedule_date_requires_validated_lock_v3(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        four_region_launcher,
+        "coordinator_invocation_from_environment",
+        lambda _environment: SimpleNamespace(schedule_date="2026-08-03"),
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "require_official_live_entry_lease",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "integrity_gate",
+        lambda _root: pytest.fail(
+            "attestation must not run before coordinator authority is bound"
+        ),
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "load_config",
+        lambda _path: pytest.fail(
+            "config must not load before coordinator authority is bound"
+        ),
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "run_execution_matrix",
+        lambda **_kwargs: pytest.fail(
+            "matrix must not run before coordinator authority is bound"
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_wb_four_region_nightly.py",
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--matrix-file",
+            str(tmp_path / "matrix.json"),
+            "--no-publish",
+        ],
+    )
+
+    assert four_region_launcher.main() == 2
+
+
+@pytest.mark.parametrize("invalid_fd", (None, True, 0, 2))
+def test_coordinator_schedule_date_rejects_unvalidated_lease_result(
+    invalid_fd: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        four_region_launcher,
+        "require_official_live_entry_lease",
+        lambda **_kwargs: invalid_fd,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "coordinator_invocation_from_environment",
+        lambda _environment: SimpleNamespace(schedule_date="2026-08-03"),
+    )
+
+    with pytest.raises(
+        four_region_launcher.NightlyCoordinatorContractError,
+        match="coordinator_schedule_date_requires_lock_v3",
+    ):
+        four_region_launcher._coordinator_invocation_under_validated_lease()
+
+
 def _downstream_state_paths(
     root: Path,
     *,

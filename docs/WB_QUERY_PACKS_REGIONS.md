@@ -53,6 +53,14 @@ entries and resumes only the current child run. The deduplication identity is
 `run_date + marketplace + query_pack_id/version + region_id + query_id` and is
 checked against the regional warehouse before collection.
 
+For an authenticated coordinator invocation, `run_date` is the validated
+`MARKETPLACE_COORDINATOR_SCHEDULE_DATE`, not the UTC date prefix of the WB
+`run_ref`. This keeps a `01:00 Europe/Moscow` generation on its local schedule
+date when the UTC run reference is still on the previous day. The same date is
+bound to matrix state, generation deduplication and regional Warehouse rows.
+Resume must present the same authenticated date. Standalone/manual runs have no
+coordinator schedule identity and retain the legacy UTC-derived run date.
+
 The matrix validates the reviewed new-run window once and gives every serial
 child the same bounded absolute deadline. A later pack may therefore begin
 after the one-plan start grace only as an explicit matrix continuation; it
