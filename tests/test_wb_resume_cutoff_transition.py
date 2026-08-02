@@ -459,7 +459,7 @@ def test_completed_collection_skips_serp_and_passes_same_deadline_to_downstream(
     assert validation_calls[0]["resume_cutoff_transition"] is transition
 
 
-def test_exact_input_attestation_transition_accepts_only_built_target_manifest() -> None:
+def test_expired_input_attestation_transition_is_rejected() -> None:
     manifest_path = (
         PROJECT_ROOT / "config/wb/nightly_coordinator_adapter_inputs.json"
     )
@@ -475,37 +475,13 @@ def test_exact_input_attestation_transition_accepts_only_built_target_manifest()
         }
     )
 
-    transition = runner_module._resume_attestation_transition(
-        stored=dict(STORED_TRANSPORT_FINGERPRINT),
-        current=current,
-        project_root=PROJECT_ROOT,
-        run_id=COLLECTION_RUN_ID,
-        collection_plan_id=COLLECTION_PLAN_ID,
-        effective_plan_sha256=EFFECTIVE_PLAN_SHA256,
-    )
-
-    assert transition is not None
-    assert transition["transition_id"] == TRANSITION_ID
-    assert transition["to_input_manifest_sha256"] == current[
-        "input_manifest_sha256"
-    ]
-
-    changed = dict(current)
-    changed["input_manifest_sha256"] = "e" * 64
-    changed["fingerprint_sha256"] = runner_module._canonical_sha256(
-        {
-            key: value
-            for key, value in changed.items()
-            if key != "fingerprint_sha256"
-        }
-    )
     with pytest.raises(
         runner_module.CollectionPlanRunError,
-        match="target input manifest digest",
+        match="transition is not approved",
     ):
         runner_module._resume_attestation_transition(
             stored=dict(STORED_TRANSPORT_FINGERPRINT),
-            current=changed,
+            current=current,
             project_root=PROJECT_ROOT,
             run_id=COLLECTION_RUN_ID,
             collection_plan_id=COLLECTION_PLAN_ID,

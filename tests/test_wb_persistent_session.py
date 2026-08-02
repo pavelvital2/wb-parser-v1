@@ -105,6 +105,11 @@ def test_persistent_browser_entrypoint_fails_before_playwright_without_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = _load_session()
+    monkeypatch.setattr(
+        session,
+        "require_official_live_entry_lease",
+        lambda **_kwargs: 1,
+    )
     monkeypatch.setattr(session.keeper, "load_config", lambda _path: {})
     monkeypatch.setattr(
         session.keeper,

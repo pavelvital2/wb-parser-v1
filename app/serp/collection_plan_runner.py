@@ -84,23 +84,7 @@ _RESUME_ATTESTATION_RUNNER_RELATIVE = Path(
 
 _APPROVED_RESUME_ATTESTATION_TRANSITIONS: dict[
     tuple[str, str, str, str, str], dict[str, str]
-] = {
-    (
-        "20260801_183812Z",
-        "shevron-four-regions-top1000-v2",
-        "0b37ed2c84f50a79f69f89c769ee3823055bbea9394f56d1baa1b7e77d03443e",
-        "7bcd2d7b3c4d4ff4b5a925b2b2d9015bc5083659607a93bb6ff63012294b5021",
-        "ae7780b166a4be2945792286042c918029b88a71f186e135909c95eb87c2a925",
-    ): {
-        "transition_id": CUTOFF_TRANSITION_ID,
-        "target_manifest_projection_sha256": (
-            "4d136a99a69cec259ae400f3bf07d2ae8436707e9e67d975660bdca7cf7462aa"
-        ),
-        "target_runner_projection_sha256": (
-            "9d850f5d824ec68604b44202600dee6d9a0b269db8a9976b145669d74abdf277"
-        ),
-    }
-}
+] = {}
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _RUN_ID_RE = re.compile(r"^[0-9]{8}_[0-9]{6}Z$")

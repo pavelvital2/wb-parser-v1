@@ -135,6 +135,11 @@ def test_config_save_prefixes(tmp_path: Path, monkeypatch) -> None:
     cfg = _make_config(tmp_path)
     monkeypatch.setenv("WEBUI_ADMIN_PASSWORD", "secret")
     monkeypatch.setenv("WEBUI_SECRET_KEY", "secret-key")
+    monkeypatch.setattr(
+        webui_services,
+        "require_official_live_entry_lease",
+        lambda: 1,
+    )
 
     app = create_app(config_path=str(cfg))
     client = TestClient(app)

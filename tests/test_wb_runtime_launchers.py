@@ -33,11 +33,25 @@ def _copy_launcher(tmp_path: Path, launcher_name: str) -> Path:
         target = project / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
-    shutil.copy2(
-        PROJECT_ROOT / f"scripts/{launcher_name}",
-        scripts / launcher_name,
+        if relative == "scripts/wb_runtime_env.py":
+            target.write_text(
+                target.read_text(encoding="utf-8").replace(
+                    "require_official_live_entry_lease(environment=os.environ)",
+                    "None  # isolated fixture: lock-v3 is covered separately",
+                ),
+                encoding="utf-8",
+            )
+    launcher = scripts / launcher_name
+    launcher.write_text(
+        (PROJECT_ROOT / f"scripts/{launcher_name}")
+        .read_text(encoding="utf-8")
+        .replace(
+            "/run/lock/parser-nightly-coordinator",
+            str(tmp_path / "isolated-coordinator-lock-not-present"),
+        ),
+        encoding="utf-8",
     )
-    (scripts / launcher_name).chmod(0o755)
+    launcher.chmod(0o755)
     return project
 
 
@@ -322,8 +336,13 @@ def test_real_script_path_bootstraps_project_imports_from_external_cwd(
     result = subprocess.run(
         [
             str(PYTHON_BIN),
-            str(PROJECT_ROOT / "scripts" / script_name),
-            "--help",
+            "-B",
+            "-c",
+            (
+                "import runpy; "
+                f"runpy.run_path({str(PROJECT_ROOT / 'scripts' / script_name)!r}, "
+                "run_name='import_only')"
+            ),
         ],
         cwd=tmp_path,
         text=True,
@@ -331,7 +350,7 @@ def test_real_script_path_bootstraps_project_imports_from_external_cwd(
         check=False,
     )
 
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stderr
     assert "ModuleNotFoundError" not in result.stderr
     assert "No module named 'app'" not in result.stderr
 
@@ -363,6 +382,30 @@ def test_real_keeper_launcher_imports_then_fails_closed_before_network(
         target = project / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
+        if relative == "scripts/wb_runtime_env.py":
+            target.write_text(
+                target.read_text(encoding="utf-8").replace(
+                    "require_official_live_entry_lease(environment=os.environ)",
+                    "None  # isolated fixture: lock-v3 is covered separately",
+                ),
+                encoding="utf-8",
+            )
+        elif relative == "scripts/wb_cookie_keeper.py":
+            target.write_text(
+                target.read_text(encoding="utf-8").replace(
+                    "/run/lock/parser-nightly-coordinator",
+                    str(tmp_path / "isolated-coordinator-lock-not-present"),
+                ),
+                encoding="utf-8",
+            )
+    launcher = scripts / "run_wb_access_tool.sh"
+    launcher.write_text(
+        launcher.read_text(encoding="utf-8").replace(
+            "/run/lock/parser-nightly-coordinator",
+            str(tmp_path / "isolated-coordinator-lock-not-present"),
+        ),
+        encoding="utf-8",
+    )
     (scripts / "run_wb_access_tool.sh").chmod(0o755)
     (config / "runtime.env").write_text(
         "PARSER_WB_COOKIE_REQUIRED=0\n",

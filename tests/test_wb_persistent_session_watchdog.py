@@ -22,8 +22,17 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _allow_official_lease(watchdog, monkeypatch) -> None:
+    monkeypatch.setattr(
+        watchdog,
+        "require_official_live_entry_lease",
+        lambda **_kwargs: 1,
+    )
+
+
 def test_watchdog_counts_only_new_bad_heartbeats(tmp_path: Path, monkeypatch) -> None:
     watchdog = _load_watchdog()
+    _allow_official_lease(watchdog, monkeypatch)
     runner = tmp_path / "run.sh"
     runner.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     latest = tmp_path / "latest.json"
@@ -73,6 +82,7 @@ def test_watchdog_counts_only_new_bad_heartbeats(tmp_path: Path, monkeypatch) ->
 
 def test_watchdog_can_be_disabled_by_env(tmp_path: Path, monkeypatch) -> None:
     watchdog = _load_watchdog()
+    _allow_official_lease(watchdog, monkeypatch)
     runner = tmp_path / "run.sh"
     runner.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     latest = tmp_path / "latest.json"
@@ -112,6 +122,7 @@ def test_watchdog_can_be_disabled_by_env(tmp_path: Path, monkeypatch) -> None:
 
 def test_watchdog_profile_reset_after_first_498(tmp_path: Path, monkeypatch) -> None:
     watchdog = _load_watchdog()
+    _allow_official_lease(watchdog, monkeypatch)
     runner = tmp_path / "run.sh"
     runner.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     config = tmp_path / "config.yaml"
@@ -217,6 +228,7 @@ def test_watchdog_profile_reset_after_first_498(tmp_path: Path, monkeypatch) -> 
 
 def test_watchdog_does_not_restart_same_profile_when_clean_probe_fails(tmp_path: Path, monkeypatch) -> None:
     watchdog = _load_watchdog()
+    _allow_official_lease(watchdog, monkeypatch)
     runner = tmp_path / "run.sh"
     runner.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     config = tmp_path / "config.yaml"

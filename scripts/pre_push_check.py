@@ -15,7 +15,22 @@ import sys
 from pathlib import Path
 
 
-PROJECT_DIR = Path(os.environ.get("PARSER_WB_PROJECT_DIR", "/home/pavel/projects/parser_wb"))
+PROJECT_DIR = Path(
+    os.environ.get("PARSER_WB_PROJECT_DIR", "/home/pavel/projects/parser_wb")
+)
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from app.common.nightly_attestation import verify_input_manifest
+from app.common.nightly_coordinator import (
+    DESCENDANT_LEASE_ENV_KEYS,
+    acquire_marketplace_collection_lease,
+    descendant_lease_environment,
+)
+from app.common.cli import _doctor_checks
+from app.common.config import load_config
+from app.common.state_db import StateDB
+
 PYTHON_BIN = Path(os.environ.get("PARSER_WB_PYTHON_BIN", "/home/Codex/agent-tools/parser_wb-python/bin/python"))
 CONFIG_FILE = PROJECT_DIR / "config/config.yaml"
 
@@ -49,11 +64,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def run_command(command: list[str], *, cwd: Path = PROJECT_DIR, capture: bool = False) -> subprocess.CompletedProcess[str]:
+def run_command(
+    command: list[str],
+    *,
+    cwd: Path = PROJECT_DIR,
+    capture: bool = False,
+    environment: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
     print("+ " + " ".join(command), flush=True)
     return subprocess.run(
         command,
         cwd=str(cwd),
+        env=environment,
+        pass_fds=pass_fds,
         text=True,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
@@ -114,6 +138,53 @@ def run_required(command: list[str]) -> bool:
     return False
 
 
+def run_warehouse_required(command: list[str]) -> bool:
+    """Run a read-only Warehouse check under the production lock-v3 contract."""
+    lease = acquire_marketplace_collection_lease()
+    try:
+        manifest_sha256 = verify_input_manifest(PROJECT_DIR)
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in DESCENDANT_LEASE_ENV_KEYS
+            and not key.startswith("PARSER_WB_LOCK_V3_")
+            and not key.startswith("MARKETPLACE_COORDINATOR_")
+            and not key.startswith("MARKETPLACE_COLLECTION_")
+        }
+        environment.update(descendant_lease_environment(lease))
+        result = run_command(
+            command,
+            environment=environment,
+            pass_fds=lease.pass_fds,
+        )
+        lease.assert_held()
+        if verify_input_manifest(PROJECT_DIR) != manifest_sha256:
+            print("ERROR: input manifest changed during Warehouse validation", file=sys.stderr)
+            return False
+        if result.returncode == 0:
+            return True
+        print(
+            f"ERROR: command failed with exit {result.returncode}: "
+            f"{' '.join(command)}",
+            file=sys.stderr,
+        )
+        return False
+    finally:
+        lease.__exit__()
+
+
+def run_read_only_doctor() -> bool:
+    print(f"+ read-only doctor {CONFIG_FILE}", flush=True)
+    config = load_config(CONFIG_FILE)
+    db = StateDB(config.paths.SQLITE_DB, create_parent=False)
+    errors, warnings = _doctor_checks(config, db)
+    for warning in warnings:
+        print(f"WARN: {warning}")
+    for error in errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+    return not errors
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if not check_paths():
@@ -133,16 +204,29 @@ def main(argv: list[str] | None = None) -> int:
                 "scripts/run_wb_warehouse_refresh.sh",
             ]
         )
-        checks.append([str(PYTHON_BIN), "main.py", "--config", str(CONFIG_FILE), "validate"])
-        if not args.skip_warehouse:
-            checks.append([str(PYTHON_BIN), "scripts/wb_warehouse.py", "build", "--dry-run"])
-            checks.append([str(PYTHON_BIN), "scripts/wb_warehouse.py", "check"])
-        if not args.skip_tests:
-            checks.append([str(PYTHON_BIN), "-m", "pytest", "-q"])
 
     for command in checks:
         if not run_required(command):
             return 21
+
+    if not args.staged_only and not run_read_only_doctor():
+        return 21
+
+    if not args.staged_only and not args.skip_warehouse:
+        warehouse_checks = (
+            [str(PYTHON_BIN), "scripts/wb_warehouse.py", "build", "--dry-run"],
+            [str(PYTHON_BIN), "scripts/wb_warehouse.py", "check"],
+        )
+        for command in warehouse_checks:
+            if not run_warehouse_required(command):
+                return 21
+
+    if (
+        not args.staged_only
+        and not args.skip_tests
+        and not run_required([str(PYTHON_BIN), "-m", "pytest", "-q"])
+    ):
+        return 21
 
     print("pre-push check: OK")
     return 0
