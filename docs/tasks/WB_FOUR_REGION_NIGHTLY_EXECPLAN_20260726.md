@@ -123,22 +123,29 @@ warehouse/final pointer publication recheck the deadline. A completed SERP run
 whose downstream window expires is continued with an explicit
 `--downstream-only-run-id`; SERP is not repeated.
 
-Before final cutover, downstream additionally runs under the explicit
-`pre_cutover_legacy_nightly_protected_v1` execution contract. Before taking
-any shared lock it rejects starts during the protected interval beginning at
-the versioned legacy boundary `00:15` MSK and rejects starts with less than
-1800 seconds before the next legacy boundary. This boundary is independent of
-collection-plan fields and is recorded as
-`legacy_nightly_start_msk=00:15` with
-`legacy_boundary_source=pre_cutover_contract_v1`.
+After the owner-approved coordinator cutover, an authenticated coordinator
+descendant that has already validated its inherited lock-v3 lease uses
+`post_cutover_coordinator_lock_v3_v1`. This retires only the obsolete legacy
+window that began at `00:15` MSK; it does not relax the coordinator absolute
+deadline, the plan cutoff, minimum resume window, finalization reserve,
+quarantine, attestation, shared lock ownership or publication gates. The
+execution evidence records the validated coordinator-descendant authority and
+the retained deadline bounds without claiming the mutable plan time is a
+legacy boundary.
+
+Manual and unvalidated entrants cannot select the post-cutover mode. They keep
+the exact `pre_cutover_legacy_nightly_protected_v1` behavior, including the
+versioned `00:15` boundary and clearance check. Completed states written before
+cutover remain valid only with their exact legacy evidence; new coordinator
+states use the exact post-cutover evidence. Both variants remain immutable.
 
 The v2 four-region plan is separately required to match the complete reviewed
 runtime contract exactly: `bounded_resumable`, `00:15`, 81900-second new-run
 grace ending at the `23:00` cutoff, 21600-second invocation cap, 1800-second
 resume window and 60-second finalization reserve. Valid but unreviewed runtime
-drift fails before shared lock acquisition. The final supervisor/cutover must
-replace the pre-cutover mode in a separate reviewed change; it must not silently
-bypass the guard.
+drift fails before shared lock acquisition. The post-cutover mode is selected
+only by the reviewed launcher authority seam after coordinator invocation and
+lock-v3 validation; it is not a CLI option or a runtime override.
 
 Downstream `runs/<run_id>/state.json` is authoritative and may be written only
 while all collection-plan exclusion locks are held. A successful or complete

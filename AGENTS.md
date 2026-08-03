@@ -592,13 +592,17 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   wrapper must pass `entry-check` on inherited lease descriptors before
   invoking warehouse code. Never bypass this check or authorize it with a
   manually exported marker variable.
-  Before final cutover, four-region downstream uses the explicit
-  `pre_cutover_legacy_nightly_protected_v1` mode. It must reject protected or
-  insufficient-clearance starts before acquiring any shared lock; changing
-  this mode belongs to a separately reviewed supervisor/cutover change.
-  Its versioned legacy boundary is fixed at `00:15` MSK and must never be
-  derived from mutable collection-plan runtime fields. The v2 plan runtime
-  window must exact-match its reviewed contract; any drift fails before locks.
+  After the owner-approved coordinator cutover, an authenticated coordinator
+  descendant with a validated inherited lock-v3 lease uses the explicit
+  `post_cutover_coordinator_lock_v3_v1` downstream mode. That mode retires only
+  the obsolete legacy `00:15-06:15` exclusion window; the coordinator absolute
+  deadline, plan `23:00` cutoff, minimum resume window, finalization reserve,
+  quarantine, attestation and all shared locks remain fail-closed. Manual or
+  unvalidated entry cannot select this mode and retains
+  `pre_cutover_legacy_nightly_protected_v1`. Existing completed states carrying
+  either exact versioned execution contract remain readable and immutable. The
+  v2 plan runtime window must exact-match its reviewed contract; any drift
+  fails before locks.
   Downstream may write authoritative run state only while it owns all
   collection-plan exclusion locks. Completed/published run state is immutable,
   and `latest.json` pins its exact SHA-256. Rejected resumes, preflight

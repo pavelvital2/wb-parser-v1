@@ -145,6 +145,18 @@ commands are canonicalized inside the project and must match the exact
 allowlist. Use the reviewed wrappers; setting a marker environment variable
 without valid held descriptors is insufficient.
 
+The four-region downstream cutover contract is
+`post_cutover_coordinator_lock_v3_v1`. The inner launcher selects it only when
+the complete coordinator invocation is authenticated under the validated
+inherited lock-v3 lease. It removes the retired legacy `00:15-06:15` exclusion
+for that official descendant, while preserving the coordinator absolute
+deadline, the v2 plan `23:00` cutoff, minimum resume window, finalization
+reserve, quarantine, attestation, shared locks and durable publication gates.
+Manual or incomplete/unvalidated coordinator environments remain on the
+legacy-protected mode and cannot request post-cutover behavior through CLI.
+When the collection manifest is already `success/complete`, official resume
+uses it as immutable input and enters downstream without another SERP call.
+
 The contract checker returns at most 32 direct coordinator roots, including
 the attested verifier and
 `config/wb/nightly_coordinator_adapter_inputs.json`. That versioned manifest

@@ -7,6 +7,7 @@ import shutil
 import stat
 import sys
 import csv
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,6 +40,7 @@ from app.serp.four_region_nightly import (
     FOUR_REGION_IDS,
     FOUR_REGION_PLAN_ID,
     LEGACY_NIGHTLY_START_MSK,
+    POST_CUTOVER_DOWNSTREAM_MODE,
     PRE_CUTOVER_DOWNSTREAM_MODE,
     REVIEWED_FOUR_REGION_RUNTIME_WINDOW,
     DownstreamExecutionContract,
@@ -200,6 +202,9 @@ def test_coordinator_schedule_date_is_passed_to_matrix_and_downstream(
         datetime(2026, 8, 3, 6, 0, tzinfo=timezone.utc),
     )
     assert child_calls["generation_date"] == "2026-08-03"
+    assert child_calls["downstream_execution_mode"] == (
+        POST_CUTOVER_DOWNSTREAM_MODE
+    )
 
 
 def test_coordinator_schedule_date_requires_validated_lock_v3(
@@ -251,6 +256,83 @@ def test_coordinator_schedule_date_requires_validated_lock_v3(
     )
 
     assert four_region_launcher.main() == 2
+
+
+def test_manual_matrix_entry_keeps_pre_cutover_downstream_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        four_region_launcher,
+        "_coordinator_invocation_under_validated_lease",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "integrity_gate",
+        lambda _root: lambda: None,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "load_config",
+        lambda _path: SimpleNamespace(project_root=tmp_path),
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "resolve_resume_cutoff_transition",
+        lambda **_kwargs: None,
+    )
+
+    def fake_matrix(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"status": "success", "complete": True}
+
+    monkeypatch.setattr(
+        four_region_launcher,
+        "run_execution_matrix",
+        fake_matrix,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "_adapter_run_ref",
+        lambda _now: RUN_ID,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_wb_four_region_nightly.py",
+            "--config",
+            "config/config.yaml",
+            "--matrix-file",
+            "config/wb/execution_matrices/four-region-nightly-v1.json",
+            "--no-publish",
+        ],
+    )
+
+    assert four_region_launcher.main() == 0
+    child_call: dict[str, Any] = {}
+    monkeypatch.setattr(
+        four_region_launcher,
+        "execute_four_region_plan",
+        lambda **kwargs: child_call.update(kwargs),
+    )
+    captured["execute_entry"](
+        SimpleNamespace(
+            plan_file=(
+                "config/wb/collection_plans/"
+                "shevron-four-regions-top1000-v2.json"
+            )
+        ),
+        RUN_ID,
+        False,
+        datetime(2026, 8, 3, 6, 0, tzinfo=timezone.utc),
+    )
+    assert child_call["generation_date"] is None
+    assert child_call["downstream_execution_mode"] == (
+        PRE_CUTOVER_DOWNSTREAM_MODE
+    )
 
 
 @pytest.mark.parametrize("invalid_fd", (None, True, 0, 2))
@@ -1572,6 +1654,7 @@ def test_completed_collection_resume_skips_serp_collection(
     def completed_downstream(**kwargs):
         called["downstream"] += 1
         assert kwargs["run_id"] == RUN_ID
+        assert kwargs["execution_mode"] == POST_CUTOVER_DOWNSTREAM_MODE
         return {"run_id": RUN_ID, "status": "success", "complete": True}
 
     monkeypatch.setattr(
@@ -1593,6 +1676,7 @@ def test_completed_collection_resume_skips_serp_collection(
         downstream_only=False,
         absolute_deadline_utc=None,
         input_integrity_gate=lambda: None,
+        downstream_execution_mode=POST_CUTOVER_DOWNSTREAM_MODE,
     )
 
     assert manifest == {
@@ -1695,6 +1779,7 @@ def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
                 "sellers": 0,
             },
         },
+        execution_mode=POST_CUTOVER_DOWNSTREAM_MODE,
         now=lambda: datetime(
             2026,
             7,
@@ -1705,6 +1790,9 @@ def test_downstream_state_reports_all_regions_and_updates_scoped_latest(
         ),
     )
     assert state["complete"] is True
+    assert state["execution_contract"] == (
+        DownstreamExecutionContract.post_cutover().evidence()
+    )
     assert [item["region_id"] for item in state["regions"]] == list(
         FOUR_REGION_IDS
     )
@@ -1878,6 +1966,8 @@ def test_downstream_failure_leaves_previous_scoped_latest_unchanged(
     [
         datetime(2026, 7, 25, 21, 0, tzinfo=timezone.utc),
         datetime(2026, 7, 25, 21, 16, tzinfo=timezone.utc),
+        datetime(2026, 8, 3, 1, 49, tzinfo=timezone.utc),
+        datetime(2026, 8, 3, 1, 52, tzinfo=timezone.utc),
     ],
 )
 def test_pre_cutover_downstream_guard_rejects_before_lock(
@@ -1982,6 +2072,91 @@ def test_pre_cutover_contract_allows_after_protected_window() -> None:
         datetime(2026, 7, 26, 4, 0, tzinfo=timezone.utc)
     )
     assert contract.evidence()["legacy_nightly_start_msk"] == "00:15"
+
+
+@pytest.mark.parametrize("minute", (49, 52))
+def test_post_cutover_contract_accepts_official_early_downstream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    minute: int,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    current = datetime(2026, 8, 3, 1, minute, tzinfo=timezone.utc)
+    lock_calls = 0
+
+    @contextmanager
+    def acquired_locks(**_kwargs):
+        nonlocal lock_calls
+        lock_calls += 1
+        yield
+
+    monkeypatch.setattr(
+        "app.serp.four_region_nightly.acquire_collection_plan_locks",
+        acquired_locks,
+    )
+    monkeypatch.setattr(
+        "app.serp.four_region_nightly._run_locked_four_region_downstream",
+        lambda **kwargs: {
+            "status": "accepted",
+            "execution_contract": kwargs["execution_contract"].evidence(),
+        },
+    )
+    result = run_four_region_downstream(
+        config=config,
+        plan_path=plan_path,
+        run_id=RUN_ID,
+        execution_mode=POST_CUTOVER_DOWNSTREAM_MODE,
+        absolute_deadline_utc=current + timedelta(hours=3),
+        now=lambda: current,
+    )
+
+    assert lock_calls == 1
+    assert result["execution_contract"] == {
+        "mode": POST_CUTOVER_DOWNSTREAM_MODE,
+        "authority": (
+            "authenticated_coordinator_descendant_with_validated_lock_v3"
+        ),
+        "legacy_nightly_guard": "retired_after_coordinator_cutover",
+        "absolute_cutoff_msk": "23:00",
+        "minimum_resume_window_seconds": 1800,
+        "finalization_reserve_seconds": 60,
+    }
+
+
+@pytest.mark.parametrize("remaining_seconds", (-1, 1799))
+def test_post_cutover_downstream_keeps_absolute_deadline_gate_before_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remaining_seconds: int,
+) -> None:
+    _root, config, plan_path = _project(tmp_path, monkeypatch)
+    current = datetime(2026, 8, 3, 1, 49, tzinfo=timezone.utc)
+    lock_calls = 0
+
+    def forbidden_locks(**_kwargs):
+        nonlocal lock_calls
+        lock_calls += 1
+        raise AssertionError("deadline gate must run before locks")
+
+    monkeypatch.setattr(
+        "app.serp.four_region_nightly.acquire_collection_plan_locks",
+        forbidden_locks,
+    )
+    with pytest.raises(
+        CollectionPlanRunError,
+        match="insufficient time before cutoff",
+    ):
+        run_four_region_downstream(
+            config=config,
+            plan_path=plan_path,
+            run_id=RUN_ID,
+            execution_mode=POST_CUTOVER_DOWNSTREAM_MODE,
+            absolute_deadline_utc=(
+                current + timedelta(seconds=remaining_seconds)
+            ),
+            now=lambda: current,
+        )
+    assert lock_calls == 0
 
 
 def test_launcher_preserves_authoritative_downstream_failure_state(
@@ -2181,6 +2356,7 @@ def test_downstream_same_run_reconcile_is_idempotent_without_mutation(
         warehouse_ingest=lambda **_kwargs: pytest.fail(
             "completed state must not run warehouse"
         ),
+        execution_mode=POST_CUTOVER_DOWNSTREAM_MODE,
         now=lambda: datetime(
             2026,
             7,

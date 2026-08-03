@@ -38,7 +38,9 @@ from app.serp.execution_matrix_runner import (
 )
 from app.serp.four_region_nightly import (
     FOUR_REGION_PLAN_ID,
+    POST_CUTOVER_DOWNSTREAM_MODE,
     PRE_CUTOVER_DOWNSTREAM_MODE,
+    DownstreamExecutionContract,
     run_four_region_downstream,
     write_four_region_failure_attempt,
 )
@@ -194,6 +196,7 @@ def execute_four_region_plan(
     absolute_deadline_utc: datetime | None,
     input_integrity_gate: Any,
     generation_date: str | None = None,
+    downstream_execution_mode: str = PRE_CUTOVER_DOWNSTREAM_MODE,
     on_downstream_start: Callable[[], None] = lambda: None,
     matrix_continuation: bool = False,
     resume_cutoff_transition: ApprovedResumeCutoffTransition | None = None,
@@ -255,7 +258,7 @@ def execute_four_region_plan(
         plan_path=plan_path,
         run_id=str(manifest["run_id"]),
         generation_date=generation_date,
-        execution_mode=PRE_CUTOVER_DOWNSTREAM_MODE,
+        execution_mode=downstream_execution_mode,
         absolute_deadline_utc=absolute_deadline_utc,
         input_integrity_gate=input_integrity_gate,
         resume_cutoff_transition=resume_cutoff_transition,
@@ -337,10 +340,13 @@ def main() -> int:
     )
     config = None
     stage_marker = {"downstream_started": False}
+    downstream_execution_mode = PRE_CUTOVER_DOWNSTREAM_MODE
     collection_plan_id = FOUR_REGION_PLAN_ID
     plan_path: Path | None = None
     try:
         coordinator_invocation = _coordinator_invocation_under_validated_lease()
+        if coordinator_invocation is not None:
+            downstream_execution_mode = POST_CUTOVER_DOWNSTREAM_MODE
         verify_inputs = integrity_gate(PROJECT_ROOT)
         absolute_deadline_utc = _adapter_deadline()
         if not args.downstream_only_run_id and not args.resume_run_id:
@@ -387,6 +393,7 @@ def main() -> int:
                         if coordinator_invocation is not None
                         else None
                     ),
+                    downstream_execution_mode=downstream_execution_mode,
                     matrix_continuation=not resume,
                     resume_cutoff_transition=resume_cutoff_transition,
                 )
@@ -432,6 +439,7 @@ def main() -> int:
                     if coordinator_invocation is not None
                     else None
                 ),
+                downstream_execution_mode=downstream_execution_mode,
                 on_downstream_start=lambda: stage_marker.__setitem__(
                     "downstream_started",
                     True,
@@ -454,6 +462,11 @@ def main() -> int:
                 config=config,
                 run_id=run_id,
                 error=exc,
+                execution_contract=(
+                    DownstreamExecutionContract.for_mode(
+                        downstream_execution_mode
+                    )
+                ),
             )
         resumable = bool(
             isinstance(exc, ExecutionMatrixRunError) and exc.resumable

@@ -53,6 +53,10 @@ DOWNSTREAM_SCHEMA = "wb_four_region_downstream_v1"
 DOWNSTREAM_ATTEMPT_SCHEMA = "wb_four_region_attempt_v1"
 BRIDGE_FIELDS = list(PRODUCT_FIELDS)
 PRE_CUTOVER_DOWNSTREAM_MODE = "pre_cutover_legacy_nightly_protected_v1"
+POST_CUTOVER_DOWNSTREAM_MODE = "post_cutover_coordinator_lock_v3_v1"
+POST_CUTOVER_DOWNSTREAM_AUTHORITY = (
+    "authenticated_coordinator_descendant_with_validated_lock_v3"
+)
 LEGACY_NIGHTLY_START_MSK = "00:15"
 REVIEWED_FOUR_REGION_RUNTIME_WINDOW = CollectionRuntimeWindow(
     mode="bounded_resumable",
@@ -184,9 +188,9 @@ def _default_four_region_plan_spec() -> FourRegionPlanSpec:
 @dataclass(frozen=True, slots=True)
 class DownstreamExecutionContract:
     mode: str
-    legacy_nightly_start_msk: str
-    protected_duration_seconds: int
-    minimum_clearance_seconds: int
+    legacy_nightly_start_msk: str | None
+    protected_duration_seconds: int | None
+    minimum_clearance_seconds: int | None
 
     @classmethod
     def pre_cutover(cls) -> "DownstreamExecutionContract":
@@ -202,14 +206,43 @@ class DownstreamExecutionContract:
             ),
         )
 
+    @classmethod
+    def post_cutover(cls) -> "DownstreamExecutionContract":
+        return cls(
+            mode=POST_CUTOVER_DOWNSTREAM_MODE,
+            legacy_nightly_start_msk=None,
+            protected_duration_seconds=None,
+            minimum_clearance_seconds=None,
+        )
+
+    @classmethod
+    def for_mode(cls, mode: str) -> "DownstreamExecutionContract":
+        if mode == PRE_CUTOVER_DOWNSTREAM_MODE:
+            return cls.pre_cutover()
+        if mode == POST_CUTOVER_DOWNSTREAM_MODE:
+            return cls.post_cutover()
+        raise CriticalPipelineError(
+            "downstream execution mode is not approved"
+        )
+
     def ensure_start_allowed(self, current: datetime) -> None:
+        if current.tzinfo is None:
+            raise CriticalPipelineError(
+                "downstream clock must return timezone-aware datetime"
+            )
+        if self.mode == POST_CUTOVER_DOWNSTREAM_MODE:
+            return
         if self.mode != PRE_CUTOVER_DOWNSTREAM_MODE:
             raise CriticalPipelineError(
                 "unsupported downstream execution contract"
             )
-        if current.tzinfo is None:
+        if (
+            self.legacy_nightly_start_msk is None
+            or self.protected_duration_seconds is None
+            or self.minimum_clearance_seconds is None
+        ):
             raise CriticalPipelineError(
-                "downstream clock must return timezone-aware datetime"
+                "downstream pre-cutover contract is incomplete"
             )
         try:
             hour, minute = (
@@ -247,6 +280,23 @@ class DownstreamExecutionContract:
             )
 
     def evidence(self) -> dict[str, Any]:
+        if self.mode == POST_CUTOVER_DOWNSTREAM_MODE:
+            return {
+                "mode": self.mode,
+                "authority": POST_CUTOVER_DOWNSTREAM_AUTHORITY,
+                "legacy_nightly_guard": "retired_after_coordinator_cutover",
+                "absolute_cutoff_msk": (
+                    REVIEWED_FOUR_REGION_RUNTIME_WINDOW.absolute_cutoff_msk
+                ),
+                "minimum_resume_window_seconds": (
+                    REVIEWED_FOUR_REGION_RUNTIME_WINDOW
+                    .minimum_resume_window_seconds
+                ),
+                "finalization_reserve_seconds": (
+                    REVIEWED_FOUR_REGION_RUNTIME_WINDOW
+                    .finalization_reserve_seconds
+                ),
+            }
         return {
             "mode": self.mode,
             "legacy_nightly_start_msk": self.legacy_nightly_start_msk,
@@ -254,6 +304,17 @@ class DownstreamExecutionContract:
             "protected_duration_seconds": self.protected_duration_seconds,
             "minimum_clearance_seconds": self.minimum_clearance_seconds,
         }
+
+
+def _validate_downstream_execution_contract_evidence(value: Any) -> None:
+    if value in (
+        DownstreamExecutionContract.pre_cutover().evidence(),
+        DownstreamExecutionContract.post_cutover().evidence(),
+    ):
+        return
+    raise CriticalPipelineError(
+        "completed downstream execution contract mismatch"
+    )
 
 
 @dataclass(slots=True)
@@ -1001,12 +1062,13 @@ def _validate_completed_state_bytes(
         or payload.get("complete") is not True
         or payload.get("stage") != "complete"
         or payload.get("failure_reason") is not None
-        or payload.get("execution_contract")
-        != DownstreamExecutionContract.pre_cutover().evidence()
     ):
         raise CriticalPipelineError(
             "completed downstream state semantic mismatch"
         )
+    _validate_downstream_execution_contract_evidence(
+        payload.get("execution_contract")
+    )
     lineage = _validate_collection_lineage(
         payload.get("lineage"),
         project_root=project_root,
@@ -1925,6 +1987,7 @@ def write_four_region_failure_attempt(
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     attempt_id: str | None = None,
     plan_spec: FourRegionPlanSpec | None = None,
+    execution_contract: DownstreamExecutionContract | None = None,
 ) -> dict[str, Any] | None:
     try:
         spec = plan_spec or _default_four_region_plan_spec()
@@ -1984,8 +2047,9 @@ def write_four_region_failure_attempt(
             "lock_ownership": lock_ownership,
             "authoritative_state_changed": False,
             "execution_contract": (
-                DownstreamExecutionContract.pre_cutover().evidence()
-            ),
+                execution_contract
+                or DownstreamExecutionContract.pre_cutover()
+            ).evidence(),
             "regions": [
                 {
                     "region_id": region_id,
@@ -2190,6 +2254,7 @@ def _run_locked_four_region_downstream(
             stage=stage,
             lock_ownership="acquired",
             plan_spec=plan_spec,
+            execution_contract=execution_contract,
         )
         raise
 
@@ -2227,6 +2292,7 @@ def _run_locked_four_region_downstream(
                 stage=stage,
                 lock_ownership="acquired",
                 plan_spec=plan_spec,
+                execution_contract=execution_contract,
             )
             raise
         finally:
@@ -2481,6 +2547,7 @@ def _run_locked_four_region_downstream(
             stage=stage,
             lock_ownership="acquired",
             plan_spec=plan_spec,
+            execution_contract=execution_contract,
         )
         raise
     finally:
@@ -2502,7 +2569,7 @@ def run_four_region_downstream(
     resume_cutoff_transition: ApprovedResumeCutoffTransition | None = None,
 ) -> dict[str, Any]:
     integrity_gate = input_integrity_gate or (lambda: None)
-    execution_contract = DownstreamExecutionContract.pre_cutover()
+    execution_contract = DownstreamExecutionContract.for_mode(execution_mode)
     stage = "preflight"
     locks_owned = False
     plan_spec: FourRegionPlanSpec | None = None
@@ -2530,10 +2597,6 @@ def run_four_region_downstream(
         if runtime_window is None:
             raise CriticalPipelineError(
                 "four-region runtime window is missing"
-            )
-        if execution_mode != execution_contract.mode:
-            raise CriticalPipelineError(
-                "downstream execution mode is not approved"
             )
         if run_id == CUTOFF_TRANSITION_RUN_ID:
             if resume_cutoff_transition is None:
@@ -2592,5 +2655,6 @@ def run_four_region_downstream(
                 stage=stage,
                 lock_ownership="not_acquired",
                 plan_spec=plan_spec,
+                execution_contract=execution_contract,
             )
         raise
