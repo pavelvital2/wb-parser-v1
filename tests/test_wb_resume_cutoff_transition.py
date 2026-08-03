@@ -49,6 +49,9 @@ MATRIX_PATH = PROJECT_ROOT / (
     "config/wb/execution_matrices/four-region-nightly-v1.json"
 )
 REGISTRY_PATH = PROJECT_ROOT / "config/wb/regions.json"
+CURRENT_COORDINATOR_RUN_ID = "nightly-20260803-3daeb3f466a0"
+CURRENT_MATRIX_RUN_ID = "20260802_224122Z"
+UNRELATED_TRANSITION_ID = "ozon-completion-evidence-successor-20260803"
 
 
 def _transition() -> ApprovedResumeCutoffTransition:
@@ -164,6 +167,51 @@ def test_exact_transition_binds_run_coordinator_stage_and_same_day_deadline() ->
     for changed in variants:
         with pytest.raises(ResumeCutoffTransitionError):
             resolve_resume_cutoff_transition(**{**base, **changed})
+
+
+def test_unrelated_transition_is_ignored_only_under_validated_authority() -> None:
+    base = {
+        "run_id": CURRENT_MATRIX_RUN_ID,
+        "resume": True,
+        "coordinator_run_id": CURRENT_COORDINATOR_RUN_ID,
+        "coordinator_stage": "wb_resume",
+        "transition_id": UNRELATED_TRANSITION_ID,
+        "absolute_deadline_utc": datetime(2026, 8, 3, 20, 0, tzinfo=UTC),
+        "validated_coordinator_authority": True,
+    }
+    assert resolve_resume_cutoff_transition(**base) is None
+
+    invalid_variants = (
+        {"validated_coordinator_authority": False},
+        {"resume": False},
+        {"coordinator_run_id": ""},
+        {"coordinator_stage": "wb_unknown"},
+        {"transition_id": TRANSITION_ID},
+        {"transition_id": "unsafe transition"},
+        {"absolute_deadline_utc": None},
+    )
+    for changed in invalid_variants:
+        with pytest.raises(
+            ResumeCutoffTransitionError,
+            match="unrelated transition metadata is not authorized",
+        ):
+            resolve_resume_cutoff_transition(**{**base, **changed})
+
+
+def test_legacy_run_remains_strict_with_validated_coordinator_authority() -> None:
+    with pytest.raises(
+        ResumeCutoffTransitionError,
+        match="exact resume cutoff transition authorization mismatch",
+    ):
+        resolve_resume_cutoff_transition(
+            run_id=MATRIX_RUN_ID,
+            resume=True,
+            coordinator_run_id=CURRENT_COORDINATOR_RUN_ID,
+            coordinator_stage="wb_resume",
+            transition_id=UNRELATED_TRANSITION_ID,
+            absolute_deadline_utc=datetime(2026, 8, 3, 20, 0, tzinfo=UTC),
+            validated_coordinator_authority=True,
+        )
 
 
 def test_transition_keeps_exact_plan_matrix_and_old_runtime_provenance() -> None:
@@ -500,7 +548,11 @@ def test_launcher_refuses_exact_resume_without_transition_before_config_load(
     monkeypatch.setattr(
         four_region_launcher,
         "coordinator_invocation_from_environment",
-        lambda _environment: SimpleNamespace(schedule_date="2026-08-01"),
+        lambda _environment: SimpleNamespace(
+            coordinator_run_id=COORDINATOR_RUN_ID,
+            schedule_date="2026-08-01",
+            stage=COORDINATOR_STAGE,
+        ),
     )
     monkeypatch.setattr(
         four_region_launcher,
@@ -556,7 +608,11 @@ def test_launcher_passes_exact_transition_to_matrix_runner(
     monkeypatch.setattr(
         four_region_launcher,
         "coordinator_invocation_from_environment",
-        lambda _environment: SimpleNamespace(schedule_date="2026-08-01"),
+        lambda _environment: SimpleNamespace(
+            coordinator_run_id=COORDINATOR_RUN_ID,
+            schedule_date="2026-08-01",
+            stage=COORDINATOR_STAGE,
+        ),
     )
     monkeypatch.setattr(
         four_region_launcher,
@@ -608,3 +664,108 @@ def test_launcher_passes_exact_transition_to_matrix_runner(
     assert captured["absolute_deadline_utc"] == TO_DEADLINE_UTC
     assert captured["resume"] is True
     assert captured["generation_date"] == "2026-08-01"
+
+
+def test_launcher_ignores_unrelated_transition_after_validated_lock_v3(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        four_region_launcher,
+        "require_official_live_entry_lease",
+        lambda **_kwargs: 9,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "coordinator_invocation_from_environment",
+        lambda _environment: SimpleNamespace(
+            coordinator_run_id=CURRENT_COORDINATOR_RUN_ID,
+            schedule_date="2026-08-03",
+            stage="wb_resume",
+        ),
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "integrity_gate",
+        lambda _root: (lambda: None),
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "load_config",
+        lambda _path: SimpleNamespace(project_root=tmp_path),
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "run_execution_matrix",
+        lambda **kwargs: captured.update(kwargs)
+        or {"status": "success", "complete": True},
+    )
+    monkeypatch.setenv(
+        "MARKETPLACE_COORDINATOR_DEADLINE_UTC",
+        "2026-08-03T20:00:00Z",
+    )
+    monkeypatch.setenv(
+        "MARKETPLACE_COORDINATOR_CUTOFF_TRANSITION_ID",
+        UNRELATED_TRANSITION_ID,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_wb_four_region_nightly.py",
+            "--matrix-file",
+            "config/wb/execution_matrices/four-region-nightly-v1.json",
+            "--no-publish",
+            "--resume-run-id",
+            CURRENT_MATRIX_RUN_ID,
+        ],
+    )
+
+    assert four_region_launcher.main() == 0
+    assert captured["matrix_run_id"] == CURRENT_MATRIX_RUN_ID
+    assert captured["resume"] is True
+    assert captured["generation_date"] == "2026-08-03"
+    assert captured["resume_cutoff_transition"] is None
+
+
+def test_launcher_rejects_unrelated_transition_without_validated_lock_v3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        four_region_launcher,
+        "_coordinator_invocation_under_validated_lease",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "integrity_gate",
+        lambda _root: (lambda: None),
+    )
+    monkeypatch.setattr(
+        four_region_launcher,
+        "load_config",
+        lambda _path: pytest.fail("config must not load without authority"),
+    )
+    monkeypatch.setenv(
+        "MARKETPLACE_COORDINATOR_DEADLINE_UTC",
+        "2026-08-03T20:00:00Z",
+    )
+    monkeypatch.setenv(
+        "MARKETPLACE_COORDINATOR_CUTOFF_TRANSITION_ID",
+        UNRELATED_TRANSITION_ID,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_wb_four_region_nightly.py",
+            "--matrix-file",
+            "config/wb/execution_matrices/four-region-nightly-v1.json",
+            "--no-publish",
+            "--resume-run-id",
+            CURRENT_MATRIX_RUN_ID,
+        ],
+    )
+
+    assert four_region_launcher.main() == 2

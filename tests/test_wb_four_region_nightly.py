@@ -126,7 +126,11 @@ def test_coordinator_schedule_date_is_passed_to_matrix_and_downstream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
-    invocation = SimpleNamespace(schedule_date="2026-08-03")
+    invocation = SimpleNamespace(
+        coordinator_run_id="nightly-20260803-test00000000",
+        schedule_date="2026-08-03",
+        stage="wb_initial",
+    )
     monkeypatch.setattr(
         four_region_launcher,
         "coordinator_invocation_from_environment",

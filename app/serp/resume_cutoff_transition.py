@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Mapping
@@ -82,6 +83,7 @@ _SHA256_FIELDS = {
     "from_input_manifest_sha256",
     "to_input_manifest_sha256",
 }
+_SAFE_TRANSITION_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 
 
 class ResumeCutoffTransitionError(CriticalPipelineError):
@@ -403,12 +405,26 @@ def resolve_resume_cutoff_transition(
     coordinator_stage: str,
     transition_id: str,
     absolute_deadline_utc: datetime | None,
+    validated_coordinator_authority: bool = False,
 ) -> ApprovedResumeCutoffTransition | None:
     if run_id != MATRIX_RUN_ID:
-        if transition_id:
+        if not transition_id:
+            return None
+        if (
+            transition_id == TRANSITION_ID
+            or not _SAFE_TRANSITION_ID.fullmatch(transition_id)
+            or not validated_coordinator_authority
+            or not resume
+            or not coordinator_run_id
+            or coordinator_stage not in {"wb_initial", "wb_resume"}
+            or absolute_deadline_utc is None
+        ):
             raise ResumeCutoffTransitionError(
-                "resume cutoff transition run_id mismatch"
+                "unrelated transition metadata is not authorized"
             )
+        # A validated coordinator may carry successor metadata for another
+        # marketplace. It grants no WB cutoff authority and is ignored here;
+        # ordinary post-cutover deadline, lock and publication gates still apply.
         return None
     if (
         not resume

@@ -603,6 +603,12 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   either exact versioned execution contract remain readable and immutable. The
   v2 plan runtime window must exact-match its reviewed contract; any drift
   fails before locks.
+  The historical `wb_resume_cutoff_transition_v1` remains hard-pinned to its
+  exact 2026-08-01 run and coordinator identity. A transition ID belonging to
+  another marketplace or scheduler successor grants no WB cutoff authority.
+  It may be ignored only for a different WB run after the full coordinator
+  invocation has been authenticated under lock-v3; manual/unvalidated entry,
+  a malformed ID, or reuse of the historical WB transition ID fails closed.
   Downstream may write authoritative run state only while it owns all
   collection-plan exclusion locks. Completed/published run state is immutable,
   and `latest.json` pins its exact SHA-256. Rejected resumes, preflight

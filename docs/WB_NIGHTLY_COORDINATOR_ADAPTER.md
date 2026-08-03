@@ -157,6 +157,16 @@ legacy-protected mode and cannot request post-cutover behavior through CLI.
 When the collection manifest is already `success/complete`, official resume
 uses it as immutable input and enters downstream without another SERP call.
 
+The exact 2026-08-01 resume-cutoff transition is legacy run-scoped authority,
+not a generic interpretation of coordinator metadata. A validated coordinator
+invocation for another WB run may carry an unrelated scheduler successor ID;
+the launcher ignores that ID only after lock-v3 authentication and gives it no
+cutoff privileges. The run then proceeds solely under
+`post_cutover_coordinator_lock_v3_v1` and its ordinary deadline, attestation,
+lock, quarantine and publication gates. The historical transition ID on any
+other run, foreign metadata on the historical run, malformed metadata, and any
+manual or unvalidated invocation remain fail-closed.
+
 The contract checker returns at most 32 direct coordinator roots, including
 the attested verifier and
 `config/wb/nightly_coordinator_adapter_inputs.json`. That versioned manifest

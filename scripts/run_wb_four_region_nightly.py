@@ -354,19 +354,24 @@ def main() -> int:
         resume_cutoff_transition = resolve_resume_cutoff_transition(
             run_id=run_id,
             resume=bool(args.resume_run_id),
-            coordinator_run_id=os.getenv(
-                "MARKETPLACE_COORDINATOR_RUN_ID",
-                "",
+            coordinator_run_id=(
+                coordinator_invocation.coordinator_run_id
+                if coordinator_invocation is not None
+                else ""
             ),
-            coordinator_stage=os.getenv(
-                "MARKETPLACE_COORDINATOR_STAGE",
-                "",
+            coordinator_stage=(
+                coordinator_invocation.stage
+                if coordinator_invocation is not None
+                else ""
             ),
             transition_id=os.getenv(
                 "MARKETPLACE_COORDINATOR_CUTOFF_TRANSITION_ID",
                 "",
             ),
             absolute_deadline_utc=absolute_deadline_utc,
+            validated_coordinator_authority=(
+                coordinator_invocation is not None
+            ),
         )
         config = load_config(args.config)
         if args.matrix_file:
