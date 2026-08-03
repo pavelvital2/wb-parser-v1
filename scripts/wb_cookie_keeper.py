@@ -10,11 +10,12 @@ import os
 import re
 import stat
 import sys
+import uuid
 from collections import OrderedDict
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any
-from urllib.parse import quote
+from typing import Any, Callable
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -29,6 +30,8 @@ from app.common.proxy_required import (
     proxy_route_from_url,
     require_marketplace_proxy,
 )
+from app.common.durable_atomic import durable_atomic_replace
+from app.common.nightly_attestation import integrity_gate as attestation_integrity_gate
 
 
 EXIT_OK = 0
@@ -43,6 +46,18 @@ DEFAULT_AUTHORIZATION_HORIZON_PLAN = (
 )
 MAX_PINNED_SECRET_BYTES = 1024 * 1024
 MSK = ZoneInfo("Europe/Moscow")
+BROWSER_PROFILE_RELATIVE_PATH = Path("state/browser/wb_cookie_renewal_profile")
+BROWSER_COOLDOWN_RELATIVE_PATH = Path(
+    "state/wb_session_keeper/browser_refresh_cooldown.json"
+)
+BROWSER_COOKIE_CANDIDATE_RELATIVE_DIR = Path("state/wb_cookie_candidates")
+BROWSER_COOKIE_BACKUP_RELATIVE_DIR = Path("state/wb_known_good")
+BROWSER_REFRESH_COOLDOWN_SECONDS = 1800
+BROWSER_TIMEOUT_MIN_MS = 1000
+BROWSER_TIMEOUT_MAX_MS = 60000
+BROWSER_SETTLE_MAX_MS = 15000
+BROWSER_RATE_LIMIT_STATUSES = {429, 498}
+BROWSER_COOLDOWN_SCHEMA = "wb_browser_refresh_cooldown_v1"
 
 
 class AccessContractError(RuntimeError):
@@ -124,24 +139,32 @@ class RequestHeadersSource:
         self.pinned.close()
 
 
-def _require_host_lease_after_cutover() -> None:
+def _require_host_lease_after_cutover() -> Any | None:
     if not os.path.lexists(COORDINATOR_LOCK_DIRECTORY):
-        return
+        return None
     from app.common.nightly_coordinator import (
         require_official_live_entry_lease,
     )
 
-    require_official_live_entry_lease(environment=os.environ)
+    return require_official_live_entry_lease(environment=os.environ)
+
+
+def _publication_integrity_gate(args: argparse.Namespace | None = None) -> Callable[[], None]:
+    explicit = getattr(args, "_publication_integrity_gate", None) if args is not None else None
+    if explicit is not None:
+        return explicit
+    return attestation_integrity_gate(PROJECT_ROOT, os.environ)
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def resolve_path(value: str | Path, *, root: Path = PROJECT_ROOT) -> Path:
+def resolve_path(value: str | Path, *, root: Path | None = None) -> Path:
+    effective_root = root or PROJECT_ROOT
     path = Path(value)
     if not path.is_absolute():
-        path = root / path
+        path = effective_root / path
     return path
 
 
@@ -675,7 +698,11 @@ def load_candidate_cookie_source(
     *,
     project_root: Path | None = None,
 ) -> PinnedFile | None:
-    if not str(getattr(args, "request_headers_file", "") or "").strip():
+    generated = bool(getattr(args, "_generated_cookie_candidate", False))
+    if (
+        not generated
+        and not str(getattr(args, "request_headers_file", "") or "").strip()
+    ):
         return None
     if getattr(args, "without_cookie", False):
         return None
@@ -691,13 +718,24 @@ def load_candidate_cookie_source(
     )
 
 
-def write_cookie_value(cookie_path: Path, cookie_value: str) -> None:
+def write_cookie_value(
+    cookie_path: Path,
+    cookie_value: str,
+    *,
+    integrity_gate: Callable[[], None] | None = None,
+    require_absent: bool = False,
+) -> None:
+    payload = cookie_value.strip()
+    if not payload or "\n" in payload or "\r" in payload:
+        raise AccessContractError("cookie_candidate_invalid")
     cookie_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = cookie_path.with_name(f"{cookie_path.name}.tmp")
-    tmp_path.write_text(cookie_value.strip() + "\n", encoding="utf-8")
-    tmp_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    tmp_path.replace(cookie_path)
-    cookie_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    durable_atomic_replace(
+        cookie_path,
+        (payload + "\n").encode("utf-8"),
+        mode=0o600,
+        require_absent=require_absent,
+        integrity_gate=integrity_gate or _publication_integrity_gate(),
+    )
 
 
 def load_queries(config: dict[str, Any], explicit_query: str, sample_count: int) -> list[str]:
@@ -753,7 +791,168 @@ def write_state(path_value: str, data: dict[str, Any]) -> None:
         return
     path = resolve_path(path_value)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    durable_atomic_replace(
+        path,
+        (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        mode=0o600,
+        integrity_gate=_publication_integrity_gate(),
+    )
+
+
+def _strict_utc_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not value.endswith("+00:00"):
+        raise AccessContractError("browser_refresh_cooldown_invalid")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise AccessContractError("browser_refresh_cooldown_invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise AccessContractError("browser_refresh_cooldown_invalid")
+    return parsed.astimezone(timezone.utc)
+
+
+def _ensure_private_runtime_directory(path: Path) -> None:
+    root = Path(os.path.abspath(os.fspath(PROJECT_ROOT)))
+    expected_roots = {
+        root / BROWSER_PROFILE_RELATIVE_PATH,
+        root / BROWSER_COOKIE_CANDIDATE_RELATIVE_DIR,
+        root / BROWSER_COOKIE_BACKUP_RELATIVE_DIR,
+        root / BROWSER_COOLDOWN_RELATIVE_PATH.parent,
+    }
+    path = Path(os.path.abspath(os.fspath(path)))
+    if path not in expected_roots:
+        raise AccessContractError("browser_runtime_path_invalid")
+    relative = path.relative_to(root)
+    current = root
+    for part in relative.parts:
+        current /= part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            os.mkdir(current, mode=0o700)
+            info = os.lstat(current)
+        except OSError as exc:
+            raise AccessContractError("browser_runtime_path_unavailable") from exc
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o002
+        ):
+            raise AccessContractError("browser_runtime_path_unsafe")
+        if current == path and stat.S_IMODE(info.st_mode) != 0o700:
+            try:
+                os.chmod(current, 0o700, follow_symlinks=False)
+            except OSError as exc:
+                raise AccessContractError("browser_runtime_path_unsafe") from exc
+            if stat.S_IMODE(os.lstat(current).st_mode) != 0o700:
+                raise AccessContractError("browser_runtime_path_unsafe")
+
+
+def browser_profile_path(args: argparse.Namespace) -> Path:
+    configured = str(
+        getattr(args, "browser_profile_dir", "")
+        or BROWSER_PROFILE_RELATIVE_PATH.as_posix()
+    )
+    path = resolve_path(configured)
+    expected = resolve_path(BROWSER_PROFILE_RELATIVE_PATH)
+    if path != expected:
+        raise AccessContractError("browser_profile_path_not_approved")
+    _ensure_private_runtime_directory(path)
+    return path
+
+
+def browser_cooldown_path() -> Path:
+    path = resolve_path(BROWSER_COOLDOWN_RELATIVE_PATH)
+    _ensure_private_runtime_directory(path.parent)
+    return path
+
+
+def browser_refresh_cooldown_active(
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any] | None:
+    path = browser_cooldown_path()
+    if not path.exists():
+        return None
+    pinned = _open_pinned_file(
+        path,
+        project_root=PROJECT_ROOT,
+        allowed_root=path.parent,
+        exact_mode=0o600,
+    )
+    try:
+        try:
+            payload = json.loads(pinned.payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AccessContractError("browser_refresh_cooldown_invalid") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != BROWSER_COOLDOWN_SCHEMA
+            or payload.get("status") not in {"active", "cleared"}
+            or payload.get("reason") not in {
+                "browser_http_429",
+                "browser_http_498",
+                "browser_timeout",
+                "candidate_api_rate_limited",
+                "none",
+            }
+        ):
+            raise AccessContractError("browser_refresh_cooldown_invalid")
+        pinned.verify()
+        if payload["status"] == "cleared":
+            return None
+        next_allowed = _strict_utc_timestamp(payload.get("next_allowed_at_utc"))
+        now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        return payload if now < next_allowed else None
+    finally:
+        pinned.close()
+
+
+def record_browser_refresh_cooldown(
+    reason: str,
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any]:
+    if reason not in {
+        "browser_http_429",
+        "browser_http_498",
+        "browser_timeout",
+        "candidate_api_rate_limited",
+    }:
+        raise AccessContractError("browser_refresh_cooldown_reason_invalid")
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(
+        microsecond=0
+    )
+    payload = {
+        "schema_version": BROWSER_COOLDOWN_SCHEMA,
+        "status": "active",
+        "reason": reason,
+        "checked_at_utc": now.isoformat(),
+        "next_allowed_at_utc": (
+            now + timedelta(seconds=BROWSER_REFRESH_COOLDOWN_SECONDS)
+        ).isoformat(),
+        "cooldown_seconds": BROWSER_REFRESH_COOLDOWN_SECONDS,
+    }
+    write_state(str(browser_cooldown_path()), payload)
+    return payload
+
+
+def clear_browser_refresh_cooldown(*, now_utc: datetime | None = None) -> None:
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(
+        microsecond=0
+    )
+    write_state(
+        str(browser_cooldown_path()),
+        {
+            "schema_version": BROWSER_COOLDOWN_SCHEMA,
+            "status": "cleared",
+            "reason": "none",
+            "checked_at_utc": now.isoformat(),
+            "next_allowed_at_utc": None,
+            "cooldown_seconds": BROWSER_REFRESH_COOLDOWN_SECONDS,
+        },
+    )
 
 
 def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True) -> bool:
@@ -783,7 +982,10 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
         page = int(args.page)
         base_urls = resolve_serp_base_urls(config)
         min_successes = resolve_smoke_min_successes(config, args, len(queries))
-        if str(getattr(args, "request_headers_file", "") or "").strip() and (
+        if (
+            str(getattr(args, "request_headers_file", "") or "").strip()
+            or bool(getattr(args, "_generated_cookie_candidate", False))
+        ) and (
             str(getattr(args, "query", "") or "").strip()
             or int(args.sample_count) != 3
             or int(args.min_successes) != 3
@@ -813,6 +1015,8 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
         timeout = int(config.get("runtime", {}).get("http_timeout_seconds", 45))
         results: list[dict[str, Any]] = []
         successes = 0
+        attempts = 0
+        terminal_reason = ""
         for query in queries:
             params = dict(request_params)
             params["query"] = query
@@ -823,6 +1027,7 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
             result: dict[str, Any] | None = None
             query_ok = False
             for base_url in base_urls:
+                attempts += 1
                 result = {
                     "query": query,
                     "page": page,
@@ -846,6 +1051,12 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
                         result["kind"] = "http_error"
                         result["products_count"] = 0
                         result["sample"] = response.text[:120].replace("\n", " ")
+                        if (
+                            bool(getattr(args, "_terminal_on_access_failure", False))
+                            and response.status_code in BROWSER_RATE_LIMIT_STATUSES
+                        ):
+                            terminal_reason = f"http_{response.status_code}"
+                            break
                     else:
                         try:
                             payload = response.json()
@@ -863,6 +1074,14 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
                                 break
                 except AccessContractError:
                     raise
+                except requests.Timeout:
+                    result["http_status"] = 0
+                    result["kind"] = "request_failed"
+                    result["products_count"] = 0
+                    result["sample"] = "Timeout"
+                    if bool(getattr(args, "_terminal_on_access_failure", False)):
+                        terminal_reason = "timeout"
+                        break
                 except Exception as exc:
                     result["http_status"] = 0
                     result["kind"] = "request_failed"
@@ -893,8 +1112,12 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
                     f"products={result.get('products_count')}",
                     f"sample={result.get('sample')}",
                 )
+            if terminal_reason:
+                break
 
         ok = successes >= min_successes
+        setattr(args, "_smoke_attempts", attempts)
+        setattr(args, "_smoke_terminal_reason", terminal_reason)
         if source is not None:
             source.verify()
         if candidate_cookie is not None:
@@ -980,86 +1203,198 @@ def storage_state_default() -> str:
     return os.getenv("PARSER_WB_STORAGE_STATE_FILE") or os.getenv("WB_STORAGE_STATE_FILE") or "state/browser/wb_storage_state.json"
 
 
+def _browser_search_url(config: dict[str, Any], args: argparse.Namespace) -> str:
+    query = load_queries(config, getattr(args, "query", ""), 1)[0]
+    template = str(
+        getattr(args, "refresh_url", "")
+        or "https://www.wildberries.ru/catalog/0/search.aspx?search={query}"
+    )
+    if "{query}" not in template:
+        raise AccessContractError("browser_refresh_url_invalid")
+    url = template.replace("{query}", quote(query))
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in {"wildberries.ru", "www.wildberries.ru"}
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise AccessContractError("browser_refresh_url_invalid")
+    return url
+
+
+def _browser_antibot(title: str, html: str) -> bool:
+    return (
+        "__wbaas/challenges/antibot" in html
+        or "Почти готово" in title
+        or "Почти готово" in html
+        or "ÐÐ¾ÑÑÐ¸" in title
+        or "ÐÐ¾ÑÑÐ¸" in html
+    )
+
+
+def _browser_failure_reason(exc: Exception) -> str:
+    name = exc.__class__.__name__
+    return "browser_timeout" if "timeout" in name.lower() else "browser_error"
+
+
+def _is_wb_cookie_domain(value: str) -> bool:
+    domain = value.strip().lower().lstrip(".")
+    return domain in {"wildberries.ru", "wb.ru"} or domain.endswith(
+        (".wildberries.ru", ".wb.ru")
+    )
+
+
 def refresh(config: dict[str, Any], args: argparse.Namespace) -> bool:
+    if not bool(getattr(args, "_allow_candidate_write", False)):
+        raise AccessContractError("browser_refresh_candidate_contract_required")
+    if not bool(getattr(args, "headed", False)) or not os.getenv("DISPLAY", "").strip():
+        raise AccessContractError("browser_headed_xvfb_required")
+    browser_channel = str(getattr(args, "browser_channel", "") or "chrome").strip()
+    if browser_channel != "chrome":
+        raise AccessContractError("browser_channel_not_approved")
+    timeout_ms = int(getattr(args, "timeout_ms", 0) or 0)
+    wait_ms = int(getattr(args, "wait_ms", 0) or 0)
+    if not BROWSER_TIMEOUT_MIN_MS <= timeout_ms <= BROWSER_TIMEOUT_MAX_MS:
+        raise AccessContractError("browser_timeout_budget_invalid")
+    if not 0 <= wait_ms <= BROWSER_SETTLE_MAX_MS:
+        raise AccessContractError("browser_settle_budget_invalid")
+
+    proxy_config = require_marketplace_proxy(config, browser=True).playwright_proxy()
+    profile_dir = browser_profile_path(args)
+    url = _browser_search_url(config, args)
     try:
         from playwright.sync_api import sync_playwright
     except Exception as exc:
-        print(f"refresh failed: playwright is unavailable in current runtime: {exc}", file=sys.stderr)
+        print("refresh failed: browser_runtime_unavailable", file=sys.stderr)
+        setattr(args, "_browser_failure_reason", "browser_runtime_unavailable")
         return False
 
     cookie_path = resolve_cookie_path(config, args.cookie_file)
-    storage_state = resolve_path(args.storage_state or storage_state_default())
-    storage_state_out = resolve_path(args.storage_state_out or str(storage_state))
-    suggest = config.get("suggest") if isinstance(config.get("suggest"), dict) else {}
-    browser_channel = args.browser_channel or str(suggest.get("browser_channel") or "chrome")
-    proxy_config = require_marketplace_proxy(
-        config,
-        browser=True,
-    ).playwright_proxy()
-    headless = not bool(args.no_headless)
-    if args.headed:
-        headless = False
-
-    context_kwargs: dict[str, Any] = {}
-    if storage_state.exists():
-        context_kwargs["storage_state"] = str(storage_state)
-    elif args.require_storage_state:
-        print(f"refresh failed: storage_state not found: {storage_state}", file=sys.stderr)
-        return False
-    extra_headers = request_headers_from_config(config)
-    if extra_headers:
-        context_kwargs["extra_http_headers"] = extra_headers
-
+    candidate_dir = resolve_path(BROWSER_COOKIE_CANDIDATE_RELATIVE_DIR)
+    if (
+        cookie_path.parent != candidate_dir
+        or not re.fullmatch(r"wb_cookie\.browser_[A-Za-z0-9_-]+\.txt", cookie_path.name)
+    ):
+        raise AccessContractError("browser_cookie_candidate_path_invalid")
+    _ensure_private_runtime_directory(candidate_dir)
+    response_status = 0
+    antibot = False
+    cookies: list[dict[str, Any]] = []
     try:
         with sync_playwright() as p:
-            launch_kwargs: dict[str, Any] = {"headless": headless}
-            if browser_channel:
-                launch_kwargs["channel"] = browser_channel
-            launch_kwargs["proxy"] = proxy_config
-            browser = p.chromium.launch(**launch_kwargs)
-            context = browser.new_context(**context_kwargs)
-            page = context.new_page()
-            page.goto(args.refresh_url, wait_until="domcontentloaded", timeout=args.timeout_ms)
-            page.wait_for_timeout(args.wait_ms)
-            cookies = context.cookies(["https://www.wildberries.ru", "https://search.wb.ru"])
-            storage_state_out.parent.mkdir(parents=True, exist_ok=True)
-            context.storage_state(path=str(storage_state_out))
-            context.close()
-            browser.close()
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                channel="chrome",
+                headless=False,
+                proxy=proxy_config,
+            )
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                response = page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=timeout_ms,
+                )
+                response_status = (
+                    response.status
+                    if response is not None
+                    and isinstance(response.status, int)
+                    and not isinstance(response.status, bool)
+                    else 0
+                )
+                page.wait_for_timeout(wait_ms)
+                title = page.title()[:160]
+                html = page.content()[:10000]
+                antibot = _browser_antibot(title, html)
+                cookies = context.cookies(
+                    ["https://www.wildberries.ru", "https://search.wb.ru"]
+                )
+            finally:
+                context.close()
     except Exception as exc:
-        print(f"refresh failed: {exc.__class__.__name__}", file=sys.stderr)
+        reason = _browser_failure_reason(exc)
+        setattr(args, "_browser_failure_reason", reason)
+        setattr(
+            args,
+            "_browser_evidence",
+            {
+                "status": "failed",
+                "reason": reason,
+                "http_status": 0,
+                "antibot": False,
+                "headed": True,
+                "browser_channel": "chrome",
+                "headers_mode": "browser_native",
+                "profile": BROWSER_PROFILE_RELATIVE_PATH.as_posix(),
+            },
+        )
+        print(f"refresh failed: {reason}", file=sys.stderr)
+        return False
+
+    if response_status in BROWSER_RATE_LIMIT_STATUSES:
+        reason = f"browser_http_{response_status}"
+    elif response_status != 200:
+        reason = "browser_http_unusable"
+    elif antibot:
+        reason = "browser_antibot"
+    else:
+        reason = ""
+    if reason:
+        setattr(args, "_browser_failure_reason", reason)
+        setattr(
+            args,
+            "_browser_evidence",
+            {
+                "status": "failed",
+                "reason": reason,
+                "http_status": response_status,
+                "antibot": antibot,
+                "headed": True,
+                "browser_channel": "chrome",
+                "headers_mode": "browser_native",
+                "profile": BROWSER_PROFILE_RELATIVE_PATH.as_posix(),
+            },
+        )
+        print(f"refresh failed: {reason}", file=sys.stderr)
         return False
 
     cookie_pairs: OrderedDict[str, str] = OrderedDict()
-    allowed_domains: set[str] = set()
     for cookie in cookies:
         domain = str(cookie.get("domain") or "")
         name = str(cookie.get("name") or "")
         value = str(cookie.get("value") or "")
         if not name:
             continue
-        if "wildberries.ru" not in domain and "wb.ru" not in domain:
+        if not _is_wb_cookie_domain(domain):
             continue
-        allowed_domains.add(domain)
         cookie_pairs[name] = value
 
     if not cookie_pairs:
-        print("refresh failed: browser did not return WB cookies", file=sys.stderr)
+        setattr(args, "_browser_failure_reason", "browser_cookie_missing")
+        print("refresh failed: browser_cookie_missing", file=sys.stderr)
         return False
 
-    write_cookie_value(cookie_path, "; ".join(f"{name}={value}" for name, value in cookie_pairs.items()))
-    write_state(
-        args.state_json,
-        {
-            "status": "refreshed",
-            "checked_at_utc": utc_now_iso(),
-            "cookie_file": str(cookie_path),
-            "cookie_count": len(cookie_pairs),
-            "cookie_domains": sorted(allowed_domains),
-            "storage_state": str(storage_state_out),
-        },
+    write_cookie_value(
+        cookie_path,
+        "; ".join(f"{name}={value}" for name, value in cookie_pairs.items()),
+        integrity_gate=_publication_integrity_gate(args),
+        require_absent=True,
     )
-    print(f"refresh ok: cookie_file={cookie_path} cookie_count={len(cookie_pairs)} storage_state={storage_state_out}")
+    evidence = {
+        "status": "passed",
+        "reason": "browser_non_antibot_passed",
+        "http_status": response_status,
+        "antibot": False,
+        "headed": True,
+        "browser_channel": "chrome",
+        "headers_mode": "browser_native",
+        "profile": BROWSER_PROFILE_RELATIVE_PATH.as_posix(),
+        "cookie_count": len(cookie_pairs),
+    }
+    setattr(args, "_browser_failure_reason", "")
+    setattr(args, "_browser_evidence", evidence)
+    print(f"refresh candidate ready: cookie_count={len(cookie_pairs)}")
     return True
 
 
@@ -1073,47 +1408,241 @@ def _temp_path(path: Path, suffix: str) -> Path:
     return path.with_name(f"{path.name}.{suffix}.tmp")
 
 
+def _browser_candidate_path() -> tuple[str, Path]:
+    candidate_dir = resolve_path(BROWSER_COOKIE_CANDIDATE_RELATIVE_DIR)
+    _ensure_private_runtime_directory(candidate_dir)
+    attempt_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        + "-"
+        + uuid.uuid4().hex[:12]
+    )
+    return attempt_id, candidate_dir / f"wb_cookie.browser_{attempt_id}.txt"
+
+
+def _promote_browser_cookie_candidate(
+    cookie_path: Path,
+    candidate_path: Path,
+    *,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    expected_cookie_path = resolve_path("config/wb_cookie.txt")
+    if cookie_path != expected_cookie_path:
+        raise AccessContractError("production_cookie_path_not_approved")
+    gate = _publication_integrity_gate(args)
+    candidate = _open_pinned_file(
+        candidate_path,
+        project_root=PROJECT_ROOT,
+        allowed_root=resolve_path(BROWSER_COOKIE_CANDIDATE_RELATIVE_DIR),
+        exact_mode=0o600,
+    )
+    current: PinnedFile | None = None
+    backup_path: Path | None = None
+    try:
+        try:
+            candidate_text = candidate.payload.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise AccessContractError("cookie_candidate_invalid") from exc
+        if not candidate_text or "\n" in candidate_text or "\r" in candidate_text:
+            raise AccessContractError("cookie_candidate_invalid")
+
+        if cookie_path.exists():
+            current = _open_pinned_file(
+                cookie_path,
+                project_root=PROJECT_ROOT,
+                allowed_root=resolve_path("config"),
+                exact_mode=0o600,
+            )
+            backup_dir = resolve_path(BROWSER_COOKIE_BACKUP_RELATIVE_DIR)
+            _ensure_private_runtime_directory(backup_dir)
+            backup_name = (
+                "wb_cookie.browser_backup_"
+                + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                + "_"
+                + current.sha256[:12]
+                + "_"
+                + uuid.uuid4().hex[:8]
+                + ".txt"
+            )
+            backup_path = backup_dir / backup_name
+            durable_atomic_replace(
+                backup_path,
+                current.payload,
+                mode=0o600,
+                require_absent=True,
+                integrity_gate=gate,
+                source_integrity_gate=current.verify,
+            )
+            current.verify()
+
+        candidate.verify()
+        durable_atomic_replace(
+            cookie_path,
+            candidate.payload,
+            mode=0o600,
+            integrity_gate=gate,
+            source_integrity_gate=candidate.verify,
+        )
+        promoted = _open_pinned_file(
+            cookie_path,
+            project_root=PROJECT_ROOT,
+            allowed_root=resolve_path("config"),
+            exact_mode=0o600,
+        )
+        try:
+            if promoted.sha256 != candidate.sha256:
+                raise AccessContractError("cookie_promotion_verification_failed")
+        finally:
+            promoted.close()
+        return {
+            "candidate_sha256": candidate.sha256,
+            "previous_sha256": current.sha256 if current is not None else None,
+            "backup_path": (
+                backup_path.relative_to(PROJECT_ROOT).as_posix()
+                if backup_path is not None
+                else None
+            ),
+        }
+    finally:
+        if current is not None:
+            current.close()
+        candidate.close()
+
+
 def refresh_and_promote(config: dict[str, Any], args: argparse.Namespace) -> bool:
     cookie_path = resolve_cookie_path(config, args.cookie_file)
-    temp_cookie = _temp_path(cookie_path, "refresh")
-    state_json = resolve_path(args.state_json) if args.state_json else PROJECT_ROOT / "state/wb_session_keeper/latest.json"
-    temp_state_json = _temp_path(state_json, "refresh")
+    state_json = str(
+        resolve_path(args.state_json)
+        if getattr(args, "state_json", "")
+        else PROJECT_ROOT / "state/wb_session_keeper/latest.json"
+    )
+    cooldown = browser_refresh_cooldown_active()
+    if cooldown is not None:
+        write_state(
+            state_json,
+            {
+                "status": "cooldown",
+                "checked_at_utc": utc_now_iso(),
+                "failure_reason": "browser_refresh_cooldown_active",
+                "cooldown": cooldown,
+            },
+        )
+        print("browser refresh skipped: cooldown active", file=sys.stderr)
+        return False
 
-    storage_state_target = resolve_path(args.storage_state_out or args.storage_state or storage_state_default())
-    temp_storage_state = _temp_path(storage_state_target, "refresh")
-
+    attempt_id, candidate_cookie = _browser_candidate_path()
     refresh_args = _namespace_copy(
         args,
-        cookie_file=str(temp_cookie),
-        state_json=str(temp_state_json),
-        storage_state_out=str(temp_storage_state),
+        cookie_file=str(candidate_cookie),
+        state_json=state_json,
+        browser_profile_dir=(
+            getattr(args, "browser_profile_dir", "")
+            or BROWSER_PROFILE_RELATIVE_PATH.as_posix()
+        ),
+        _allow_candidate_write=True,
     )
     try:
         if not refresh(config, refresh_args):
+            reason = str(
+                getattr(refresh_args, "_browser_failure_reason", "")
+                or "browser_refresh_failed"
+            )
+            if reason in {"browser_http_429", "browser_http_498", "browser_timeout"}:
+                cooldown = record_browser_refresh_cooldown(reason)
+            else:
+                cooldown = None
+            write_state(
+                state_json,
+                {
+                    "status": "failed",
+                    "checked_at_utc": utc_now_iso(),
+                    "attempt_id": attempt_id,
+                    "failure_reason": reason,
+                    "browser": getattr(refresh_args, "_browser_evidence", {}),
+                    "cooldown": cooldown,
+                    "production_cookie_changed": False,
+                    "storage_state_changed": False,
+                },
+            )
             return False
 
-        smoke_args = _namespace_copy(args, cookie_file=str(temp_cookie))
+        smoke_args = _namespace_copy(
+            args,
+            cookie_file=str(candidate_cookie),
+            state_json=state_json,
+            sample_count=3,
+            min_successes=3,
+            without_cookie=False,
+            request_headers_file="",
+            authorization_policy="if_present",
+            authorization_horizon_plan_file=(
+                getattr(args, "authorization_horizon_plan_file", "")
+                or DEFAULT_AUTHORIZATION_HORIZON_PLAN
+            ),
+            _generated_cookie_candidate=True,
+            _terminal_on_access_failure=True,
+        )
         if not smoke(config, smoke_args):
-            print("refresh smoke failed; keeping existing cookie file unchanged", file=sys.stderr)
+            terminal = str(getattr(smoke_args, "_smoke_terminal_reason", "") or "")
+            cooldown = None
+            if terminal in {"http_429", "http_498", "timeout"}:
+                cooldown = record_browser_refresh_cooldown(
+                    "candidate_api_rate_limited"
+                )
+            write_state(
+                state_json,
+                {
+                    "status": "failed",
+                    "checked_at_utc": utc_now_iso(),
+                    "attempt_id": attempt_id,
+                    "failure_reason": "candidate_api_smoke_failed",
+                    "browser": getattr(refresh_args, "_browser_evidence", {}),
+                    "api_smoke": {
+                        "required_successes": 3,
+                        "attempts": int(getattr(smoke_args, "_smoke_attempts", 0)),
+                        "terminal_reason": terminal or None,
+                    },
+                    "cooldown": cooldown,
+                    "production_cookie_changed": False,
+                    "storage_state_changed": False,
+                },
+            )
+            print("refresh API smoke failed; production cookie unchanged", file=sys.stderr)
             return False
 
-        if not html_access_smoke(config, smoke_args, temp_cookie):
-            print("refresh html smoke failed; keeping existing cookie file unchanged", file=sys.stderr)
-            return False
-
-        write_cookie_value(cookie_path, read_cookie_value(temp_cookie))
-        if temp_storage_state.exists():
-            storage_state_target.parent.mkdir(parents=True, exist_ok=True)
-            temp_storage_state.replace(storage_state_target)
-        print(f"refresh promoted: cookie_file={cookie_path} storage_state={storage_state_target}")
+        promotion = _promote_browser_cookie_candidate(
+            cookie_path,
+            candidate_cookie,
+            args=args,
+        )
+        clear_browser_refresh_cooldown()
+        write_state(
+            state_json,
+            {
+                "status": "promoted",
+                "checked_at_utc": utc_now_iso(),
+                "attempt_id": attempt_id,
+                "browser": getattr(refresh_args, "_browser_evidence", {}),
+                "api_smoke": {
+                    "required_successes": 3,
+                    "successes": 3,
+                    "attempts": int(getattr(smoke_args, "_smoke_attempts", 0)),
+                    "authorization": getattr(
+                        smoke_args, "_authorization_evidence", {}
+                    ),
+                },
+                "promotion": promotion,
+                "production_cookie_changed": True,
+                "storage_state_changed": False,
+            },
+        )
+        print("refresh promoted: browser and exact API gates passed")
         return True
     finally:
-        for path in (temp_cookie, temp_state_json, temp_storage_state):
-            try:
-                if path.exists():
-                    path.unlink()
-            except OSError:
-                pass
+        try:
+            if candidate_cookie.exists():
+                candidate_cookie.unlink()
+        except OSError:
+            pass
 
 
 def renew(config: dict[str, Any], args: argparse.Namespace) -> bool:
@@ -1139,11 +1668,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-count", type=int, default=1)
     parser.add_argument("--min-successes", type=int, default=0)
     parser.add_argument("--page", type=int, default=1)
-    parser.add_argument("--refresh-url", default="https://www.wildberries.ru/")
+    parser.add_argument(
+        "--refresh-url",
+        default="https://www.wildberries.ru/catalog/0/search.aspx?search={query}",
+    )
     parser.add_argument("--storage-state", default="")
     parser.add_argument("--storage-state-out", default="")
     parser.add_argument("--require-storage-state", action="store_true")
     parser.add_argument("--browser-channel", default="")
+    parser.add_argument(
+        "--browser-profile-dir",
+        default=BROWSER_PROFILE_RELATIVE_PATH.as_posix(),
+    )
     parser.add_argument("--headed", action="store_true")
     parser.add_argument("--no-headless", action="store_true")
     parser.add_argument("--wait-ms", type=int, default=3000)
@@ -1178,7 +1714,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "smoke":
             return EXIT_OK if smoke(config, args) else EXIT_SMOKE_FAILED
         if args.command == "refresh":
-            return EXIT_OK if refresh(config, args) else EXIT_REFRESH_FAILED
+            return EXIT_OK if refresh_and_promote(config, args) else EXIT_REFRESH_FAILED
         if args.command == "renew":
             return EXIT_OK if renew(config, args) else EXIT_REFRESH_FAILED
         return EXIT_OK if ensure(config, args) else EXIT_SMOKE_FAILED

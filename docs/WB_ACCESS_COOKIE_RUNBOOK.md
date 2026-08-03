@@ -20,7 +20,9 @@ Windows 3proxy и секретные Opera-derived request headers. Persistent b
   или `data/warehouse/`.
 - Не запускать `suggest`, `filter` или full `daily` для проверки доступа.
 - Не увеличивать concurrency и не убирать backoff при `429`/`498`.
-- Не считать browser renewal доказанным автономным способом обновления cookies.
+- Не считать новый browser renewal доказанным автономным способом обновления
+  cookies до отдельного owner-authorized live smoke. Offline contract и live
+  доступ - разные gates.
 - Не продвигать новый cookie/header candidate без smoke-проверок.
 - Не трогать Ozon в рамках WB access repair.
 - Не запускать marketplace access через обычный `source runtime.env`: используй
@@ -36,6 +38,8 @@ config/runtime.env
 config/wb_cookie.txt
 config/wb_request_headers.json
 state/wb_session_keeper/latest.json
+state/wb_session_keeper/browser_refresh_cooldown.json
+state/browser/wb_cookie_renewal_profile/
 state/wb_nightly_preflight/latest.json
 state/wb_known_good/
 data/logs/wb_cookie_renewal.log
@@ -239,6 +243,35 @@ scripts/run_wb_cookie_renewal.sh
 Текущий режим - `ensure`, не blind browser renew. Он сначала проверяет текущий
 канал через API/SERP smoke. Browser refresh допускается только после fail и не
 должен перезаписывать рабочий cookie/header contour без успешных gates.
+
+Refresh выполняется только штатным wrapper под lock-v3 lease: `timeout` задаёт
+10-minute hard cap, а `xvfb-run` запускает system Chrome в headed
+persistent-context режиме. Между
+maintenance invocations сохраняется только ignored profile
+`state/browser/wb_cookie_renewal_profile` с mode `700`. Browser открывает
+реальную WB search page через обязательный proxy и формирует обычные browser
+headers самостоятельно. В context не передаются parser API headers,
+Authorization или старый Playwright `storage_state`; Authorization не
+извлекается из browser и не сохраняется.
+
+Cookies только WB-domain записываются в уникальный mode-`600` candidate. До
+promotion обязательны оба условия:
+
+1. browser response `HTTP 200` без anti-bot признаков;
+2. proxy-only exact `3/3` API smoke candidate cookie с policy `if_present` и
+   horizon из reviewed four-region plan.
+
+`429`, `498` и browser timeout завершают попытку без retry и создают
+secret-safe 30-minute cooldown state. Пока cooldown активен, новый browser
+refresh/candidate smoke не запускается. Production cookie меняется только
+durable atomic writer-ом, получает mode `600`, а прежние exact bytes сохраняются
+в ignored hash-proven backup под `state/wb_known_good/`. Candidate failure не
+меняет production cookie или legacy `storage_state`.
+
+Долгоживущая tmux browser session/watchdog для этого workflow не требуется и
+остаётся disabled. Реализация и offline tests сами по себе не являются
+доказательством, что WB сейчас принимает browser session; live verification
+требует отдельного разрешения владельца.
 
 Pre-nightly checks:
 

@@ -6,8 +6,9 @@ import hashlib
 import importlib.util
 import json
 import shutil
+import stat
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -562,91 +563,278 @@ def test_candidate_headers_cookie_and_cookieless_exact_three_of_three_smoke(
     assert token not in Path(args.state_json).read_text(encoding="utf-8")
 
 
-def test_ensure_keeps_existing_cookie_when_refresh_smoke_fails(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("status", [429, 498])
+def test_generated_browser_candidate_rate_limit_is_terminal_before_second_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
     keeper = _load_keeper()
-    cookie_path = tmp_path / "wb_cookie.txt"
-    cookie_path.write_text("old_cookie=1\n", encoding="utf-8")
+    monkeypatch.setattr(keeper, "PROJECT_ROOT", tmp_path)
+    _enable_proxy(monkeypatch)
+    headers = tmp_path / "config/wb_request_headers.json"
+    headers.parent.mkdir(parents=True)
+    headers.write_text('{"deviceid":"test-device"}\n', encoding="utf-8")
+    headers.chmod(0o600)
+    candidate = tmp_path / "state/wb_cookie_candidates/wb_cookie.browser_test.txt"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("cookie=1\n", encoding="utf-8")
+    candidate.chmod(0o600)
+    queries = tmp_path / "exports/queries.txt"
+    queries.parent.mkdir(parents=True)
+    queries.write_text("q1\nq2\nq3\n", encoding="utf-8")
+    monkeypatch.setattr(
+        keeper,
+        "authorization_horizon_from_plan",
+        lambda *_args, **_kwargs: (
+            datetime(2026, 8, 4, tzinfo=timezone.utc),
+            {"horizon_source": "test", "plan_sha256": "a" * 64},
+        ),
+    )
+    calls = 0
 
+    class Response:
+        status_code = status
+        text = "blocked"
+
+    def fake_get(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return Response()
+
+    monkeypatch.setattr(keeper, "marketplace_get", fake_get)
+    args = argparse.Namespace(
+        cookie_file=str(candidate),
+        state_json=str(tmp_path / "state/smoke.json"),
+        query="",
+        sample_count=3,
+        min_successes=3,
+        page=1,
+        without_cookie=False,
+        request_headers_file="",
+        authorization_policy="if_present",
+        authorization_horizon_plan_file="config/wb/collection_plans/test.json",
+        _generated_cookie_candidate=True,
+        _terminal_on_access_failure=True,
+    )
+    config = {
+        "runtime": {"http_timeout_seconds": 5},
+        "serp": {
+            "proxy_url_env": "PARSER_WB_PROXY_URL",
+            "request_headers_file": "config/wb_request_headers.json",
+            "base_url": "https://example.invalid/search",
+            "fallback_base_urls": ["https://fallback.invalid/search"],
+            "input_files": {"queries_txt": str(queries)},
+            "request_params": {},
+        },
+    }
+
+    assert keeper.smoke(config, args, emit=False) is False
+    assert calls == 1
+    assert args._smoke_attempts == 1
+    assert args._smoke_terminal_reason == f"http_{status}"
+
+
+def _browser_renew_fixture(
+    keeper,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path, argparse.Namespace]:
+    monkeypatch.setattr(keeper, "PROJECT_ROOT", tmp_path)
+    cookie_path = tmp_path / "config/wb_cookie.txt"
+    cookie_path.parent.mkdir(parents=True)
+    cookie_path.write_text("old_cookie=1\n", encoding="utf-8")
+    cookie_path.chmod(0o600)
+    storage_state = tmp_path / "state/browser/legacy_storage_state.json"
+    storage_state.parent.mkdir(parents=True)
+    (tmp_path / "state").chmod(0o700)
+    storage_state.parent.chmod(0o700)
+    storage_state.write_text('{"cookies":[]}\n', encoding="utf-8")
+    storage_state.chmod(0o600)
     args = argparse.Namespace(
         cookie_file=str(cookie_path),
-        state_json=str(tmp_path / "state.json"),
-        storage_state="",
+        state_json=str(tmp_path / "state/wb_session_keeper/latest.json"),
+        storage_state=str(storage_state),
         storage_state_out="",
+        browser_profile_dir="state/browser/wb_cookie_renewal_profile",
+        browser_channel="chrome",
+        headed=True,
+        no_headless=False,
+        require_storage_state=False,
+        refresh_url="https://www.wildberries.ru/catalog/0/search.aspx?search={query}",
+        query="test-query",
+        sample_count=1,
+        min_successes=0,
+        page=1,
+        wait_ms=1,
+        timeout_ms=1000,
+        without_cookie=False,
+        request_headers_file="",
+        authorization_policy="optional",
+        authorization_horizon_plan_file="config/wb/collection_plans/test.json",
+        _publication_integrity_gate=lambda: None,
+    )
+    return cookie_path, storage_state, args
+
+
+def _fake_browser_candidate(refresh_args: argparse.Namespace) -> None:
+    candidate = Path(refresh_args.cookie_file)
+    candidate.write_text("new_cookie=1\n", encoding="utf-8")
+    candidate.chmod(0o600)
+    refresh_args._browser_failure_reason = ""
+    refresh_args._browser_evidence = {
+        "status": "passed",
+        "headers_mode": "browser_native",
+        "http_status": 200,
+        "antibot": False,
+    }
+
+
+def test_ensure_healthy_current_channel_never_starts_browser_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keeper = _load_keeper()
+    _cookie_path, _storage_state, args = _browser_renew_fixture(
+        keeper, tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(keeper, "smoke", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        keeper,
+        "refresh_and_promote",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("healthy ensure must not start browser refresh")
+        ),
     )
 
-    def fake_smoke(config, smoke_args, emit=True):
-        return Path(smoke_args.cookie_file) != cookie_path and False
+    assert keeper.ensure({}, args) is True
 
-    def fake_refresh(config, refresh_args):
-        Path(refresh_args.cookie_file).write_text("new_cookie=1\n", encoding="utf-8")
-        Path(refresh_args.storage_state_out).write_text('{"cookies":[]}\n', encoding="utf-8")
-        return True
+
+def test_ensure_keeps_existing_cookie_and_storage_when_candidate_smoke_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keeper = _load_keeper()
+    cookie_path, storage_state, args = _browser_renew_fixture(
+        keeper, tmp_path, monkeypatch
+    )
+    smoke_calls = 0
+
+    def fake_smoke(_config, smoke_args, emit=True):
+        nonlocal smoke_calls
+        smoke_calls += 1
+        if smoke_calls == 1:
+            return False
+        assert smoke_args.sample_count == 3
+        assert smoke_args.min_successes == 3
+        assert smoke_args.authorization_policy == "if_present"
+        assert smoke_args._generated_cookie_candidate is True
+        smoke_args._smoke_attempts = 1
+        smoke_args._smoke_terminal_reason = "http_429"
+        return False
 
     monkeypatch.setattr(keeper, "smoke", fake_smoke)
-    monkeypatch.setattr(keeper, "refresh", fake_refresh)
-    monkeypatch.setattr(keeper, "html_access_smoke", lambda config, smoke_args, cookie_path, emit=True: True)
+    monkeypatch.setattr(
+        keeper,
+        "refresh",
+        lambda _config, refresh_args: (_fake_browser_candidate(refresh_args) or True),
+    )
 
     assert keeper.ensure({}, args) is False
     assert cookie_path.read_text(encoding="utf-8") == "old_cookie=1\n"
+    assert storage_state.read_text(encoding="utf-8") == '{"cookies":[]}\n'
+    state = json.loads(Path(args.state_json).read_text(encoding="utf-8"))
+    assert state["status"] == "failed"
+    assert state["production_cookie_changed"] is False
+    assert state["storage_state_changed"] is False
 
 
-def test_renew_promotes_temp_cookie_after_smoke_success(tmp_path: Path, monkeypatch) -> None:
+def test_renew_exact_three_of_three_then_atomic_promotion_with_hash_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     keeper = _load_keeper()
-    cookie_path = tmp_path / "wb_cookie.txt"
-    cookie_path.write_text("old_cookie=1\n", encoding="utf-8")
-    storage_state = tmp_path / "storage_state.json"
-    storage_state.write_text('{"cookies":[]}\n', encoding="utf-8")
+    cookie_path, storage_state, args = _browser_renew_fixture(
+        keeper, tmp_path, monkeypatch
+    )
+    old_hash = hashlib.sha256(cookie_path.read_bytes()).hexdigest()
 
-    args = argparse.Namespace(
-        cookie_file=str(cookie_path),
-        state_json=str(tmp_path / "state.json"),
-        storage_state=str(storage_state),
-        storage_state_out="",
+    monkeypatch.setattr(
+        keeper,
+        "refresh",
+        lambda _config, refresh_args: (_fake_browser_candidate(refresh_args) or True),
     )
 
-    def fake_refresh(config, refresh_args):
-        Path(refresh_args.cookie_file).write_text("new_cookie=1\n", encoding="utf-8")
-        Path(refresh_args.storage_state_out).write_text('{"cookies":[{"name":"ok"}]}\n', encoding="utf-8")
+    def fake_smoke(_config, smoke_args, emit=True):
+        assert smoke_args.sample_count == 3
+        assert smoke_args.min_successes == 3
+        assert smoke_args.authorization_policy == "if_present"
+        assert smoke_args._generated_cookie_candidate is True
+        assert smoke_args._terminal_on_access_failure is True
+        smoke_args._smoke_attempts = 3
+        smoke_args._smoke_terminal_reason = ""
+        smoke_args._authorization_evidence = {
+            "policy": "if_present",
+            "status": "not_present_allowed",
+        }
         return True
 
-    def fake_smoke(config, smoke_args, emit=True):
-        return Path(smoke_args.cookie_file).read_text(encoding="utf-8") == "new_cookie=1\n"
-
-    monkeypatch.setattr(keeper, "refresh", fake_refresh)
     monkeypatch.setattr(keeper, "smoke", fake_smoke)
-    monkeypatch.setattr(keeper, "html_access_smoke", lambda config, smoke_args, cookie_path, emit=True: True)
 
     assert keeper.renew({}, args) is True
     assert cookie_path.read_text(encoding="utf-8") == "new_cookie=1\n"
-    assert storage_state.read_text(encoding="utf-8") == '{"cookies":[{"name":"ok"}]}\n'
+    assert stat.S_IMODE(cookie_path.stat().st_mode) == 0o600
+    assert storage_state.read_text(encoding="utf-8") == '{"cookies":[]}\n'
+    backups = list((tmp_path / "state/wb_known_good").glob("wb_cookie.browser_backup_*.txt"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "old_cookie=1\n"
+    assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+    state_text = Path(args.state_json).read_text(encoding="utf-8")
+    state = json.loads(state_text)
+    assert state["status"] == "promoted"
+    assert state["api_smoke"]["successes"] == 3
+    assert state["promotion"]["previous_sha256"] == old_hash
+    assert "old_cookie=1" not in state_text
+    assert "new_cookie=1" not in state_text
 
 
-def test_renew_keeps_existing_cookie_when_html_smoke_fails(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "failure_reason",
+    ["browser_http_429", "browser_http_498", "browser_timeout"],
+)
+def test_browser_access_failure_sets_bounded_cooldown_and_skips_next_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_reason: str,
+) -> None:
     keeper = _load_keeper()
-    cookie_path = tmp_path / "wb_cookie.txt"
-    cookie_path.write_text("old_cookie=1\n", encoding="utf-8")
-    storage_state = tmp_path / "storage_state.json"
-    storage_state.write_text('{"cookies":[]}\n', encoding="utf-8")
-
-    args = argparse.Namespace(
-        cookie_file=str(cookie_path),
-        state_json=str(tmp_path / "state.json"),
-        storage_state=str(storage_state),
-        storage_state_out="",
+    cookie_path, storage_state, args = _browser_renew_fixture(
+        keeper, tmp_path, monkeypatch
     )
+    calls = 0
 
-    def fake_refresh(config, refresh_args):
-        Path(refresh_args.cookie_file).write_text("new_cookie=1\n", encoding="utf-8")
-        Path(refresh_args.storage_state_out).write_text('{"cookies":[{"name":"weak"}]}\n', encoding="utf-8")
-        return True
+    def failed_refresh(_config, refresh_args):
+        nonlocal calls
+        calls += 1
+        refresh_args._browser_failure_reason = failure_reason
+        refresh_args._browser_evidence = {
+            "status": "failed",
+            "reason": failure_reason,
+        }
+        return False
 
-    monkeypatch.setattr(keeper, "refresh", fake_refresh)
-    monkeypatch.setattr(keeper, "smoke", lambda config, smoke_args, emit=True: True)
-    monkeypatch.setattr(keeper, "html_access_smoke", lambda config, smoke_args, cookie_path, emit=True: False)
+    monkeypatch.setattr(keeper, "refresh", failed_refresh)
 
     assert keeper.renew({}, args) is False
+    assert keeper.renew({}, args) is False
+    assert calls == 1
     assert cookie_path.read_text(encoding="utf-8") == "old_cookie=1\n"
     assert storage_state.read_text(encoding="utf-8") == '{"cookies":[]}\n'
+    cooldown_path = tmp_path / keeper.BROWSER_COOLDOWN_RELATIVE_PATH
+    cooldown = json.loads(cooldown_path.read_text(encoding="utf-8"))
+    assert cooldown["status"] == "active"
+    assert cooldown["cooldown_seconds"] == keeper.BROWSER_REFRESH_COOLDOWN_SECONDS
+    assert stat.S_IMODE(cooldown_path.stat().st_mode) == 0o600
 
 
 def test_smoke_uses_fallback_urls_and_min_successes(tmp_path: Path, monkeypatch) -> None:
@@ -807,17 +995,22 @@ def test_smoke_without_proxy_fails_before_requests_call(
 
 def _refresh_args(tmp_path: Path) -> SimpleNamespace:
     return SimpleNamespace(
-        cookie_file=str(tmp_path / "wb_cookie.txt"),
+        cookie_file=str(
+            tmp_path / "state/wb_cookie_candidates/wb_cookie.browser_test.txt"
+        ),
         storage_state=str(tmp_path / "missing-storage-state.json"),
         storage_state_out=str(tmp_path / "storage-state-out.json"),
         state_json="",
         browser_channel="chrome",
+        browser_profile_dir="state/browser/wb_cookie_renewal_profile",
         no_headless=False,
-        headed=False,
+        headed=True,
         require_storage_state=False,
-        refresh_url="https://www.wildberries.ru/",
+        refresh_url="https://www.wildberries.ru/catalog/0/search.aspx?search={query}",
         timeout_ms=1000,
         wait_ms=0,
+        query="test-query",
+        _allow_candidate_write=True,
     )
 
 
@@ -826,6 +1019,8 @@ def test_refresh_without_proxy_fails_before_playwright_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     keeper = _load_keeper()
+    monkeypatch.setattr(keeper, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("DISPLAY", ":99")
     calls = 0
     sync_api = ModuleType("playwright.sync_api")
 
@@ -854,6 +1049,12 @@ def test_refresh_passes_explicit_proxy_to_browser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     keeper = _load_keeper()
+    monkeypatch.setattr(keeper, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("DISPLAY", ":99")
+    browser_parent = tmp_path / "state/browser"
+    browser_parent.mkdir(parents=True)
+    (tmp_path / "state").chmod(0o775)
+    browser_parent.chmod(0o775)
     _enable_proxy(
         monkeypatch,
         "http://user:test-only@proxy.example.test:8080",
@@ -863,7 +1064,7 @@ def test_refresh_passes_explicit_proxy_to_browser(
 
     class Chromium:
         @staticmethod
-        def launch(**kwargs):
+        def launch_persistent_context(**kwargs):
             captured.update(kwargs)
             raise RuntimeError("stop after launch contract check")
 
@@ -892,3 +1093,146 @@ def test_refresh_passes_explicit_proxy_to_browser(
         "username": "user",
         "password": "test-only",
     }
+    assert captured["channel"] == "chrome"
+    assert captured["headless"] is False
+    assert captured["user_data_dir"] == str(
+        tmp_path / "state/browser/wb_cookie_renewal_profile"
+    )
+    assert "extra_http_headers" not in captured
+    assert "user_agent" not in captured
+    assert stat.S_IMODE(
+        (tmp_path / "state/browser/wb_cookie_renewal_profile").stat().st_mode
+    ) == 0o700
+    assert stat.S_IMODE((tmp_path / "state").stat().st_mode) == 0o775
+    assert stat.S_IMODE(browser_parent.stat().st_mode) == 0o775
+
+
+def test_refresh_uses_headed_persistent_chrome_native_headers_and_wb_cookies_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keeper = _load_keeper()
+    monkeypatch.setattr(keeper, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("DISPLAY", ":99")
+    _enable_proxy(monkeypatch)
+    args = _refresh_args(tmp_path)
+    captured: dict[str, object] = {}
+    sync_api = ModuleType("playwright.sync_api")
+
+    class Response:
+        status = 200
+
+    class Page:
+        def goto(self, url, **kwargs):
+            captured["url_is_search"] = "/search.aspx?search=" in url
+            captured["goto"] = kwargs
+            return Response()
+
+        @staticmethod
+        def wait_for_timeout(value):
+            captured["wait_ms"] = value
+
+        @staticmethod
+        def title():
+            return "Search"
+
+        @staticmethod
+        def content():
+            return "<html><body>products</body></html>"
+
+    class BrowserContext:
+        pages = [Page()]
+
+        @staticmethod
+        def cookies(_urls):
+            return [
+                {"domain": ".wildberries.ru", "name": "wb", "value": "one"},
+                {"domain": ".evilwb.ru", "name": "lookalike", "value": "three"},
+                {"domain": ".example.test", "name": "outside", "value": "two"},
+            ]
+
+        @staticmethod
+        def close():
+            captured["closed"] = True
+
+    class Chromium:
+        @staticmethod
+        def launch_persistent_context(**kwargs):
+            captured["launch"] = kwargs
+            return BrowserContext()
+
+    class Playwright:
+        chromium = Chromium()
+
+    class ContextManager:
+        def __enter__(self):
+            return Playwright()
+
+        def __exit__(self, *_args):
+            return False
+
+    sync_api.sync_playwright = lambda: ContextManager()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+    assert keeper.refresh(
+        {
+            "serp": {
+                "proxy_url_env": "PARSER_WB_PROXY_URL",
+                "request_headers": {
+                    "authorization": "Bearer must-not-reach-browser",
+                    "deviceid": "must-not-reach-browser",
+                },
+            }
+        },
+        args,
+    ) is True
+
+    launch = captured["launch"]
+    assert isinstance(launch, dict)
+    assert launch["headless"] is False
+    assert launch["channel"] == "chrome"
+    assert "extra_http_headers" not in launch
+    assert "user_agent" not in launch
+    assert captured["url_is_search"] is True
+    assert Path(args.cookie_file).read_text(encoding="utf-8") == "wb=one\n"
+    assert args._browser_evidence["headers_mode"] == "browser_native"
+    assert args._browser_evidence["antibot"] is False
+    assert not Path(args.storage_state_out).exists()
+
+
+@pytest.mark.parametrize("unsafe_kind", ["outside", "symlink"])
+def test_refresh_rejects_unsafe_persistent_profile_before_browser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_kind: str,
+) -> None:
+    keeper = _load_keeper()
+    monkeypatch.setattr(keeper, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("DISPLAY", ":99")
+    _enable_proxy(monkeypatch)
+    args = _refresh_args(tmp_path)
+    if unsafe_kind == "outside":
+        args.browser_profile_dir = str(tmp_path.parent / "outside-profile")
+    else:
+        browser_parent = tmp_path / "state/browser"
+        browser_parent.mkdir(parents=True)
+        target = tmp_path / "real-profile"
+        target.mkdir()
+        (browser_parent / "wb_cookie_renewal_profile").symlink_to(target)
+    calls = 0
+    sync_api = ModuleType("playwright.sync_api")
+
+    def forbidden_playwright():
+        nonlocal calls
+        calls += 1
+        raise AssertionError("browser must not start")
+
+    sync_api.sync_playwright = forbidden_playwright  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+    with pytest.raises(keeper.AccessContractError):
+        keeper.refresh(
+            {"serp": {"proxy_url_env": "PARSER_WB_PROXY_URL"}},
+            args,
+        )
+    assert calls == 0

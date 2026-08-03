@@ -336,6 +336,36 @@ def test_nightly_preflight_enforces_if_present_authorization_horizon() -> None:
     ) in source
 
 
+def test_cookie_maintenance_uses_bounded_headed_xvfb_persistent_profile() -> None:
+    renewal = (PROJECT_ROOT / "scripts/run_wb_cookie_renewal.sh").read_text(
+        encoding="utf-8"
+    )
+    preflight = (PROJECT_ROOT / "scripts/run_wb_nightly_preflight.sh").read_text(
+        encoding="utf-8"
+    )
+    legacy = (PROJECT_ROOT / "scripts/run_products_sellers_daily.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'XVFB_RUN="/usr/bin/xvfb-run"' in renewal
+    assert 'TIMEOUT_BIN="/usr/bin/timeout"' in renewal
+    assert "BROWSER_INVOCATION_TIMEOUT_SECONDS=600" in renewal
+    assert '"$TIMEOUT_BIN" --signal=TERM --kill-after=10s' in renewal
+    assert '"$XVFB_RUN" --auto-servernum' in renewal
+    assert "--headed" in renewal
+    assert "--browser-channel chrome" in renewal
+    assert '--browser-profile-dir "$BROWSER_PROFILE_DIR"' in renewal
+    assert "--authorization-policy if_present" in renewal
+    assert 'XVFB_RUN="/usr/bin/xvfb-run"' in preflight
+    assert 'TIMEOUT_BIN="/usr/bin/timeout"' in preflight
+    assert "BROWSER_INVOCATION_TIMEOUT_SECONDS=600" in preflight
+    assert '"$TIMEOUT_BIN" --signal=TERM --kill-after=10s' in preflight
+    assert '"$XVFB_RUN" --auto-servernum' in preflight
+    assert "--headed" in preflight
+    assert '--browser-profile-dir "$BROWSER_PROFILE_DIR"' in preflight
+    assert "xvfb-run" not in legacy
+
+
 @pytest.mark.parametrize(
     "script_name",
     ["wb_cookie_keeper.py", "wb_persistent_session.py"],
@@ -385,8 +415,9 @@ def test_real_keeper_launcher_imports_then_fails_closed_before_network(
         "app/common/__init__.py",
         "app/common/durable_atomic.py",
         "app/common/exceptions.py",
-        "app/common/nightly_coordinator.py",
-        "app/common/proxy_required.py",
+            "app/common/nightly_coordinator.py",
+            "app/common/nightly_attestation.py",
+            "app/common/proxy_required.py",
         "app/common/runtime_env.py",
     ):
         source = PROJECT_ROOT / relative

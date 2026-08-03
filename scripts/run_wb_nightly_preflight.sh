@@ -12,6 +12,10 @@ RUNTIME_ENV_FILE="$PROJECT_DIR/config/runtime.env"
 RUNTIME_LOADER="$PROJECT_DIR/scripts/wb_runtime_env.sh"
 PREFLIGHT_SCRIPT="$PROJECT_DIR/scripts/wb_nightly_preflight.py"
 AUTHORIZATION_HORIZON_PLAN="$PROJECT_DIR/config/wb/collection_plans/shevron-four-regions-top1000-v2.json"
+BROWSER_PROFILE_DIR="$PROJECT_DIR/state/browser/wb_cookie_renewal_profile"
+XVFB_RUN="/usr/bin/xvfb-run"
+TIMEOUT_BIN="/usr/bin/timeout"
+BROWSER_INVOCATION_TIMEOUT_SECONDS=600
 NOTIFY_SCRIPT="$PROJECT_DIR/scripts/notify_products_sellers_daily.py"
 LOCK_FILE="$PROJECT_DIR/state/locks/wb_nightly_preflight.flock"
 PRODUCTS_SELLERS_LOCK_FILE="$PROJECT_DIR/state/locks/products_sellers_daily.flock"
@@ -64,6 +68,11 @@ if [[ ! -r "$PREFLIGHT_SCRIPT" ]]; then
   exit 2
 fi
 
+if [[ ! -x "$XVFB_RUN" || ! -x "$TIMEOUT_BIN" ]]; then
+  echo "$(date --iso-8601=seconds) headed browser runtime is unavailable"
+  exit 2
+fi
+
 if [[ ! -s "$COOKIE_FILE" ]]; then
   echo "$(date --iso-8601=seconds) WB cookie file is missing or empty: $COOKIE_FILE"
   exit 2
@@ -73,12 +82,17 @@ export WB_COOKIE_FILE="$COOKIE_FILE"
 
 echo "$(date --iso-8601=seconds) wb nightly preflight started: stamp=$RUN_STAMP"
 set +e
-"$PYTHON_BIN" "$PREFLIGHT_SCRIPT" preflight \
+"$TIMEOUT_BIN" --signal=TERM --kill-after=10s "$BROWSER_INVOCATION_TIMEOUT_SECONDS" \
+  "$XVFB_RUN" --auto-servernum --server-args="-screen 0 1365x768x24 -nolisten tcp" \
+  "$PYTHON_BIN" "$PREFLIGHT_SCRIPT" preflight \
   --config "$CONFIG_FILE" \
   --cookie-file "$COOKIE_FILE" \
   --sample-count "${PARSER_WB_PREFLIGHT_SAMPLE_COUNT:-3}" \
   --authorization-policy if_present \
   --authorization-horizon-plan-file "$AUTHORIZATION_HORIZON_PLAN" \
+  --headed \
+  --browser-channel chrome \
+  --browser-profile-dir "$BROWSER_PROFILE_DIR" \
   --page "${PARSER_WB_PREFLIGHT_PAGE:-1}" \
   --wait-ms "${PARSER_WB_PREFLIGHT_WAIT_MS:-5000}" \
   --timeout-ms "${PARSER_WB_PREFLIGHT_TIMEOUT_MS:-45000}"

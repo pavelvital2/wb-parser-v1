@@ -118,13 +118,13 @@ The wrapper executes:
 ```
 
 Before `serp`, the wrapper runs `scripts/wb_cookie_keeper.py ensure`. The
-keeper checks the current WB cookie with a smoke SERP request and, if the smoke
-check fails, tries to refresh `config/wb_cookie.txt` through
-Playwright/browser cookies without printing cookie values. Use
-`PARSER_WB_KEEPER_DISABLED=1` to skip this check,
-`PARSER_WB_STORAGE_STATE_FILE`/`WB_STORAGE_STATE_FILE` to point to a Playwright
-`storage_state`, and `PARSER_WB_KEEPER_SAMPLE_COUNT` to control how many
-queries are smoke-checked. The wrapper default is `3`. Smoke accepts configured
+keeper checks the current WB cookie with a smoke SERP request. The retired
+legacy wrapper remains byte-compatible and is not the automatic browser-renewal
+entrypoint; bounded headed renewal belongs to the official lock-v3 maintenance
+and preflight wrappers described below. Use
+`PARSER_WB_KEEPER_DISABLED=1` to skip this check and
+`PARSER_WB_KEEPER_SAMPLE_COUNT` to control how many queries are smoke-checked.
+The wrapper default is `3`. Smoke accepts configured
 SERP fallback endpoints and uses `serp.smoke_min_successes`; production config
 requires at least 2 successful smoke queries out of the default 3-query sample.
 This tolerates one temporary failed smoke but blocks a full SERP when 2 of 3
@@ -140,9 +140,18 @@ The user's crontab contains a separate WB cookie/access maintenance job every
 Current direct-3proxy steady state uses `scripts/wb_cookie_keeper.py ensure` by
 default through `PARSER_WB_COOKIE_RENEW_COMMAND=ensure` in ignored
 `config/runtime.env`. This checks the current `config/wb_cookie.txt` with the
-same SERP/API smoke gate and only attempts browser refresh if smoke fails. A
-temporary refreshed cookie is promoted only after smoke and HTML anti-bot gates
-pass; otherwise the existing cookie file is left unchanged.
+same SERP/API smoke gate and only attempts browser refresh if smoke fails. The
+refresh is a headed system-Chrome invocation under Xvfb and lock-v3 with a
+10-minute outer hard cap,
+using an ignored mode-`700` persistent profile and the required proxy. Chrome
+uses browser-native headers; parser API headers/Authorization and Playwright
+`storage_state` are not injected. A WB-only cookie candidate is promoted only
+after browser HTTP-200/non-antibot validation and proxy-only exact `3/3` API
+smoke with `authorization-policy=if_present` and the reviewed plan horizon.
+Promotion is atomic to mode `600` with a hash-proven ignored backup. Browser or
+candidate API `429`/`498`, or browser timeout, leaves production unchanged and
+sets a 30-minute refresh cooldown. The implementation is offline-tested but is
+not live-proven until a separately authorized smoke succeeds.
 
 Detailed WB access/cookie repair rules are in `docs/WB_ACCESS_COOKIE_RUNBOOK.md`.
 Use that runbook before changing proxy/cookie/header runtime or processing a new

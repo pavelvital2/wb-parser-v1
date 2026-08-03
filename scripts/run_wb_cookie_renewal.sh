@@ -11,6 +11,11 @@ COOKIE_FILE="$PROJECT_DIR/config/wb_cookie.txt"
 RUNTIME_ENV_FILE="$PROJECT_DIR/config/runtime.env"
 RUNTIME_LOADER="$PROJECT_DIR/scripts/wb_runtime_env.sh"
 KEEPER_SCRIPT="$PROJECT_DIR/scripts/wb_cookie_keeper.py"
+AUTHORIZATION_HORIZON_PLAN="$PROJECT_DIR/config/wb/collection_plans/shevron-four-regions-top1000-v2.json"
+BROWSER_PROFILE_DIR="$PROJECT_DIR/state/browser/wb_cookie_renewal_profile"
+XVFB_RUN="/usr/bin/xvfb-run"
+TIMEOUT_BIN="/usr/bin/timeout"
+BROWSER_INVOCATION_TIMEOUT_SECONDS=600
 LOCK_FILE="$PROJECT_DIR/state/locks/wb_cookie_renewal.flock"
 PRODUCTS_SELLERS_LOCK_FILE="$PROJECT_DIR/state/locks/products_sellers_daily.flock"
 LOG_FILE="$PROJECT_DIR/data/logs/wb_cookie_renewal.log"
@@ -60,6 +65,11 @@ if [[ ! -r "$KEEPER_SCRIPT" ]]; then
   exit 2
 fi
 
+if [[ ! -x "$XVFB_RUN" || ! -x "$TIMEOUT_BIN" ]]; then
+  echo "$(date --iso-8601=seconds) headed browser runtime is unavailable"
+  exit 2
+fi
+
 if [[ ! -s "$COOKIE_FILE" && "${PARSER_WB_COOKIE_REQUIRED:-1}" != "0" ]]; then
   echo "$(date --iso-8601=seconds) WB cookie file is missing or empty: $COOKIE_FILE"
   exit 2
@@ -68,14 +78,23 @@ fi
 export WB_COOKIE_FILE="$COOKIE_FILE"
 
 echo "$(date --iso-8601=seconds) wb cookie renewal started"
-"$PYTHON_BIN" "$KEEPER_SCRIPT" "${PARSER_WB_COOKIE_RENEW_COMMAND:-ensure}" \
+set +e
+"$TIMEOUT_BIN" --signal=TERM --kill-after=10s "$BROWSER_INVOCATION_TIMEOUT_SECONDS" \
+  "$XVFB_RUN" --auto-servernum --server-args="-screen 0 1365x768x24 -nolisten tcp" \
+  "$PYTHON_BIN" "$KEEPER_SCRIPT" "${PARSER_WB_COOKIE_RENEW_COMMAND:-ensure}" \
   --config "$CONFIG_FILE" \
   --cookie-file "$COOKIE_FILE" \
   --sample-count "${PARSER_WB_COOKIE_RENEW_SAMPLE_COUNT:-1}" \
   --page "${PARSER_WB_COOKIE_RENEW_PAGE:-1}" \
+  --headed \
+  --browser-channel chrome \
+  --browser-profile-dir "$BROWSER_PROFILE_DIR" \
+  --authorization-policy if_present \
+  --authorization-horizon-plan-file "$AUTHORIZATION_HORIZON_PLAN" \
   --wait-ms "${PARSER_WB_COOKIE_RENEW_WAIT_MS:-5000}" \
   --timeout-ms "${PARSER_WB_COOKIE_RENEW_TIMEOUT_MS:-45000}"
 status=$?
+set -e
 if [[ "$status" -ne 0 && "${PARSER_WB_COOKIELESS_FALLBACK_OK:-0}" == "1" ]]; then
   echo "$(date --iso-8601=seconds) wb cookie renewal failed; checking cookie-less fallback channel"
   if "$PYTHON_BIN" "$KEEPER_SCRIPT" smoke \

@@ -377,10 +377,20 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   with output appended to `data/logs/wb_cookie_renewal.log`. Current direct
   3proxy runtime uses `PARSER_WB_COOKIE_RENEW_COMMAND=ensure`, so the wrapper
   validates the current cookie with SERP/API smoke first and only attempts
-  browser refresh if smoke fails. A refreshed temporary cookie is promoted only
-  after smoke and HTML anti-bot gates pass; otherwise the existing
-  `config/wb_cookie.txt` is left unchanged. This prevents the currently blocked
-  Playwright browser path from overwriting a working API cookie/header contour.
+  browser refresh if smoke fails. The refresh is a bounded one-shot headed
+  system-Chrome invocation under Xvfb and the existing lock-v3 lease. It reuses
+  only the ignored mode-`700` profile
+  `state/browser/wb_cookie_renewal_profile`, opens a real WB search page through
+  the required proxy and lets Chrome form its own headers. Parser API headers,
+  Authorization and Playwright `storage_state` are not injected into that
+  browser context. A browser cookie candidate remains isolated until the page
+  is HTTP 200/non-antibot and the candidate passes proxy-only exact `3/3` API
+  smoke with `authorization-policy=if_present` and the reviewed plan horizon.
+  Promotion is durable/atomic to mode `600` and preserves a hash-proven ignored
+  backup; failures leave the production cookie unchanged. Browser/API
+  `429`/`498` or browser timeout sets a bounded 30-minute refresh cooldown.
+  This workflow is covered by offline tests; do not claim autonomous live
+  renewal until an owner-authorized smoke confirms it.
   If renewal fails but `PARSER_WB_COOKIELESS_FALLBACK_OK=1`, the wrapper checks
   `wb_cookie_keeper.py smoke --without-cookie`; if that smoke passes, the
   collection channel is considered alive and the cookie file is left unchanged.

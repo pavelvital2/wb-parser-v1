@@ -257,6 +257,7 @@ def preflight(config: dict[str, Any], args: argparse.Namespace) -> int:
             storage_state_out=args.storage_state_out,
             require_storage_state=args.require_storage_state,
             browser_channel=args.browser_channel,
+            browser_profile_dir=args.browser_profile_dir,
             headed=args.headed,
             no_headless=args.no_headless,
             refresh_url=args.refresh_url,
@@ -297,11 +298,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-successes", type=int, default=0)
     parser.add_argument("--page", type=int, default=1)
     parser.add_argument("--no-refresh", action="store_true")
-    parser.add_argument("--refresh-url", default="https://www.wildberries.ru/")
+    parser.add_argument(
+        "--refresh-url",
+        default="https://www.wildberries.ru/catalog/0/search.aspx?search={query}",
+    )
     parser.add_argument("--storage-state", default="")
     parser.add_argument("--storage-state-out", default="")
     parser.add_argument("--require-storage-state", action="store_true")
     parser.add_argument("--browser-channel", default="")
+    parser.add_argument(
+        "--browser-profile-dir",
+        default=keeper.BROWSER_PROFILE_RELATIVE_PATH.as_posix(),
+    )
     parser.add_argument("--headed", action="store_true")
     parser.add_argument("--no-headless", action="store_true")
     parser.add_argument("--wait-ms", type=int, default=5000)
