@@ -2,15 +2,20 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hashlib
 import json
 import os
+import re
 import stat
 import sys
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 import yaml
@@ -32,6 +37,91 @@ EXIT_REFRESH_FAILED = 21
 COORDINATOR_LOCK_DIRECTORY = Path("/run/lock/parser-nightly-coordinator")
 
 OK_KINDS = {"top_products", "nested_products", "nested_promo_products"}
+AUTHORIZATION_POLICIES = {"optional", "required"}
+DEFAULT_AUTHORIZATION_HORIZON_PLAN = (
+    "config/wb/collection_plans/shevron-four-regions-top1000-v2.json"
+)
+MAX_PINNED_SECRET_BYTES = 1024 * 1024
+MSK = ZoneInfo("Europe/Moscow")
+
+
+class AccessContractError(RuntimeError):
+    def __init__(self, code: str, *, evidence: dict[str, Any] | None = None) -> None:
+        self.code = code
+        self.evidence = dict(evidence or {})
+        super().__init__(code)
+
+
+class PinnedFile:
+    def __init__(
+        self,
+        *,
+        path: Path,
+        fd: int,
+        payload: bytes,
+        relative_path: str,
+        exact_mode: int,
+    ) -> None:
+        self.path = path
+        self.fd = fd
+        self.payload = payload
+        self.relative_path = relative_path
+        self.exact_mode = exact_mode
+        self.sha256 = hashlib.sha256(payload).hexdigest()
+        self._identity = self._stat_identity(os.fstat(fd))
+
+    @staticmethod
+    def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_uid,
+            stat.S_IMODE(info.st_mode),
+            info.st_nlink,
+            info.st_size,
+        )
+
+    def verify(self) -> None:
+        try:
+            before = os.fstat(self.fd)
+            payload = os.pread(self.fd, len(self.payload) + 1, 0)
+            after = os.fstat(self.fd)
+            current = os.lstat(self.path)
+        except OSError as exc:
+            raise AccessContractError("access_source_changed") from exc
+        if (
+            self._stat_identity(before) != self._identity
+            or self._stat_identity(after) != self._identity
+            or self._stat_identity(current) != self._identity
+            or payload != self.payload
+            or hashlib.sha256(payload).hexdigest() != self.sha256
+        ):
+            raise AccessContractError("access_source_changed")
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
+class RequestHeadersSource:
+    def __init__(self, *, pinned: PinnedFile, headers: dict[str, str], source_kind: str) -> None:
+        self.pinned = pinned
+        self.headers = headers
+        self.source_kind = source_kind
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "source": self.source_kind,
+            "sha256": self.pinned.sha256,
+            "headers_count": len(self.headers),
+        }
+
+    def verify(self) -> None:
+        self.pinned.verify()
+
+    def close(self) -> None:
+        self.pinned.close()
 
 
 def _require_host_lease_after_cutover() -> None:
@@ -55,12 +145,13 @@ def resolve_path(value: str | Path, *, root: Path = PROJECT_ROOT) -> Path:
     return path
 
 
-def load_config(config_path: Path) -> dict[str, Any]:
+def load_config(config_path: Path, *, inject_request_headers: bool = True) -> dict[str, Any]:
     with config_path.open("r", encoding="utf-8-sig") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
         raise RuntimeError("config is not a YAML object")
-    inject_runtime_request_headers(data, config_path.parent.parent)
+    if inject_request_headers:
+        inject_runtime_request_headers(data, config_path.parent.parent)
     return data
 
 
@@ -146,6 +237,378 @@ def request_headers_from_config(config: dict[str, Any]) -> dict[str, str]:
     return _coerce_request_headers(serp.get("request_headers"))
 
 
+def _project_lexical_path(value: str | Path, *, project_root: Path) -> Path:
+    path = Path(value)
+    if ".." in path.parts:
+        raise AccessContractError("access_source_path_traversal")
+    if not path.is_absolute():
+        path = project_root / path
+    lexical = Path(os.path.abspath(os.fspath(path)))
+    try:
+        lexical.relative_to(project_root)
+    except ValueError as exc:
+        raise AccessContractError("access_source_outside_project") from exc
+    return lexical
+
+
+def _reject_symlink_components(project_root: Path, path: Path) -> None:
+    relative = path.relative_to(project_root)
+    current = project_root
+    for part in relative.parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            raise AccessContractError("access_source_unavailable") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise AccessContractError("access_source_symlink")
+        if current != path and not stat.S_ISDIR(info.st_mode):
+            raise AccessContractError("access_source_parent_unsafe")
+
+
+def _open_pinned_file(
+    value: str | Path,
+    *,
+    project_root: Path,
+    allowed_root: Path,
+    exact_mode: int,
+) -> PinnedFile:
+    root = Path(os.path.abspath(os.fspath(project_root)))
+    path = _project_lexical_path(value, project_root=root)
+    allowed = Path(os.path.abspath(os.fspath(allowed_root)))
+    try:
+        path.relative_to(allowed)
+    except ValueError as exc:
+        raise AccessContractError("access_source_scope_invalid") from exc
+    _reject_symlink_components(root, path)
+
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise AccessContractError("access_source_unavailable") from exc
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != exact_mode
+            or info.st_nlink != 1
+            or info.st_size <= 0
+            or info.st_size > MAX_PINNED_SECRET_BYTES
+        ):
+            raise AccessContractError("access_source_metadata_unsafe")
+        payload = os.pread(fd, info.st_size + 1, 0)
+        if len(payload) != info.st_size:
+            raise AccessContractError("access_source_changed")
+        pinned = PinnedFile(
+            path=path,
+            fd=fd,
+            payload=payload,
+            relative_path=path.relative_to(root).as_posix(),
+            exact_mode=exact_mode,
+        )
+        pinned.verify()
+        return pinned
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise AccessContractError("request_headers_json_duplicate_key")
+        result[key] = value
+    return result
+
+
+def _parse_request_headers(payload: bytes) -> dict[str, str]:
+    try:
+        decoded = payload.decode("utf-8")
+        document = json.loads(decoded, object_pairs_hook=_json_object_without_duplicates)
+    except AccessContractError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AccessContractError("request_headers_json_invalid") from exc
+    if isinstance(document, dict) and isinstance(document.get("headers"), dict):
+        document = document["headers"]
+    if not isinstance(document, dict) or not document or len(document) > 128:
+        raise AccessContractError("request_headers_schema_invalid")
+
+    headers: dict[str, str] = {}
+    normalized_names: set[str] = set()
+    for name, value in document.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise AccessContractError("request_headers_schema_invalid")
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+            raise AccessContractError("request_headers_name_invalid")
+        normalized = name.lower()
+        if normalized in normalized_names or normalized == "cookie":
+            raise AccessContractError("request_headers_name_invalid")
+        if not value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise AccessContractError("request_headers_value_invalid")
+        normalized_names.add(normalized)
+        headers[name] = value
+    return headers
+
+
+def _configured_request_headers_path(config: dict[str, Any]) -> str:
+    serp = config.get("serp") if isinstance(config.get("serp"), dict) else {}
+    env_name = str(serp.get("request_headers_file_env") or "PARSER_WB_REQUEST_HEADERS_FILE").strip()
+    env_value = os.getenv(env_name, "").strip() if env_name else ""
+    return env_value or str(serp.get("request_headers_file") or "").strip()
+
+
+def load_request_headers_source(
+    config: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    project_root: Path | None = None,
+) -> RequestHeadersSource | None:
+    root = Path(project_root or PROJECT_ROOT)
+    explicit = str(getattr(args, "request_headers_file", "") or "").strip()
+    policy = str(getattr(args, "authorization_policy", "optional") or "optional").strip()
+    if policy not in AUTHORIZATION_POLICIES:
+        raise AccessContractError("authorization_policy_invalid")
+    if explicit:
+        if policy != "required":
+            raise AccessContractError("candidate_headers_require_authorization")
+        source_value = explicit
+        allowed_root = root / "state/wb_header_candidates"
+        source_kind = "candidate"
+    elif policy == "required":
+        source_value = _configured_request_headers_path(config)
+        if not source_value:
+            raise AccessContractError("request_headers_source_missing")
+        path = _project_lexical_path(source_value, project_root=root)
+        expected = root / "config/wb_request_headers.json"
+        if path != expected:
+            raise AccessContractError("request_headers_source_not_approved")
+        allowed_root = root / "config"
+        source_kind = "production"
+    else:
+        return None
+
+    pinned = _open_pinned_file(
+        source_value,
+        project_root=root,
+        allowed_root=allowed_root,
+        exact_mode=0o600,
+    )
+    try:
+        return RequestHeadersSource(
+            pinned=pinned,
+            headers=_parse_request_headers(pinned.payload),
+            source_kind=source_kind,
+        )
+    except Exception:
+        pinned.close()
+        raise
+
+
+def _authorization_header(headers: dict[str, str]) -> str:
+    matches = [value for name, value in headers.items() if name.lower() == "authorization"]
+    if len(matches) > 1:
+        raise AccessContractError("authorization_header_ambiguous")
+    return matches[0] if matches else ""
+
+
+def _decode_jwt_payload(token: str) -> dict[str, Any]:
+    segments = token.split(".")
+    if len(segments) != 3 or any(not segment for segment in segments):
+        raise AccessContractError("authorization_not_jwt")
+    encoded = segments[1]
+    padding = "=" * (-len(encoded) % 4)
+    try:
+        payload = base64.b64decode(
+            (encoded + padding).encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        if len(payload) > 16 * 1024:
+            raise AccessContractError("authorization_claims_invalid")
+        document = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_json_object_without_duplicates,
+        )
+    except AccessContractError as exc:
+        raise AccessContractError("authorization_claims_invalid") from exc
+    except (UnicodeEncodeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError) as exc:
+        raise AccessContractError("authorization_claims_invalid") from exc
+    if not isinstance(document, dict):
+        raise AccessContractError("authorization_claims_invalid")
+    return document
+
+
+def _jwt_timestamp(claims: dict[str, Any], name: str) -> int:
+    value = claims.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 253402300799:
+        raise AccessContractError(f"authorization_{name}_invalid")
+    return value
+
+
+def _timestamp_iso(value: int) -> str:
+    return datetime.fromtimestamp(value, tz=timezone.utc).replace(microsecond=0).isoformat()
+
+
+def authorization_horizon_from_plan(
+    plan_file: str,
+    *,
+    now_utc: datetime,
+    project_root: Path | None = None,
+) -> tuple[datetime, dict[str, Any]]:
+    from app.serp.collection_plan import load_collection_plan
+
+    root = Path(project_root or PROJECT_ROOT)
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        raise AccessContractError("authorization_clock_invalid")
+    pinned = _open_pinned_file(
+        plan_file,
+        project_root=root,
+        allowed_root=root / "config/wb/collection_plans",
+        exact_mode=0o644,
+    )
+    try:
+        plan = load_collection_plan(pinned.path)
+        pinned.verify()
+        if plan.source_sha256 != pinned.sha256 or not plan.enabled or plan.runtime_window is None:
+            raise AccessContractError("authorization_horizon_plan_invalid")
+        window = plan.runtime_window
+        scheduled_hour, scheduled_minute = (int(part) for part in window.scheduled_start_msk.split(":", 1))
+        cutoff_hour, cutoff_minute = (int(part) for part in window.absolute_cutoff_msk.split(":", 1))
+        local_now = now_utc.astimezone(MSK)
+        scheduled_today = datetime.combine(
+            local_now.date(),
+            time(scheduled_hour, scheduled_minute),
+            tzinfo=MSK,
+        )
+        cutoff_today = datetime.combine(
+            local_now.date(),
+            time(cutoff_hour, cutoff_minute),
+            tzinfo=MSK,
+        )
+        horizon_date: date = local_now.date()
+        if local_now >= cutoff_today:
+            horizon_date += timedelta(days=1)
+        elif local_now >= scheduled_today:
+            horizon_date = local_now.date()
+        horizon = datetime.combine(
+            horizon_date,
+            time(cutoff_hour, cutoff_minute),
+            tzinfo=MSK,
+        ).astimezone(timezone.utc)
+        return horizon, {
+            "horizon_source": "collection_plan_runtime_window",
+            "plan_sha256": pinned.sha256,
+            "required_until_utc": horizon.replace(microsecond=0).isoformat(),
+        }
+    finally:
+        pinned.close()
+
+
+def validate_authorization_temporal_contract(
+    headers: dict[str, str],
+    *,
+    policy: str,
+    now_utc: datetime,
+    required_until_utc: datetime | None,
+    source_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if policy not in AUTHORIZATION_POLICIES:
+        raise AccessContractError("authorization_policy_invalid")
+    evidence: dict[str, Any] = {
+        "policy": policy,
+        "status": "invalid",
+        "source": dict(source_evidence or {}),
+    }
+    authorization = _authorization_header(headers)
+    if policy == "optional":
+        evidence["status"] = "present_not_validated_optional" if authorization else "not_present_optional"
+        return evidence
+    if not authorization:
+        raise AccessContractError("authorization_missing", evidence=evidence)
+    scheme, separator, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or separator != " " or not token or token != token.strip():
+        raise AccessContractError("authorization_bearer_invalid", evidence=evidence)
+    try:
+        claims = _decode_jwt_payload(token)
+        iat = _jwt_timestamp(claims, "iat")
+        nbf = _jwt_timestamp(claims, "nbf")
+        exp = _jwt_timestamp(claims, "exp")
+    except AccessContractError as exc:
+        raise AccessContractError(exc.code, evidence=evidence) from exc
+    if iat >= exp or nbf >= exp:
+        raise AccessContractError("authorization_claim_order_invalid", evidence=evidence)
+
+    now = now_utc.astimezone(timezone.utc).replace(microsecond=0)
+    now_timestamp = int(now.timestamp())
+    evidence.update(
+        {
+            "iat_utc": _timestamp_iso(iat),
+            "nbf_utc": _timestamp_iso(nbf),
+            "exp_utc": _timestamp_iso(exp),
+            "ttl_seconds": exp - now_timestamp,
+            "required_until_utc": (
+                required_until_utc.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+                if required_until_utc is not None
+                else None
+            ),
+        }
+    )
+    if now_timestamp < nbf:
+        raise AccessContractError("authorization_not_yet_valid", evidence=evidence)
+    if now_timestamp < iat:
+        raise AccessContractError("authorization_iat_in_future", evidence=evidence)
+    if now_timestamp >= exp:
+        raise AccessContractError("authorization_expired", evidence=evidence)
+    if required_until_utc is not None:
+        required_timestamp = int(required_until_utc.astimezone(timezone.utc).timestamp())
+        if exp <= required_timestamp:
+            raise AccessContractError("authorization_horizon_not_covered", evidence=evidence)
+    evidence["status"] = "valid"
+    return evidence
+
+
+def authorization_contract_for_smoke(
+    headers: dict[str, str],
+    source: RequestHeadersSource | None,
+    args: argparse.Namespace,
+    *,
+    now_utc: datetime | None = None,
+    project_root: Path | None = None,
+) -> dict[str, Any]:
+    policy = str(getattr(args, "authorization_policy", "optional") or "optional").strip()
+    explicit_candidate = bool(str(getattr(args, "request_headers_file", "") or "").strip())
+    if explicit_candidate:
+        policy = "required"
+    required_until: datetime | None = None
+    horizon_evidence: dict[str, Any] = {}
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if policy == "required":
+        horizon_plan = str(
+            getattr(args, "authorization_horizon_plan_file", "")
+            or DEFAULT_AUTHORIZATION_HORIZON_PLAN
+        ).strip()
+        required_until, horizon_evidence = authorization_horizon_from_plan(
+            horizon_plan,
+            now_utc=now,
+            project_root=project_root,
+        )
+    source_evidence = source.evidence() if source is not None else {"source": "inline_config"}
+    source_evidence.update(horizon_evidence)
+    return validate_authorization_temporal_contract(
+        headers,
+        policy=policy,
+        now_utc=now,
+        required_until_utc=required_until,
+        source_evidence=source_evidence,
+    )
+
+
 def playwright_proxy_config(proxy_url: str) -> dict[str, str]:
     return proxy_route_from_url(proxy_url, browser=True).playwright_proxy()
 
@@ -205,6 +668,27 @@ def read_cookie_value_for_smoke(config: dict[str, Any], args: argparse.Namespace
         if cookie_required(config):
             raise
         return ""
+
+
+def load_candidate_cookie_source(
+    args: argparse.Namespace,
+    *,
+    project_root: Path | None = None,
+) -> PinnedFile | None:
+    if not str(getattr(args, "request_headers_file", "") or "").strip():
+        return None
+    if getattr(args, "without_cookie", False):
+        return None
+    cookie_file = str(getattr(args, "cookie_file", "") or "").strip()
+    if not cookie_file:
+        raise AccessContractError("candidate_cookie_missing")
+    root = Path(project_root or PROJECT_ROOT)
+    return _open_pinned_file(
+        cookie_file,
+        project_root=root,
+        allowed_root=root / "state/wb_cookie_candidates",
+        exact_mode=0o600,
+    )
 
 
 def write_cookie_value(cookie_path: Path, cookie_value: str) -> None:
@@ -273,117 +757,167 @@ def write_state(path_value: str, data: dict[str, Any]) -> None:
 
 
 def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True) -> bool:
-    # Validate the marketplace route once, outside the per-endpoint error
-    # handling, so a missing proxy cannot be mistaken for a failed smoke.
-    require_marketplace_proxy(config)
-    serp = config.get("serp") if isinstance(config.get("serp"), dict) else {}
-    cookie_path = resolve_cookie_path(config, args.cookie_file)
-    cookie_value = read_cookie_value_for_smoke(config, args, cookie_path)
-    queries = load_queries(config, args.query, max(1, int(args.sample_count)))
-    page = int(args.page)
-    base_urls = resolve_serp_base_urls(config)
-    min_successes = resolve_smoke_min_successes(config, args, len(queries))
-
-    headers = {
-        "user-agent": str(serp.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
-        "x-requested-with": str(serp.get("x_requested_with") or "XMLHttpRequest"),
-        "accept": "application/json, text/plain, */*",
-    }
-    headers.update(request_headers_from_config(config))
-    if cookie_value:
-        headers["cookie"] = cookie_value
-    referer_base = str(serp.get("referer_base") or "https://www.wildberries.ru/catalog/0/search.aspx?search=")
-    request_params = serp.get("request_params") if isinstance(serp.get("request_params"), dict) else {}
-    timeout = int(config.get("runtime", {}).get("http_timeout_seconds", 45))
-    results: list[dict[str, Any]] = []
-    successes = 0
-    for query in queries:
-        params = dict(request_params)
-        params["query"] = query
-        params["page"] = str(page)
-        req_headers = dict(headers)
-        req_headers["referer"] = f"{referer_base}{quote(query)}"
-
-        result: dict[str, Any] | None = None
-        query_ok = False
-        for base_url in base_urls:
-            result = {
-                "query": query,
-                "page": page,
-                "endpoint": base_url,
-                "checked_at_utc": utc_now_iso(),
-            }
+    source: RequestHeadersSource | None = None
+    candidate_cookie: PinnedFile | None = None
+    try:
+        source = load_request_headers_source(config, args)
+        candidate_cookie = load_candidate_cookie_source(args)
+        serp = config.get("serp") if isinstance(config.get("serp"), dict) else {}
+        cookie_path = resolve_cookie_path(config, args.cookie_file)
+        if candidate_cookie is not None:
+            candidate_cookie.verify()
             try:
-                response = marketplace_get(
-                    config,
-                    base_url,
-                    params=params,
-                    headers=req_headers,
-                    timeout=timeout,
-                )
-                result["http_status"] = response.status_code
-                if response.status_code != 200:
-                    result["kind"] = "http_error"
-                    result["products_count"] = 0
-                    result["sample"] = response.text[:120].replace("\n", " ")
-                else:
-                    try:
-                        payload = response.json()
-                    except Exception as exc:
-                        result["kind"] = "json_decode_failed"
+                cookie_value = candidate_cookie.payload.decode("utf-8").strip()
+            except UnicodeDecodeError as exc:
+                raise AccessContractError("candidate_cookie_invalid") from exc
+            if not cookie_value or "\n" in cookie_value or "\r" in cookie_value:
+                raise AccessContractError("candidate_cookie_invalid")
+        else:
+            cookie_value = read_cookie_value_for_smoke(config, args, cookie_path)
+        queries = load_queries(config, args.query, max(1, int(args.sample_count)))
+        page = int(args.page)
+        base_urls = resolve_serp_base_urls(config)
+        min_successes = resolve_smoke_min_successes(config, args, len(queries))
+        if str(getattr(args, "request_headers_file", "") or "").strip() and (
+            str(getattr(args, "query", "") or "").strip()
+            or int(args.sample_count) != 3
+            or int(args.min_successes) != 3
+            or len(queries) != 3
+            or min_successes != 3
+        ):
+            raise AccessContractError("candidate_smoke_requires_exact_3_of_3")
+
+        headers = {
+            "user-agent": str(serp.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
+            "x-requested-with": str(serp.get("x_requested_with") or "XMLHttpRequest"),
+            "accept": "application/json, text/plain, */*",
+        }
+        headers.update(source.headers if source is not None else request_headers_from_config(config))
+        authorization_evidence = authorization_contract_for_smoke(headers, source, args)
+        setattr(args, "_authorization_evidence", authorization_evidence)
+        # Route validation remains before every marketplace request. Temporal
+        # authorization validation intentionally happens first, while offline.
+        require_marketplace_proxy(config)
+        if cookie_value:
+            headers["cookie"] = cookie_value
+        referer_base = str(
+            serp.get("referer_base")
+            or "https://www.wildberries.ru/catalog/0/search.aspx?search="
+        )
+        request_params = serp.get("request_params") if isinstance(serp.get("request_params"), dict) else {}
+        timeout = int(config.get("runtime", {}).get("http_timeout_seconds", 45))
+        results: list[dict[str, Any]] = []
+        successes = 0
+        for query in queries:
+            params = dict(request_params)
+            params["query"] = query
+            params["page"] = str(page)
+            req_headers = dict(headers)
+            req_headers["referer"] = f"{referer_base}{quote(query)}"
+
+            result: dict[str, Any] | None = None
+            query_ok = False
+            for base_url in base_urls:
+                result = {
+                    "query": query,
+                    "page": page,
+                    "endpoint": base_url,
+                    "checked_at_utc": utc_now_iso(),
+                }
+                try:
+                    if source is not None:
+                        source.verify()
+                    if candidate_cookie is not None:
+                        candidate_cookie.verify()
+                    response = marketplace_get(
+                        config,
+                        base_url,
+                        params=params,
+                        headers=req_headers,
+                        timeout=timeout,
+                    )
+                    result["http_status"] = response.status_code
+                    if response.status_code != 200:
+                        result["kind"] = "http_error"
                         result["products_count"] = 0
-                        result["sample"] = exc.__class__.__name__
+                        result["sample"] = response.text[:120].replace("\n", " ")
                     else:
-                        kind, count, sample = classify_payload(payload)
-                        result["kind"] = kind
-                        result["products_count"] = count
-                        result["sample"] = sample
-                        if kind in OK_KINDS:
-                            query_ok = True
-                            break
-            except Exception as exc:
-                result["http_status"] = 0
-                result["kind"] = "request_failed"
-                result["products_count"] = 0
-                result["sample"] = exc.__class__.__name__
+                        try:
+                            payload = response.json()
+                        except Exception as exc:
+                            result["kind"] = "json_decode_failed"
+                            result["products_count"] = 0
+                            result["sample"] = exc.__class__.__name__
+                        else:
+                            kind, count, sample = classify_payload(payload)
+                            result["kind"] = kind
+                            result["products_count"] = count
+                            result["sample"] = sample
+                            if kind in OK_KINDS:
+                                query_ok = True
+                                break
+                except AccessContractError:
+                    raise
+                except Exception as exc:
+                    result["http_status"] = 0
+                    result["kind"] = "request_failed"
+                    result["products_count"] = 0
+                    result["sample"] = exc.__class__.__name__
 
-        if query_ok:
-            successes += 1
-        if result is None:
-            result = {
-                "query": query,
-                "page": page,
-                "endpoint": "",
+            if query_ok:
+                successes += 1
+            if result is None:
+                result = {
+                    "query": query,
+                    "page": page,
+                    "endpoint": "",
+                    "checked_at_utc": utc_now_iso(),
+                    "http_status": 0,
+                    "kind": "request_failed",
+                    "products_count": 0,
+                    "sample": "no endpoint checked",
+                }
+            results.append(result)
+            if emit:
+                print(
+                    "smoke",
+                    f"query={query!r}",
+                    f"page={page}",
+                    f"http={result.get('http_status')}",
+                    f"kind={result.get('kind')}",
+                    f"products={result.get('products_count')}",
+                    f"sample={result.get('sample')}",
+                )
+
+        ok = successes >= min_successes
+        if source is not None:
+            source.verify()
+        if candidate_cookie is not None:
+            candidate_cookie.verify()
+        write_state(
+            args.state_json,
+            {
+                "status": "ok" if ok else "failed",
                 "checked_at_utc": utc_now_iso(),
-                "http_status": 0,
-                "kind": "request_failed",
-                "products_count": 0,
-                "sample": "no endpoint checked",
-            }
-        results.append(result)
-        if emit:
-            print(
-                "smoke",
-                f"query={query!r}",
-                f"page={page}",
-                f"http={result.get('http_status')}",
-                f"kind={result.get('kind')}",
-                f"products={result.get('products_count')}",
-                f"sample={result.get('sample')}",
-            )
-
-    ok = successes >= min_successes
-    write_state(
-        args.state_json,
-        {
-            "status": "ok" if ok else "failed",
-            "checked_at_utc": utc_now_iso(),
-            "min_successes": min_successes,
-            "successes": successes,
-            "results": results,
-        },
-    )
-    return ok
+                "min_successes": min_successes,
+                "successes": successes,
+                "authorization": authorization_evidence,
+                "candidate_cookie": (
+                    {
+                        "sha256": candidate_cookie.sha256,
+                    }
+                    if candidate_cookie is not None
+                    else None
+                ),
+                "results": results,
+            },
+        )
+        return ok
+    finally:
+        if source is not None:
+            source.close()
+        if candidate_cookie is not None:
+            candidate_cookie.close()
 
 
 def html_access_smoke(config: dict[str, Any], args: argparse.Namespace, cookie_path: Path, *, emit: bool = True) -> bool:
@@ -609,6 +1143,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wait-ms", type=int, default=3000)
     parser.add_argument("--timeout-ms", type=int, default=45000)
     parser.add_argument("--without-cookie", action="store_true")
+    parser.add_argument("--request-headers-file", default="")
+    parser.add_argument(
+        "--authorization-policy",
+        choices=sorted(AUTHORIZATION_POLICIES),
+        default="optional",
+    )
+    parser.add_argument(
+        "--authorization-horizon-plan-file",
+        default=DEFAULT_AUTHORIZATION_HORIZON_PLAN,
+    )
     return parser
 
 
@@ -616,7 +1160,13 @@ def main(argv: list[str] | None = None) -> int:
     _require_host_lease_after_cutover()
     args = build_parser().parse_args(argv)
     config_path = resolve_path(args.config)
-    config = load_config(config_path)
+    if args.request_headers_file and args.command != "smoke":
+        print("candidate request headers are supported only by smoke", file=sys.stderr)
+        return EXIT_SMOKE_FAILED
+    config = load_config(
+        config_path,
+        inject_request_headers=not bool(args.request_headers_file),
+    )
 
     try:
         if args.command == "smoke":
@@ -626,6 +1176,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "renew":
             return EXIT_OK if renew(config, args) else EXIT_REFRESH_FAILED
         return EXIT_OK if ensure(config, args) else EXIT_SMOKE_FAILED
+    except AccessContractError as exc:
+        write_state(
+            args.state_json,
+            {
+                "status": "failed",
+                "checked_at_utc": utc_now_iso(),
+                "failure_reason": exc.code,
+                "authorization": exc.evidence,
+            },
+        )
+        print(f"{args.command} failed: {exc.code}", file=sys.stderr)
+        return EXIT_SMOKE_FAILED if args.command != "refresh" else EXIT_REFRESH_FAILED
     except Exception as exc:
         print(f"{args.command} failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
         return EXIT_SMOKE_FAILED if args.command != "refresh" else EXIT_REFRESH_FAILED

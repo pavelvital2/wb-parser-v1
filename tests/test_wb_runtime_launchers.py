@@ -325,6 +325,16 @@ def test_all_marketplace_wrappers_use_required_runtime_loader() -> None:
         assert "wb_load_required_runtime_env" in source
 
 
+def test_nightly_preflight_enforces_reviewed_authorization_horizon() -> None:
+    source = (PROJECT_ROOT / "scripts/run_wb_nightly_preflight.sh").read_text(encoding="utf-8")
+    assert "--authorization-policy required" in source
+    assert '--authorization-horizon-plan-file "$AUTHORIZATION_HORIZON_PLAN"' in source
+    assert (
+        'AUTHORIZATION_HORIZON_PLAN="$PROJECT_DIR/config/wb/collection_plans/'
+        'shevron-four-regions-top1000-v2.json"'
+    ) in source
+
+
 @pytest.mark.parametrize(
     "script_name",
     ["wb_cookie_keeper.py", "wb_persistent_session.py"],

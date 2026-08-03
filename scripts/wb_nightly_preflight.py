@@ -92,15 +92,53 @@ def save_known_good(cookie_path: Path, backup_dir: Path, retain: int) -> Path:
 
 
 def smoke_cookie(config: dict[str, Any], args: argparse.Namespace, cookie_path: Path) -> bool:
+    request_headers_file = str(getattr(args, "request_headers_file", "") or "")
+    sample_count = int(args.sample_count)
+    min_successes = int(args.min_successes)
+    if request_headers_file:
+        if sample_count != 3 or min_successes not in {0, 3}:
+            raise keeper.AccessContractError("candidate_smoke_requires_exact_3_of_3")
+        min_successes = 3
     smoke_args = argparse.Namespace(
         cookie_file=str(cookie_path),
         state_json="",
         query=args.query,
-        sample_count=args.sample_count,
-        min_successes=args.min_successes,
+        sample_count=sample_count,
+        min_successes=min_successes,
         page=args.page,
+        without_cookie=False,
+        request_headers_file=request_headers_file,
+        authorization_policy=str(getattr(args, "authorization_policy", "required") or "required"),
+        authorization_horizon_plan_file=str(
+            getattr(
+                args,
+                "authorization_horizon_plan_file",
+                keeper.DEFAULT_AUTHORIZATION_HORIZON_PLAN,
+            )
+            or keeper.DEFAULT_AUTHORIZATION_HORIZON_PLAN
+        ),
     )
-    return keeper.smoke(config, smoke_args, emit=False)
+    ok = keeper.smoke(config, smoke_args, emit=False)
+    setattr(args, "_authorization_evidence", getattr(smoke_args, "_authorization_evidence", {}))
+    return ok
+
+
+def _authorization_failure_payload(
+    args: argparse.Namespace,
+    exc: Exception,
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    code = exc.code if isinstance(exc, keeper.AccessContractError) else "access_contract_failed"
+    evidence = exc.evidence if isinstance(exc, keeper.AccessContractError) else {}
+    return {
+        "status": "failed",
+        "mode": mode,
+        "checked_at_utc": utc_now_iso(),
+        "failure_reason": code,
+        "authorization": evidence,
+        "actions": ["offline_access_contract_failed"],
+    }
 
 
 def backup_current(config: dict[str, Any], args: argparse.Namespace) -> int:
@@ -151,10 +189,45 @@ def preflight(config: dict[str, Any], args: argparse.Namespace) -> int:
         "actions": actions,
     }
 
-    if smoke_cookie(config, args, cookie_path):
+    if str(getattr(args, "request_headers_file", "") or ""):
+        if not args.no_refresh:
+            payload["failure_reason"] = "candidate_preflight_requires_no_refresh"
+            actions.append("candidate_preflight_refused")
+            write_state(args.state_json, payload)
+            print("nightly_preflight failed: candidate_preflight_requires_no_refresh", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILED
+        try:
+            ok = smoke_cookie(config, args, cookie_path)
+        except keeper.AccessContractError as exc:
+            failure = _authorization_failure_payload(args, exc, mode="candidate_validation")
+            write_state(args.state_json, failure)
+            print(f"nightly_preflight failed: {exc.code}", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILED
+        payload["mode"] = "candidate_validation"
+        payload.pop("cookie_file", None)
+        payload.pop("backup_dir", None)
+        payload["status"] = "ok" if ok else "failed"
+        payload["actions"] = ["candidate_headers_cookie_smoke_ok" if ok else "candidate_smoke_failed"]
+        payload["authorization"] = getattr(args, "_authorization_evidence", {})
+        write_state(args.state_json, payload)
+        if ok:
+            print("nightly_preflight ok: candidate headers and cookie passed exact 3/3 smoke")
+            return EXIT_OK
+        print("nightly_preflight failed: candidate smoke did not pass exact 3/3", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+
+    try:
+        current_ok = smoke_cookie(config, args, cookie_path)
+    except keeper.AccessContractError as exc:
+        failure = _authorization_failure_payload(args, exc, mode="preflight")
+        write_state(args.state_json, failure)
+        print(f"nightly_preflight failed: {exc.code}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
+    if current_ok:
         backup_path = save_known_good(cookie_path, backup_dir, args.retain)
         actions.extend(["current_cookie_smoke_ok", "known_good_saved"])
         payload["status"] = "ok"
+        payload["authorization"] = getattr(args, "_authorization_evidence", {})
         payload["backup_path"] = str(backup_path)
         write_state(args.state_json, payload)
         print(f"nightly_preflight ok: current cookie smoke passed; backup_path={backup_path}")
@@ -165,6 +238,7 @@ def preflight(config: dict[str, Any], args: argparse.Namespace) -> int:
     if restored_from is not None:
         actions.append("restored_known_good")
         payload["status"] = "ok"
+        payload["authorization"] = getattr(args, "_authorization_evidence", {})
         payload["restored_from"] = str(restored_from)
         write_state(args.state_json, payload)
         print(f"nightly_preflight ok: restored known-good cookie from {restored_from}")
@@ -188,11 +262,16 @@ def preflight(config: dict[str, Any], args: argparse.Namespace) -> int:
             refresh_url=args.refresh_url,
             wait_ms=args.wait_ms,
             timeout_ms=args.timeout_ms,
+            without_cookie=False,
+            request_headers_file="",
+            authorization_policy=args.authorization_policy,
+            authorization_horizon_plan_file=args.authorization_horizon_plan_file,
         )
         if keeper.refresh_and_promote(config, refresh_args) and smoke_cookie(config, args, cookie_path):
             backup_path = save_known_good(cookie_path, backup_dir, args.retain)
             actions.extend(["refresh_promoted", "known_good_saved"])
             payload["status"] = "ok"
+            payload["authorization"] = getattr(args, "_authorization_evidence", {})
             payload["backup_path"] = str(backup_path)
             write_state(args.state_json, payload)
             print(f"nightly_preflight ok: refresh promoted; backup_path={backup_path}")
@@ -227,16 +306,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-headless", action="store_true")
     parser.add_argument("--wait-ms", type=int, default=5000)
     parser.add_argument("--timeout-ms", type=int, default=45000)
+    parser.add_argument("--request-headers-file", default="")
+    parser.add_argument(
+        "--authorization-policy",
+        choices=sorted(keeper.AUTHORIZATION_POLICIES),
+        default="required",
+    )
+    parser.add_argument(
+        "--authorization-horizon-plan-file",
+        default=keeper.DEFAULT_AUTHORIZATION_HORIZON_PLAN,
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     require_official_live_entry_lease(environment=os.environ)
     args = build_parser().parse_args(argv)
-    config = keeper.load_config(resolve_path(args.config))
-    if args.command == "backup":
-        return backup_current(config, args)
-    return preflight(config, args)
+    try:
+        config = keeper.load_config(
+            resolve_path(args.config),
+            inject_request_headers=not bool(args.request_headers_file),
+        )
+        if args.command == "backup":
+            return backup_current(config, args)
+        return preflight(config, args)
+    except keeper.AccessContractError as exc:
+        payload = _authorization_failure_payload(args, exc, mode=args.command)
+        write_state(args.state_json, payload)
+        print(f"nightly_preflight failed: {exc.code}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILED
 
 
 if __name__ == "__main__":

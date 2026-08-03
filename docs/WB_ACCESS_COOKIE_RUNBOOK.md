@@ -98,7 +98,9 @@ tail -n 80 data/logs/wb_nightly_preflight.log
 scripts/run_wb_access_tool.sh smoke \
   --config config/config.yaml \
   --cookie-file config/wb_cookie.txt \
-  --sample-count 3
+  --sample-count 3 \
+  --authorization-policy required \
+  --authorization-horizon-plan-file config/wb/collection_plans/shevron-four-regions-top1000-v2.json
 ```
 
 Проверить fallback без cookie, но с secret API headers:
@@ -108,7 +110,9 @@ scripts/run_wb_access_tool.sh smoke \
   --config config/config.yaml \
   --cookie-file config/wb_cookie.txt \
   --sample-count 3 \
-  --without-cookie
+  --without-cookie \
+  --authorization-policy required \
+  --authorization-horizon-plan-file config/wb/collection_plans/shevron-four-regions-top1000-v2.json
 ```
 
 Ожидаемый здоровый результат: smoke возвращает exit `0`, в state видно
@@ -186,17 +190,34 @@ Copy-as-cURL или cookie export.
 2. Распарси non-cookie request headers и cookie string без печати значений.
 3. Сохрани candidates под ignored `state/wb_header_candidates/` и
    `state/wb_cookie_candidates/`.
-4. Запусти smoke с candidate cookie.
-5. Запусти `--without-cookie` smoke с candidate headers.
-6. Только если оба smoke проходят, сделай backup текущих runtime files и
-   замени:
+4. Выставь обоим candidate-файлам mode `600`. Файлы должны принадлежать
+   текущему service user, быть обычными single-link файлами без symlink в пути.
+5. Запусти exact `3/3` smoke с candidate headers и candidate cookie:
+
+```bash
+scripts/run_wb_access_tool.sh smoke \
+  --config config/config.yaml \
+  --request-headers-file state/wb_header_candidates/<candidate>.json \
+  --cookie-file state/wb_cookie_candidates/<candidate>.txt \
+  --sample-count 3 \
+  --min-successes 3 \
+  --authorization-policy required \
+  --authorization-horizon-plan-file config/wb/collection_plans/shevron-four-regions-top1000-v2.json
+```
+
+6. Повтори exact `3/3` с тем же header candidate и `--without-cookie`. Keeper
+   pin-ит bytes/inode обоих источников и перед каждым WB request повторно
+   проверяет identity/hash. В state попадают только SHA-256 provenance, число
+   headers и temporal metadata `iat`/`nbf`/`exp`/TTL; token/claims не выводятся.
+7. Только если оба smoke проходят, сделай backup текущих runtime files и
+   атомарно замени:
 
 ```text
 config/wb_request_headers.json
 config/wb_cookie.txt
 ```
 
-7. После promotion повтори smoke на уже promoted files.
+8. После promotion повтори smoke на уже promoted files.
 
 Нельзя продвигать файл, если:
 
@@ -225,7 +246,13 @@ scripts/run_wb_nightly_preflight.sh
 
 Preflight использует API/SERP smoke как hard gate перед ночным `serp ->
 sellers`, сохраняет known-good backups и пытается восстановиться из них при
-провале.
+провале. До первого сетевого запроса он offline проверяет temporal claims
+Bearer JWT. Требуемый горизонт берется из `runtime_window.absolute_cutoff_msk`
+reviewed four-region plan для ближайшего collection day. Если Authorization
+отсутствует, malformed, еще не действует, истек или не покрывает этот горизонт,
+preflight завершается с точным secret-safe reason и не пытается менять cookie.
+Это temporal check, а не криптографическая проверка JWT signature; финальным
+access gate остается proxy-only `3/3` WB smoke.
 
 ## Что Смотреть После Ночи
 

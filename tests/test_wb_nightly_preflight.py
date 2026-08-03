@@ -37,6 +37,9 @@ def _args(tmp_path: Path, cookie_path: Path) -> argparse.Namespace:
         refresh_url="https://www.wildberries.ru/",
         wait_ms=1,
         timeout_ms=1,
+        request_headers_file="",
+        authorization_policy="required",
+        authorization_horizon_plan_file="config/wb/collection_plans/shevron-four-regions-top1000-v2.json",
     )
 
 
@@ -74,3 +77,101 @@ def test_preflight_restores_latest_smoke_ok_known_good(tmp_path: Path, monkeypat
 
     assert preflight.preflight({}, args) == 0
     assert cookie_path.read_text(encoding="utf-8") == "cookie=good\n"
+
+
+def test_preflight_auth_failure_stops_before_restore_or_refresh(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    preflight = _load_preflight()
+    cookie_path = tmp_path / "wb_cookie.txt"
+    cookie_path.write_text("cookie=unchanged\n", encoding="utf-8")
+    args = _args(tmp_path, cookie_path)
+    restore_calls = 0
+    refresh_calls = 0
+
+    def fail_smoke(*_args, **_kwargs):
+        raise preflight.keeper.AccessContractError(
+            "authorization_expired",
+            evidence={"exp_utc": "2026-08-03T06:33:48+00:00", "ttl_seconds": -1},
+        )
+
+    def forbidden_restore(*_args, **_kwargs):
+        nonlocal restore_calls
+        restore_calls += 1
+        raise AssertionError("known-good restore must not run")
+
+    def forbidden_refresh(*_args, **_kwargs):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        raise AssertionError("refresh must not run")
+
+    monkeypatch.setattr(preflight, "smoke_cookie", fail_smoke)
+    monkeypatch.setattr(preflight, "try_restore_known_good", forbidden_restore)
+    monkeypatch.setattr(preflight.keeper, "refresh_and_promote", forbidden_refresh)
+
+    assert preflight.preflight({}, args) == preflight.EXIT_PREFLIGHT_FAILED
+    assert restore_calls == 0
+    assert refresh_calls == 0
+    assert cookie_path.read_text(encoding="utf-8") == "cookie=unchanged\n"
+    payload = __import__("json").loads(Path(args.state_json).read_text(encoding="utf-8"))
+    assert payload["failure_reason"] == "authorization_expired"
+    assert payload["authorization"]["exp_utc"] == "2026-08-03T06:33:48+00:00"
+
+
+def test_candidate_preflight_requires_exact_3_of_3_and_never_promotes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    preflight = _load_preflight()
+    cookie_path = tmp_path / "state/wb_cookie_candidates/candidate.txt"
+    cookie_path.parent.mkdir(parents=True)
+    cookie_path.write_text("candidate=1\n", encoding="utf-8")
+    cookie_path.chmod(0o600)
+    args = _args(tmp_path, cookie_path)
+    args.request_headers_file = str(tmp_path / "state/wb_header_candidates/candidate.json")
+    seen: list[tuple[int, int, str]] = []
+
+    def fake_smoke(config, smoke_args, emit=False):
+        seen.append((smoke_args.sample_count, smoke_args.min_successes, smoke_args.request_headers_file))
+        return True
+
+    monkeypatch.setattr(preflight.keeper, "smoke", fake_smoke)
+    monkeypatch.setattr(
+        preflight,
+        "save_known_good",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not promote")),
+    )
+    monkeypatch.setattr(
+        preflight.keeper,
+        "refresh_and_promote",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not refresh")),
+    )
+
+    assert preflight.preflight({}, args) == preflight.EXIT_OK
+    assert seen == [(3, 3, args.request_headers_file)]
+    payload = __import__("json").loads(Path(args.state_json).read_text(encoding="utf-8"))
+    assert payload["mode"] == "candidate_validation"
+    assert payload["actions"] == ["candidate_headers_cookie_smoke_ok"]
+
+
+def test_candidate_preflight_rejects_non_three_sample_without_smoke(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    preflight = _load_preflight()
+    cookie_path = tmp_path / "candidate.txt"
+    cookie_path.write_text("candidate=1\n", encoding="utf-8")
+    args = _args(tmp_path, cookie_path)
+    args.request_headers_file = "state/wb_header_candidates/candidate.json"
+    args.sample_count = 2
+    calls = 0
+
+    def forbidden_smoke(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("smoke must not run")
+
+    monkeypatch.setattr(preflight.keeper, "smoke", forbidden_smoke)
+    assert preflight.preflight({}, args) == preflight.EXIT_PREFLIGHT_FAILED
+    assert calls == 0

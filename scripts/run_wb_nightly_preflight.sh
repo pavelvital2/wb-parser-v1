@@ -11,6 +11,7 @@ COOKIE_FILE="$PROJECT_DIR/config/wb_cookie.txt"
 RUNTIME_ENV_FILE="$PROJECT_DIR/config/runtime.env"
 RUNTIME_LOADER="$PROJECT_DIR/scripts/wb_runtime_env.sh"
 PREFLIGHT_SCRIPT="$PROJECT_DIR/scripts/wb_nightly_preflight.py"
+AUTHORIZATION_HORIZON_PLAN="$PROJECT_DIR/config/wb/collection_plans/shevron-four-regions-top1000-v2.json"
 NOTIFY_SCRIPT="$PROJECT_DIR/scripts/notify_products_sellers_daily.py"
 LOCK_FILE="$PROJECT_DIR/state/locks/wb_nightly_preflight.flock"
 PRODUCTS_SELLERS_LOCK_FILE="$PROJECT_DIR/state/locks/products_sellers_daily.flock"
@@ -76,6 +77,8 @@ set +e
   --config "$CONFIG_FILE" \
   --cookie-file "$COOKIE_FILE" \
   --sample-count "${PARSER_WB_PREFLIGHT_SAMPLE_COUNT:-3}" \
+  --authorization-policy required \
+  --authorization-horizon-plan-file "$AUTHORIZATION_HORIZON_PLAN" \
   --page "${PARSER_WB_PREFLIGHT_PAGE:-1}" \
   --wait-ms "${PARSER_WB_PREFLIGHT_WAIT_MS:-5000}" \
   --timeout-ms "${PARSER_WB_PREFLIGHT_TIMEOUT_MS:-45000}"

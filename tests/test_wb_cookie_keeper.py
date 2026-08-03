@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import importlib.util
+import json
+import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -23,6 +28,24 @@ def _load_keeper():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _jwt(*, iat: int, nbf: int, exp: int) -> str:
+    def encode(payload: dict[str, object]) -> str:
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    return f"{encode({'alg': 'none', 'typ': 'JWT'})}.{encode({'iat': iat, 'nbf': nbf, 'exp': exp})}.sig"
+
+
+def _authorization_args(**overrides) -> argparse.Namespace:
+    values = {
+        "authorization_policy": "required",
+        "authorization_horizon_plan_file": "config/wb/collection_plans/shevron-four-regions-top1000-v2.json",
+        "request_headers_file": "",
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
 
 
 def test_nested_promo_products_is_preflight_ok() -> None:
@@ -69,6 +92,396 @@ def test_runtime_request_headers_file_merges_without_cookie(tmp_path: Path, monk
         "authorization": "Bearer runtime",
         "deviceid": "device-1",
     }
+
+
+def test_authorization_temporal_contract_accepts_valid_ttl_and_redacts_token() -> None:
+    keeper = _load_keeper()
+    now = datetime(2026, 8, 3, 0, 0, tzinfo=timezone.utc)
+    now_timestamp = int(now.timestamp())
+    token = _jwt(
+        iat=now_timestamp - 3600,
+        nbf=now_timestamp - 3600,
+        exp=now_timestamp + 86400,
+    )
+
+    evidence = keeper.validate_authorization_temporal_contract(
+        {"Authorization": f"Bearer {token}"},
+        policy="required",
+        now_utc=now,
+        required_until_utc=datetime(2026, 8, 3, 20, 0, tzinfo=timezone.utc),
+        source_evidence={"sha256": "a" * 64},
+    )
+
+    assert evidence["status"] == "valid"
+    assert evidence["ttl_seconds"] > 0
+    assert set(evidence) == {
+        "policy",
+        "status",
+        "source",
+        "iat_utc",
+        "nbf_utc",
+        "exp_utc",
+        "ttl_seconds",
+        "required_until_utc",
+    }
+    assert token not in json.dumps(evidence)
+
+
+@pytest.mark.parametrize(
+    ("authorization", "expected_code"),
+    [
+        ("Bearer not-a-jwt", "authorization_not_jwt"),
+        ("Basic value", "authorization_bearer_invalid"),
+    ],
+)
+def test_authorization_temporal_contract_rejects_malformed_without_secret(
+    authorization: str,
+    expected_code: str,
+) -> None:
+    keeper = _load_keeper()
+    with pytest.raises(keeper.AccessContractError) as captured:
+        keeper.validate_authorization_temporal_contract(
+            {"authorization": authorization},
+            policy="required",
+            now_utc=datetime(2026, 8, 3, tzinfo=timezone.utc),
+            required_until_utc=datetime(2026, 8, 3, 20, tzinfo=timezone.utc),
+        )
+    assert captured.value.code == expected_code
+    assert authorization not in str(captured.value)
+    assert authorization not in json.dumps(captured.value.evidence)
+
+
+def test_authorization_temporal_contract_rejects_expired_and_future_nbf() -> None:
+    keeper = _load_keeper()
+    now = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
+    now_timestamp = int(now.timestamp())
+    expired = _jwt(iat=now_timestamp - 200, nbf=now_timestamp - 200, exp=now_timestamp)
+    future = _jwt(iat=now_timestamp + 10, nbf=now_timestamp + 10, exp=now_timestamp + 1000)
+
+    with pytest.raises(keeper.AccessContractError, match="authorization_expired"):
+        keeper.validate_authorization_temporal_contract(
+            {"authorization": f"Bearer {expired}"},
+            policy="required",
+            now_utc=now,
+            required_until_utc=now,
+        )
+    with pytest.raises(keeper.AccessContractError, match="authorization_not_yet_valid"):
+        keeper.validate_authorization_temporal_contract(
+            {"authorization": f"Bearer {future}"},
+            policy="required",
+            now_utc=now,
+            required_until_utc=now,
+        )
+
+
+def test_authorization_temporal_contract_rejects_insufficient_horizon() -> None:
+    keeper = _load_keeper()
+    now = datetime(2026, 8, 3, 0, 0, tzinfo=timezone.utc)
+    now_timestamp = int(now.timestamp())
+    token = _jwt(iat=now_timestamp - 10, nbf=now_timestamp - 10, exp=now_timestamp + 3600)
+    with pytest.raises(keeper.AccessContractError, match="authorization_horizon_not_covered"):
+        keeper.validate_authorization_temporal_contract(
+            {"authorization": f"Bearer {token}"},
+            policy="required",
+            now_utc=now,
+            required_until_utc=now.replace(hour=20),
+        )
+
+
+def test_authorization_missing_is_allowed_only_by_optional_policy() -> None:
+    keeper = _load_keeper()
+    now = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    assert keeper.validate_authorization_temporal_contract(
+        {}, policy="optional", now_utc=now, required_until_utc=None
+    )["status"] == "not_present_optional"
+    with pytest.raises(keeper.AccessContractError, match="authorization_missing"):
+        keeper.validate_authorization_temporal_contract(
+            {}, policy="required", now_utc=now, required_until_utc=now
+        )
+
+
+def test_authorization_horizon_comes_from_reviewed_plan_cutoff() -> None:
+    keeper = _load_keeper()
+    project_root = Path(__file__).resolve().parents[1]
+    plan = keeper.DEFAULT_AUTHORIZATION_HORIZON_PLAN
+
+    before_schedule, evidence_before = keeper.authorization_horizon_from_plan(
+        plan,
+        now_utc=datetime(2026, 8, 2, 21, 5, tzinfo=timezone.utc),
+        project_root=project_root,
+    )
+    after_cutoff, evidence_after = keeper.authorization_horizon_from_plan(
+        plan,
+        now_utc=datetime(2026, 8, 3, 20, 45, tzinfo=timezone.utc),
+        project_root=project_root,
+    )
+
+    assert before_schedule == datetime(2026, 8, 3, 20, 0, tzinfo=timezone.utc)
+    assert after_cutoff == datetime(2026, 8, 4, 20, 0, tzinfo=timezone.utc)
+    assert evidence_before["horizon_source"] == "collection_plan_runtime_window"
+    assert evidence_before["plan_sha256"] == evidence_after["plan_sha256"]
+
+
+def test_candidate_request_headers_require_scoped_0600_regular_file(
+    tmp_path: Path,
+) -> None:
+    keeper = _load_keeper()
+    candidate_dir = tmp_path / "state/wb_header_candidates"
+    candidate_dir.mkdir(parents=True)
+    candidate = candidate_dir / "candidate.json"
+    candidate.write_text('{"authorization":"Bearer value","deviceid":"d"}\n', encoding="utf-8")
+    candidate.chmod(0o600)
+    args = _authorization_args(request_headers_file=str(candidate))
+
+    source = keeper.load_request_headers_source({}, args, project_root=tmp_path)
+    assert source is not None
+    try:
+        assert source.evidence() == {
+            "source": "candidate",
+            "sha256": source.pinned.sha256,
+            "headers_count": 2,
+        }
+    finally:
+        source.close()
+
+    candidate.chmod(0o644)
+    with pytest.raises(keeper.AccessContractError, match="access_source_metadata_unsafe"):
+        keeper.load_request_headers_source({}, args, project_root=tmp_path)
+
+
+def test_candidate_request_headers_reject_outside_and_symlink(tmp_path: Path) -> None:
+    keeper = _load_keeper()
+    candidate_dir = tmp_path / "state/wb_header_candidates"
+    candidate_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"authorization":"Bearer value"}\n', encoding="utf-8")
+    outside.chmod(0o600)
+    args = _authorization_args(request_headers_file=str(outside))
+    with pytest.raises(keeper.AccessContractError, match="access_source_scope_invalid"):
+        keeper.load_request_headers_source({}, args, project_root=tmp_path)
+
+    args.request_headers_file = "state/wb_header_candidates/../wb_header_candidates/candidate.json"
+    with pytest.raises(keeper.AccessContractError, match="access_source_path_traversal"):
+        keeper.load_request_headers_source({}, args, project_root=tmp_path)
+
+    link = candidate_dir / "candidate.json"
+    link.symlink_to(outside)
+    args.request_headers_file = str(link)
+    with pytest.raises(keeper.AccessContractError, match="access_source_symlink"):
+        keeper.load_request_headers_source({}, args, project_root=tmp_path)
+
+
+def test_candidate_cookie_requires_scoped_0600_file(tmp_path: Path) -> None:
+    keeper = _load_keeper()
+    cookie_dir = tmp_path / "state/wb_cookie_candidates"
+    cookie_dir.mkdir(parents=True)
+    cookie = cookie_dir / "candidate.txt"
+    cookie.write_text("cookie=1\n", encoding="utf-8")
+    cookie.chmod(0o600)
+    args = argparse.Namespace(
+        request_headers_file="state/wb_header_candidates/candidate.json",
+        cookie_file=str(cookie),
+        without_cookie=False,
+    )
+    source = keeper.load_candidate_cookie_source(args, project_root=tmp_path)
+    assert source is not None
+    source.close()
+
+    cookie.chmod(0o664)
+    with pytest.raises(keeper.AccessContractError, match="access_source_metadata_unsafe"):
+        keeper.load_candidate_cookie_source(args, project_root=tmp_path)
+
+def test_candidate_request_headers_detect_change_after_load(tmp_path: Path) -> None:
+    keeper = _load_keeper()
+    candidate_dir = tmp_path / "state/wb_header_candidates"
+    candidate_dir.mkdir(parents=True)
+    candidate = candidate_dir / "candidate.json"
+    candidate.write_text('{"authorization":"Bearer first"}\n', encoding="utf-8")
+    candidate.chmod(0o600)
+    source = keeper.load_request_headers_source(
+        {},
+        _authorization_args(request_headers_file=str(candidate)),
+        project_root=tmp_path,
+    )
+    assert source is not None
+    try:
+        candidate.write_text('{"authorization":"Bearer other"}\n', encoding="utf-8")
+        candidate.chmod(0o600)
+        with pytest.raises(keeper.AccessContractError, match="access_source_changed"):
+            source.verify()
+    finally:
+        source.close()
+
+
+def test_expired_candidate_authorization_fails_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keeper = _load_keeper()
+    monkeypatch.setattr(keeper, "PROJECT_ROOT", tmp_path)
+    plan_dir = tmp_path / "config/wb/collection_plans"
+    plan_dir.mkdir(parents=True)
+    plan = plan_dir / "shevron-four-regions-top1000-v2.json"
+    shutil.copyfile(
+        Path(__file__).resolve().parents[1]
+        / "config/wb/collection_plans/shevron-four-regions-top1000-v2.json",
+        plan,
+    )
+    plan.chmod(0o644)
+    now_timestamp = 1_775_000_000
+    token = _jwt(iat=now_timestamp - 1000, nbf=now_timestamp - 1000, exp=now_timestamp - 1)
+    headers_dir = tmp_path / "state/wb_header_candidates"
+    headers_dir.mkdir(parents=True)
+    headers = headers_dir / "candidate.json"
+    headers.write_text(json.dumps({"authorization": f"Bearer {token}"}), encoding="utf-8")
+    headers.chmod(0o600)
+    cookie_dir = tmp_path / "state/wb_cookie_candidates"
+    cookie_dir.mkdir(parents=True)
+    cookie = cookie_dir / "candidate.txt"
+    cookie.write_text("cookie=1\n", encoding="utf-8")
+    cookie.chmod(0o600)
+    queries = tmp_path / "exports/queries.txt"
+    queries.parent.mkdir(parents=True)
+    queries.write_text("q1\nq2\nq3\n", encoding="utf-8")
+    calls = 0
+
+    def forbidden_network(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("network must not be called")
+
+    monkeypatch.setattr(keeper, "marketplace_get", forbidden_network)
+    monkeypatch.setattr(
+        keeper,
+        "datetime",
+        type(
+            "FixedDateTime",
+            (datetime,),
+            {"now": classmethod(lambda cls, tz=None: datetime.fromtimestamp(now_timestamp, tz=timezone.utc))},
+        ),
+    )
+    args = argparse.Namespace(
+        cookie_file=str(cookie),
+        request_headers_file=str(headers),
+        authorization_policy="required",
+        authorization_horizon_plan_file=str(plan),
+        state_json="",
+        query="",
+        sample_count=3,
+        min_successes=3,
+        page=1,
+        without_cookie=False,
+    )
+    config = {
+        "runtime": {"http_timeout_seconds": 5},
+        "serp": {
+            "base_url": "https://example.invalid/search",
+            "proxy_url": "http://proxy.invalid:3128",
+            "input_files": {"queries_txt": str(queries)},
+            "request_params": {},
+        },
+    }
+    with pytest.raises(keeper.AccessContractError, match="authorization_expired"):
+        keeper.smoke(config, args, emit=False)
+    assert calls == 0
+
+
+def test_candidate_headers_and_cookie_exact_three_of_three_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keeper = _load_keeper()
+    monkeypatch.setattr(keeper, "PROJECT_ROOT", tmp_path)
+    plan_dir = tmp_path / "config/wb/collection_plans"
+    plan_dir.mkdir(parents=True)
+    plan = plan_dir / "shevron-four-regions-top1000-v2.json"
+    shutil.copyfile(
+        Path(__file__).resolve().parents[1]
+        / "config/wb/collection_plans/shevron-four-regions-top1000-v2.json",
+        plan,
+    )
+    plan.chmod(0o644)
+    now = datetime(2026, 8, 3, 0, 0, tzinfo=timezone.utc)
+    now_timestamp = int(now.timestamp())
+    token = _jwt(
+        iat=now_timestamp - 3600,
+        nbf=now_timestamp - 3600,
+        exp=now_timestamp + 172800,
+    )
+    headers_dir = tmp_path / "state/wb_header_candidates"
+    headers_dir.mkdir(parents=True)
+    headers = headers_dir / "candidate.json"
+    headers.write_text(
+        json.dumps({"authorization": f"Bearer {token}", "deviceid": "device"}),
+        encoding="utf-8",
+    )
+    headers.chmod(0o600)
+    cookie_dir = tmp_path / "state/wb_cookie_candidates"
+    cookie_dir.mkdir(parents=True)
+    cookie = cookie_dir / "candidate.txt"
+    cookie.write_text("cookie=1\n", encoding="utf-8")
+    cookie.chmod(0o600)
+    queries = tmp_path / "exports/queries.txt"
+    queries.parent.mkdir(parents=True)
+    queries.write_text("q1\nq2\nq3\n", encoding="utf-8")
+    monkeypatch.setattr(
+        keeper,
+        "datetime",
+        type(
+            "FixedDateTime",
+            (datetime,),
+            {"now": classmethod(lambda cls, tz=None: now)},
+        ),
+    )
+    calls: list[dict[str, str]] = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"products": [{"id": 1}]}
+
+    def fake_get(_config, _url, **kwargs):
+        calls.append(dict(kwargs["headers"]))
+        return Response()
+
+    monkeypatch.setattr(keeper, "marketplace_get", fake_get)
+    monkeypatch.setattr(keeper, "require_marketplace_proxy", lambda _config: object())
+    state = tmp_path / "state/smoke.json"
+    args = argparse.Namespace(
+        cookie_file=str(cookie),
+        request_headers_file=str(headers),
+        authorization_policy="required",
+        authorization_horizon_plan_file=str(plan),
+        state_json=str(state),
+        query="",
+        sample_count=3,
+        min_successes=3,
+        page=1,
+        without_cookie=False,
+    )
+    config = {
+        "runtime": {"http_timeout_seconds": 5},
+        "serp": {
+            "base_url": "https://example.invalid/search",
+            "proxy_url": "http://proxy.invalid:3128",
+            "input_files": {"queries_txt": str(queries)},
+            "request_params": {},
+        },
+    }
+
+    assert keeper.smoke(config, args, emit=False) is True
+    assert len(calls) == 3
+    assert all(call["authorization"] == f"Bearer {token}" for call in calls)
+    assert all(call["cookie"] == "cookie=1" for call in calls)
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    assert payload["successes"] == 3
+    assert payload["authorization"]["status"] == "valid"
+    assert payload["authorization"]["source"]["source"] == "candidate"
+    assert payload["candidate_cookie"]["sha256"] == hashlib.sha256(cookie.read_bytes()).hexdigest()
+    assert token not in state.read_text(encoding="utf-8")
 
 
 def test_ensure_keeps_existing_cookie_when_refresh_smoke_fails(tmp_path: Path, monkeypatch) -> None:
