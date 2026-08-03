@@ -77,7 +77,7 @@ set +e
   --config "$CONFIG_FILE" \
   --cookie-file "$COOKIE_FILE" \
   --sample-count "${PARSER_WB_PREFLIGHT_SAMPLE_COUNT:-3}" \
-  --authorization-policy required \
+  --authorization-policy if_present \
   --authorization-horizon-plan-file "$AUTHORIZATION_HORIZON_PLAN" \
   --page "${PARSER_WB_PREFLIGHT_PAGE:-1}" \
   --wait-ms "${PARSER_WB_PREFLIGHT_WAIT_MS:-5000}" \

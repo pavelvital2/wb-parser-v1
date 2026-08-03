@@ -38,7 +38,7 @@ def _args(tmp_path: Path, cookie_path: Path) -> argparse.Namespace:
         wait_ms=1,
         timeout_ms=1,
         request_headers_file="",
-        authorization_policy="required",
+        authorization_policy="if_present",
         authorization_horizon_plan_file="config/wb/collection_plans/shevron-four-regions-top1000-v2.json",
     )
 

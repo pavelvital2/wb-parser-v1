@@ -325,9 +325,10 @@ def test_all_marketplace_wrappers_use_required_runtime_loader() -> None:
         assert "wb_load_required_runtime_env" in source
 
 
-def test_nightly_preflight_enforces_reviewed_authorization_horizon() -> None:
+def test_nightly_preflight_enforces_if_present_authorization_horizon() -> None:
     source = (PROJECT_ROOT / "scripts/run_wb_nightly_preflight.sh").read_text(encoding="utf-8")
-    assert "--authorization-policy required" in source
+    assert "--authorization-policy if_present" in source
+    assert "--authorization-policy required" not in source
     assert '--authorization-horizon-plan-file "$AUTHORIZATION_HORIZON_PLAN"' in source
     assert (
         'AUTHORIZATION_HORIZON_PLAN="$PROJECT_DIR/config/wb/collection_plans/'

@@ -37,7 +37,7 @@ EXIT_REFRESH_FAILED = 21
 COORDINATOR_LOCK_DIRECTORY = Path("/run/lock/parser-nightly-coordinator")
 
 OK_KINDS = {"top_products", "nested_products", "nested_promo_products"}
-AUTHORIZATION_POLICIES = {"optional", "required"}
+AUTHORIZATION_POLICIES = {"if_present", "optional", "required"}
 DEFAULT_AUTHORIZATION_HORIZON_PLAN = (
     "config/wb/collection_plans/shevron-four-regions-top1000-v2.json"
 )
@@ -375,12 +375,12 @@ def load_request_headers_source(
     if policy not in AUTHORIZATION_POLICIES:
         raise AccessContractError("authorization_policy_invalid")
     if explicit:
-        if policy != "required":
+        if policy not in {"if_present", "required"}:
             raise AccessContractError("candidate_headers_require_authorization")
         source_value = explicit
         allowed_root = root / "state/wb_header_candidates"
         source_kind = "candidate"
-    elif policy == "required":
+    elif policy in {"if_present", "required"}:
         source_value = _configured_request_headers_path(config)
         if not source_value:
             raise AccessContractError("request_headers_source_missing")
@@ -530,6 +530,9 @@ def validate_authorization_temporal_contract(
         evidence["status"] = "present_not_validated_optional" if authorization else "not_present_optional"
         return evidence
     if not authorization:
+        if policy == "if_present":
+            evidence["status"] = "not_present_allowed"
+            return evidence
         raise AccessContractError("authorization_missing", evidence=evidence)
     scheme, separator, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or separator != " " or not token or token != token.strip():
@@ -582,13 +585,10 @@ def authorization_contract_for_smoke(
     project_root: Path | None = None,
 ) -> dict[str, Any]:
     policy = str(getattr(args, "authorization_policy", "optional") or "optional").strip()
-    explicit_candidate = bool(str(getattr(args, "request_headers_file", "") or "").strip())
-    if explicit_candidate:
-        policy = "required"
     required_until: datetime | None = None
     horizon_evidence: dict[str, Any] = {}
     now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    if policy == "required":
+    if policy in {"if_present", "required"}:
         horizon_plan = str(
             getattr(args, "authorization_horizon_plan_file", "")
             or DEFAULT_AUTHORIZATION_HORIZON_PLAN
@@ -767,11 +767,16 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
         if candidate_cookie is not None:
             candidate_cookie.verify()
             try:
-                cookie_value = candidate_cookie.payload.decode("utf-8").strip()
+                candidate_cookie_value = candidate_cookie.payload.decode("utf-8").strip()
             except UnicodeDecodeError as exc:
                 raise AccessContractError("candidate_cookie_invalid") from exc
-            if not cookie_value or "\n" in cookie_value or "\r" in cookie_value:
+            if (
+                not candidate_cookie_value
+                or "\n" in candidate_cookie_value
+                or "\r" in candidate_cookie_value
+            ):
                 raise AccessContractError("candidate_cookie_invalid")
+            cookie_value = "" if bool(args.without_cookie) else candidate_cookie_value
         else:
             cookie_value = read_cookie_value_for_smoke(config, args, cookie_path)
         queries = load_queries(config, args.query, max(1, int(args.sample_count)))
@@ -902,6 +907,7 @@ def smoke(config: dict[str, Any], args: argparse.Namespace, *, emit: bool = True
                 "min_successes": min_successes,
                 "successes": successes,
                 "authorization": authorization_evidence,
+                "cookie_sent": bool(cookie_value),
                 "candidate_cookie": (
                     {
                         "sha256": candidate_cookie.sha256,

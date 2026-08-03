@@ -99,7 +99,7 @@ scripts/run_wb_access_tool.sh smoke \
   --config config/config.yaml \
   --cookie-file config/wb_cookie.txt \
   --sample-count 3 \
-  --authorization-policy required \
+  --authorization-policy if_present \
   --authorization-horizon-plan-file config/wb/collection_plans/shevron-four-regions-top1000-v2.json
 ```
 
@@ -111,7 +111,7 @@ scripts/run_wb_access_tool.sh smoke \
   --cookie-file config/wb_cookie.txt \
   --sample-count 3 \
   --without-cookie \
-  --authorization-policy required \
+  --authorization-policy if_present \
   --authorization-horizon-plan-file config/wb/collection_plans/shevron-four-regions-top1000-v2.json
 ```
 
@@ -201,13 +201,15 @@ scripts/run_wb_access_tool.sh smoke \
   --cookie-file state/wb_cookie_candidates/<candidate>.txt \
   --sample-count 3 \
   --min-successes 3 \
-  --authorization-policy required \
+  --authorization-policy if_present \
   --authorization-horizon-plan-file config/wb/collection_plans/shevron-four-regions-top1000-v2.json
 ```
 
-6. Повтори exact `3/3` с тем же header candidate и `--without-cookie`. Keeper
-   pin-ит bytes/inode обоих источников и перед каждым WB request повторно
-   проверяет identity/hash. В state попадают только SHA-256 provenance, число
+6. Повтори exact `3/3` с тем же header candidate и `--without-cookie`. Cookie
+   candidate при этом не читается и его значение не отправляется. Header
+   candidate остается pinned, а keeper перед каждым WB request повторно
+   проверяет его identity/hash. В первом smoke аналогично pin-ятся header и
+   cookie candidates. В state попадают только SHA-256 provenance, число
    headers и temporal metadata `iat`/`nbf`/`exp`/TTL; token/claims не выводятся.
 7. Только если оба smoke проходят, сделай backup текущих runtime files и
    атомарно замени:
@@ -246,13 +248,18 @@ scripts/run_wb_nightly_preflight.sh
 
 Preflight использует API/SERP smoke как hard gate перед ночным `serp ->
 sellers`, сохраняет known-good backups и пытается восстановиться из них при
-провале. До первого сетевого запроса он offline проверяет temporal claims
-Bearer JWT. Требуемый горизонт берется из `runtime_window.absolute_cutoff_msk`
-reviewed four-region plan для ближайшего collection day. Если Authorization
-отсутствует, malformed, еще не действует, истек или не покрывает этот горизонт,
-preflight завершается с точным secret-safe reason и не пытается менять cookie.
-Это temporal check, а не криптографическая проверка JWT signature; финальным
-access gate остается proxy-only `3/3` WB smoke.
+провале. Его policy `if_present`: отсутствие Authorization допустимо только до
+последующего proxy-only exact `3/3` smoke. Если Bearer присутствует, preflight
+до первого сетевого запроса строго проверяет его `iat`/`nbf`/`exp` и покрытие
+горизонта из `runtime_window.absolute_cutoff_msk` reviewed four-region plan.
+Malformed, еще не действующий, истекший или недостаточный по горизонту Bearer
+завершает preflight с точным secret-safe reason до сети. Это temporal check, а
+не криптографическая проверка JWT signature.
+
+Browser export без Authorization допускается к отдельной promotion-процедуре
+только после двух независимых проверок с теми же pinned headers: exact `3/3` с
+candidate cookie и exact `3/3` с `--without-cookie`. Успех smoke сам по себе не
+продвигает candidate и не меняет production headers/cookie.
 
 ## Что Смотреть После Ночи
 

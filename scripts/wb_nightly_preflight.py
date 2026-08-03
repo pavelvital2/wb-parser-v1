@@ -108,7 +108,7 @@ def smoke_cookie(config: dict[str, Any], args: argparse.Namespace, cookie_path: 
         page=args.page,
         without_cookie=False,
         request_headers_file=request_headers_file,
-        authorization_policy=str(getattr(args, "authorization_policy", "required") or "required"),
+        authorization_policy=str(getattr(args, "authorization_policy", "if_present") or "if_present"),
         authorization_horizon_plan_file=str(
             getattr(
                 args,
@@ -310,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--authorization-policy",
         choices=sorted(keeper.AUTHORIZATION_POLICIES),
-        default="required",
+        default="if_present",
     )
     parser.add_argument(
         "--authorization-horizon-plan-file",

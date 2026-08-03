@@ -464,14 +464,16 @@ operable. Preserve them unless the user explicitly changes the operating mode.
   under `state/wb_known_good/`. If current cookies fail, it tries smoke-validated
   restore from the latest known-good backups before attempting keeper refresh.
   On failure, it sends an early Telegram notification through the same notifier.
-- Official WB preflight must validate the Bearer JWT temporal claims offline
-  before any marketplace request. Authorization must cover the nearest reviewed
-  four-region plan absolute cutoff; only iat/nbf/exp timestamps, TTL and
+- Official WB preflight uses the `if_present` Authorization policy. A missing
+  Authorization header may proceed only to the proxy-only exact 3/3 smoke; any
+  present Bearer must pass the offline iat/nbf/exp and reviewed four-region
+  cutoff-horizon checks before marketplace I/O. Only temporal metadata, TTL and
   hash-only source provenance may be persisted. Candidate request headers are
   accepted only from mode-600 regular single-link files under
   `state/wb_header_candidates/`, paired candidate cookies only from
-  `state/wb_cookie_candidates/`, and both must pass an exact 3/3 smoke before
-  any separate atomic promotion step.
+  `state/wb_cookie_candidates/`, and browser exports without Authorization must
+  pass exact 3/3 both with the candidate cookie and with `--without-cookie`
+  before any separate atomic promotion step.
 - Scheduled collection must run only products and sellers. The wrapper script
   runs `serp` first and then `sellers`; it must not run `filter`, `suggest`, or
   `daily`. If `serp` fails, `sellers` must not start.

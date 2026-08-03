@@ -200,6 +200,57 @@ def test_authorization_missing_is_allowed_only_by_optional_policy() -> None:
         )
 
 
+def test_if_present_allows_missing_and_validates_present_authorization() -> None:
+    keeper = _load_keeper()
+    now = datetime(2026, 8, 3, 0, 0, tzinfo=timezone.utc)
+    now_timestamp = int(now.timestamp())
+    valid = _jwt(
+        iat=now_timestamp - 3600,
+        nbf=now_timestamp - 3600,
+        exp=now_timestamp + 86400,
+    )
+
+    missing = keeper.validate_authorization_temporal_contract(
+        {},
+        policy="if_present",
+        now_utc=now,
+        required_until_utc=now.replace(hour=20),
+    )
+    present = keeper.validate_authorization_temporal_contract(
+        {"authorization": f"Bearer {valid}"},
+        policy="if_present",
+        now_utc=now,
+        required_until_utc=now.replace(hour=20),
+    )
+
+    assert missing["status"] == "not_present_allowed"
+    assert present["status"] == "valid"
+    assert valid not in json.dumps(present)
+
+
+def test_if_present_rejects_expired_authorization_without_secret_leak() -> None:
+    keeper = _load_keeper()
+    now = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
+    now_timestamp = int(now.timestamp())
+    expired = _jwt(
+        iat=now_timestamp - 3600,
+        nbf=now_timestamp - 3600,
+        exp=now_timestamp,
+    )
+
+    with pytest.raises(keeper.AccessContractError) as captured:
+        keeper.validate_authorization_temporal_contract(
+            {"authorization": f"Bearer {expired}"},
+            policy="if_present",
+            now_utc=now,
+            required_until_utc=now.replace(hour=20),
+        )
+
+    assert captured.value.code == "authorization_expired"
+    assert expired not in str(captured.value)
+    assert expired not in json.dumps(captured.value.evidence)
+
+
 def test_authorization_horizon_comes_from_reviewed_plan_cutoff() -> None:
     keeper = _load_keeper()
     project_root = Path(__file__).resolve().parents[1]
@@ -386,9 +437,19 @@ def test_expired_candidate_authorization_fails_before_network(
     assert calls == 0
 
 
-def test_candidate_headers_and_cookie_exact_three_of_three_smoke(
+@pytest.mark.parametrize(
+    ("authorization_policy", "with_authorization", "expected_status"),
+    [
+        ("required", True, "valid"),
+        ("if_present", False, "not_present_allowed"),
+    ],
+)
+def test_candidate_headers_cookie_and_cookieless_exact_three_of_three_smoke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    authorization_policy: str,
+    with_authorization: bool,
+    expected_status: str,
 ) -> None:
     keeper = _load_keeper()
     monkeypatch.setattr(keeper, "PROJECT_ROOT", tmp_path)
@@ -411,10 +472,10 @@ def test_candidate_headers_and_cookie_exact_three_of_three_smoke(
     headers_dir = tmp_path / "state/wb_header_candidates"
     headers_dir.mkdir(parents=True)
     headers = headers_dir / "candidate.json"
-    headers.write_text(
-        json.dumps({"authorization": f"Bearer {token}", "deviceid": "device"}),
-        encoding="utf-8",
-    )
+    header_payload = {"deviceid": "device"}
+    if with_authorization:
+        header_payload["authorization"] = f"Bearer {token}"
+    headers.write_text(json.dumps(header_payload), encoding="utf-8")
     headers.chmod(0o600)
     cookie_dir = tmp_path / "state/wb_cookie_candidates"
     cookie_dir.mkdir(parents=True)
@@ -453,7 +514,7 @@ def test_candidate_headers_and_cookie_exact_three_of_three_smoke(
     args = argparse.Namespace(
         cookie_file=str(cookie),
         request_headers_file=str(headers),
-        authorization_policy="required",
+        authorization_policy=authorization_policy,
         authorization_horizon_plan_file=str(plan),
         state_json=str(state),
         query="",
@@ -474,14 +535,31 @@ def test_candidate_headers_and_cookie_exact_three_of_three_smoke(
 
     assert keeper.smoke(config, args, emit=False) is True
     assert len(calls) == 3
-    assert all(call["authorization"] == f"Bearer {token}" for call in calls)
+    if with_authorization:
+        assert all(call["authorization"] == f"Bearer {token}" for call in calls)
+    else:
+        assert all("authorization" not in call for call in calls)
     assert all(call["cookie"] == "cookie=1" for call in calls)
     payload = json.loads(state.read_text(encoding="utf-8"))
     assert payload["successes"] == 3
-    assert payload["authorization"]["status"] == "valid"
+    assert payload["cookie_sent"] is True
+    assert payload["authorization"]["status"] == expected_status
     assert payload["authorization"]["source"]["source"] == "candidate"
     assert payload["candidate_cookie"]["sha256"] == hashlib.sha256(cookie.read_bytes()).hexdigest()
     assert token not in state.read_text(encoding="utf-8")
+
+    calls.clear()
+    args.without_cookie = True
+    args.state_json = str(tmp_path / "state/smoke_without_cookie.json")
+    assert keeper.smoke(config, args, emit=False) is True
+    assert len(calls) == 3
+    assert all("cookie" not in call for call in calls)
+    cookieless_payload = json.loads(Path(args.state_json).read_text(encoding="utf-8"))
+    assert cookieless_payload["successes"] == 3
+    assert cookieless_payload["cookie_sent"] is False
+    assert cookieless_payload["authorization"]["status"] == expected_status
+    assert cookieless_payload["candidate_cookie"] is None
+    assert token not in Path(args.state_json).read_text(encoding="utf-8")
 
 
 def test_ensure_keeps_existing_cookie_when_refresh_smoke_fails(tmp_path: Path, monkeypatch) -> None:
