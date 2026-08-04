@@ -157,6 +157,16 @@ legacy-protected mode and cannot request post-cutover behavior through CLI.
 When the collection manifest is already `success/complete`, official resume
 uses it as immutable input and enters downstream without another SERP call.
 
+For the reviewed run `20260803_220018Z`, one `search_network_error` occurred
+after 114 of 120 query units had been verified. The approved resume transition
+is limited to that run's exact stored input/transport attestation and target
+input/runner projections. It skips the 114 immutable units and rebuilds the
+discarded next unit from page 1. The bounded transport repair from parent
+`0ace198` retries a `RequestException` only on the same endpoint and page,
+with at most 4 attempts, an 8--60 second deadline-aware delay range, and no
+endpoint or route switch. All existing depth, region, proxy, checkpoint,
+attestation and publication gates remain unchanged.
+
 The exact 2026-08-01 resume-cutoff transition is legacy run-scoped authority,
 not a generic interpretation of coordinator metadata. A validated coordinator
 invocation for another WB run may carry an unrelated scheduler successor ID;

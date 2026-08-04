@@ -166,6 +166,8 @@ class FakeTransport:
             or {
                 "moscow": "-535680",
                 "rostov-on-don": "-2228364",
+                "novosibirsk": "-364220",
+                "kazan": "-1111111",
             }
         )
         self.egress_values = list(egress_values or ["203.0.113.10"] * 3)
@@ -221,12 +223,17 @@ class FakeTransport:
         elif self.malformed:
             products = [{"id": "not-an-id"}] * self.product_count
         else:
-            region_offset = 100_000 if request.task.region_id == "moscow" else 200_000
+            region_offset = {
+                "moscow": 100_000,
+                "rostov-on-don": 200_000,
+                "novosibirsk": 300_000,
+                "kazan": 400_000,
+            }[request.task.region_id]
             query_offset = {
                 "shevron": 1_000,
                 "shevrony": 2_000,
                 "shevron-na-lipuchke": 3_000,
-            }[request.task.query_id]
+            }.get(request.task.query_id, 4_000)
             page_offset = (request.task.page - 1) * 100
             products = _products(
                 region_offset + query_offset + page_offset,
@@ -599,6 +606,11 @@ def test_runner_honors_plan_depth_with_distinct_page_identity_and_positions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, config, plan_path = _project(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        DeadlineGuard,
+        "ensure_estimated_window",
+        lambda self, _estimated_seconds: None,
+    )
     plan = _read_json(plan_path)
     plan["depth"] = 200
     plan["quality"]["expected_pages_per_query"] = 2
@@ -799,6 +811,104 @@ def test_top1000_resume_repeats_only_unfinished_query_segment(
         ref["egress"]["start"]["masked"] for ref in segment_refs
     } == {"203.0.x.x", "198.51.x.x"}
     assert resumed.egress_calls == 5
+
+
+def test_production_shaped_114_verified_units_resume_starts_at_kazan_page_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, config, plan_path = _project(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        DeadlineGuard,
+        "ensure_estimated_window",
+        lambda self, _estimated_seconds: None,
+    )
+    plan = _read_json(plan_path)
+    plan["collection_plan_id"] = "shevron-four-regions-top1000-v2"
+    plan["depth"] = 1000
+    plan["query_ids"] = [
+        item["query_id"]
+        for item in _read_json(
+            root / "config/wb/query_packs/shevron-core/2026-07-26.1.json"
+        )["queries"]
+    ]
+    plan["region_set"] = [
+        "moscow",
+        "rostov-on-don",
+        "novosibirsk",
+        "kazan",
+    ]
+    plan["quality"]["expected_queries_per_region"] = 30
+    plan["quality"]["expected_pages_per_query"] = 10
+    plan_path = plan_path.with_name("shevron-four-regions-top1000-v2.json")
+    _write_json(plan_path, plan)
+    registry_path = root / REGIONS_RELATIVE
+    registry = _read_json(registry_path)
+    for region in registry["regions"]:
+        region["enabled"] = region["region_id"] in plan["region_set"]
+    _write_json(registry_path, registry)
+
+    run_id = "20260803_220018Z"
+    first = FakeTransport(failure_call=1141, failure_code="search_network_error")
+    with pytest.raises(ScopedTransportError, match="search_network_error"):
+        run_collection_plan(
+            config=config,
+            plan_path=plan_path,
+            no_publish=True,
+            transport=first,
+            run_id=run_id,
+            now=lambda: FIXED_NOW,
+            sleeper=lambda _seconds: None,
+            egress_hash_salt=b"production-shaped-resume",
+        )
+
+    state_dir = (
+        root
+        / "state/wb_collection_plans"
+        / "shevron-four-regions-top1000-v2"
+        / run_id
+    )
+    failed_manifest = _read_json(state_dir / "manifest.json")
+    assert failed_manifest["resume"]["verified_segments"] == 114
+    failed = failed_manifest["resume"]["failed_segment"]
+    assert failed["region_id"] == "kazan"
+    assert failed["query_id"] == "shevron-na-lipuchke-na-kepku"
+    assert failed["pages_written"] == 0
+    assert failed["status"] == "incomplete_not_reusable"
+    assert failed["error_code"] == "search_network_error"
+    assert len(failed_manifest["resume"]["segments"]) == 114
+    assert len(first.search_calls) == 1141
+
+    resumed = FakeTransport(egress_values=["198.51.100.20"] * 8)
+    manifest = run_collection_plan(
+        config=config,
+        plan_path=plan_path,
+        no_publish=True,
+        transport=resumed,
+        resume_run_id=run_id,
+        now=lambda: FIXED_NOW,
+        sleeper=lambda _seconds: None,
+        egress_hash_salt=b"production-shaped-resume",
+    )
+
+    assert manifest["complete"] is True
+    assert manifest["resume"]["verified_segments"] == 120
+    assert len(resumed.search_calls) == 60
+    assert [
+        (call.task.region_id, call.task.query_id, call.task.page)
+        for call in resumed.search_calls[:10]
+    ] == [
+        ("kazan", "shevron-na-lipuchke-na-kepku", page)
+        for page in range(1, 11)
+    ]
+    assert all(
+        call.task.region_id == "kazan" or call.task.query_id != "shevron-na-lipuchke-na-kepku"
+        for call in resumed.search_calls
+    )
+    assert not any(
+        call.task.region_id != "kazan"
+        for call in resumed.search_calls[:10]
+    )
 
 
 class _ExactCutoffTransitionFixture:
