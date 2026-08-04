@@ -606,11 +606,6 @@ def test_runner_honors_plan_depth_with_distinct_page_identity_and_positions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, config, plan_path = _project(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        DeadlineGuard,
-        "ensure_estimated_window",
-        lambda self, _estimated_seconds: None,
-    )
     plan = _read_json(plan_path)
     plan["depth"] = 200
     plan["quality"]["expected_pages_per_query"] = 2
