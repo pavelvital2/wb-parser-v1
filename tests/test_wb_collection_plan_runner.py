@@ -1948,6 +1948,12 @@ def test_top1000_resume_accepts_only_reviewed_input_attestation_transition(
         PROJECT_ROOT / "app/serp/collection_plan_runner.py",
         runner_path,
     )
+    attestation_path = root / "config/wb/nightly_coordinator_adapter_inputs.json"
+    attestation = _read_json(attestation_path)
+    attestation["file_sha256"]["app/serp/collection_plan_runner.py"] = hashlib.sha256(
+        runner_path.read_bytes()
+    ).hexdigest()
+    _write_json(attestation_path, attestation)
     plan = _read_json(plan_path)
     plan["depth"] = 1000
     plan["quality"]["expected_pages_per_query"] = 10
@@ -2064,6 +2070,12 @@ def test_top1000_resume_rejects_tampered_attestation_history_before_network(
         PROJECT_ROOT / "app/serp/collection_plan_runner.py",
         runner_path,
     )
+    attestation_path = root / "config/wb/nightly_coordinator_adapter_inputs.json"
+    attestation = _read_json(attestation_path)
+    attestation["file_sha256"]["app/serp/collection_plan_runner.py"] = hashlib.sha256(
+        runner_path.read_bytes()
+    ).hexdigest()
+    _write_json(attestation_path, attestation)
     plan = _read_json(plan_path)
     plan["depth"] = 1000
     plan["quality"]["expected_pages_per_query"] = 10
@@ -3139,6 +3151,94 @@ def test_ordered_search_does_not_fallback_for_non_retryable_http() -> None:
     assert [url for url, _kwargs in session.calls] == [
         "https://primary.example.test"
     ]
+
+
+def test_ordered_search_retries_network_on_same_endpoint_and_page() -> None:
+    session = FakeSession(
+        [
+            requests.ConnectionError("transient"),
+            FakeResponse(payload={"products": _products(1_000)}),
+        ]
+    )
+    transport = RequestsScopedTransport(
+        session=session,  # type: ignore[arg-type]
+        request_params={"appType": "1"},
+        endpoint_urls=(
+            "https://primary.example.test",
+            "https://fallback.example.test",
+        ),
+        timeout_seconds=45,
+        referer_base="https://www.wildberries.ru/search?query=",
+        network_retry_max_attempts=2,
+        network_retry_base_delay_seconds=0,
+    )
+
+    result = transport.search_ordered(_scoped_search_request("primary"), timeout_seconds=10)
+
+    assert result.endpoint_id == "primary"
+    assert result.attempted_endpoint_ids == ("primary",)
+    assert result.endpoint_attempt_counts == (("primary", 2),)
+    assert [url for url, _kwargs in session.calls] == [
+        "https://primary.example.test",
+        "https://primary.example.test",
+    ]
+
+
+def test_ordered_search_network_exhaustion_is_fail_closed_without_switch() -> None:
+    session = FakeSession(
+        [
+            requests.Timeout("one"),
+            requests.Timeout("two"),
+            requests.Timeout("three"),
+        ]
+    )
+    transport = RequestsScopedTransport(
+        session=session,  # type: ignore[arg-type]
+        request_params={"appType": "1"},
+        endpoint_urls=(
+            "https://primary.example.test",
+            "https://fallback.example.test",
+        ),
+        timeout_seconds=45,
+        referer_base="https://www.wildberries.ru/search?query=",
+        network_retry_max_attempts=3,
+        network_retry_base_delay_seconds=0,
+    )
+
+    with pytest.raises(ScopedTransportError, match="search_network_error") as caught:
+        transport.search_ordered(_scoped_search_request("primary"), timeout_seconds=10)
+
+    assert caught.value.endpoint_id == "primary"
+    assert caught.value.endpoint_attempt_counts == (("primary", 3),)
+    assert [url for url, _kwargs in session.calls] == [
+        "https://primary.example.test",
+        "https://primary.example.test",
+        "https://primary.example.test",
+    ]
+
+
+def test_network_retry_does_not_commit_partial_page_or_duplicate_product() -> None:
+    session = FakeSession(
+        [
+            requests.ConnectionError("transient"),
+            FakeResponse(payload={"products": _products(1_000)}),
+        ]
+    )
+    transport = RequestsScopedTransport(
+        session=session,  # type: ignore[arg-type]
+        request_params={"appType": "1"},
+        endpoint_urls=("https://primary.example.test",),
+        timeout_seconds=45,
+        referer_base="https://www.wildberries.ru/search?query=",
+        network_retry_max_attempts=2,
+        network_retry_base_delay_seconds=0,
+    )
+
+    result = transport.search_ordered(_scoped_search_request(), timeout_seconds=10)
+
+    assert len(session.calls) == 2
+    assert len(result.payload["products"]) == 100
+    assert result.endpoint_attempt_counts == (("primary", 2),)
 
 
 def test_ordered_search_falls_back_for_production_nested_promo_anomaly() -> None:

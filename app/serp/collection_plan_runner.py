@@ -125,6 +125,7 @@ class ScopedTransportError(CollectionPlanRunError):
         retry_after_seconds: int | None = None,
         endpoint_id: str = "",
         attempted_endpoint_ids: tuple[str, ...] = (),
+        endpoint_attempt_counts: tuple[tuple[str, int], ...] = (),
     ) -> None:
         super().__init__(code)
         self.code = code
@@ -135,6 +136,7 @@ class ScopedTransportError(CollectionPlanRunError):
         self.retry_after_seconds = retry_after_seconds
         self.endpoint_id = endpoint_id
         self.attempted_endpoint_ids = attempted_endpoint_ids
+        self.endpoint_attempt_counts = endpoint_attempt_counts
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +182,7 @@ class ScopedSearchResult:
     dest_id_sent: str
     http_status: int = 200
     attempted_endpoint_ids: tuple[str, ...] = ()
+    endpoint_attempt_counts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +246,8 @@ class ScopedTransport(Protocol):
     def pin_endpoint(self, endpoint_id: str) -> None: ...
 
     def close(self) -> None: ...
+
+    def set_network_retry_sleep(self, sleeper: Callable[[float], None]) -> None: ...
 
 
 def _safe_id(value: str, *, field: str) -> str:
@@ -1094,6 +1099,9 @@ class RequestsScopedTransport:
         egress_fallback_url: str | None = None,
         egress_fallback_session: requests.Session | None = None,
         retry_http_statuses: frozenset[int] | None = None,
+        network_retry_max_attempts: int = 1,
+        network_retry_base_delay_seconds: float = 0.0,
+        network_retry_max_delay_seconds: float = 0.0,
     ) -> None:
         if not endpoint_urls:
             raise CollectionPlanRunError("SERP endpoint list is empty")
@@ -1112,6 +1120,14 @@ class RequestsScopedTransport:
         self.retry_http_statuses = retry_http_statuses or frozenset(
             {429, 498, 500, 502, 503, 504}
         )
+        if type(network_retry_max_attempts) is not int or not 1 <= network_retry_max_attempts <= 10:
+            raise CollectionPlanRunError("network retry attempts are invalid")
+        if network_retry_base_delay_seconds < 0 or network_retry_max_delay_seconds < 0:
+            raise CollectionPlanRunError("network retry delay is invalid")
+        self.network_retry_max_attempts = network_retry_max_attempts
+        self.network_retry_base_delay_seconds = float(network_retry_base_delay_seconds)
+        self.network_retry_max_delay_seconds = float(network_retry_max_delay_seconds)
+        self._network_retry_sleep: Callable[[float], None] = time_module.sleep
         self.proxy_route_sha256 = getattr(
             session,
             "_wb_marketplace_proxy_sha256",
@@ -1134,6 +1150,9 @@ class RequestsScopedTransport:
         provider: Callable[[float], float],
     ) -> None:
         self._network_timeout_provider = provider
+
+    def set_network_retry_sleep(self, sleeper: Callable[[float], None]) -> None:
+        self._network_retry_sleep = sleeper
 
     def _network_timeout(self, requested_timeout: float) -> float:
         value = min(self.timeout_seconds, requested_timeout)
@@ -1234,6 +1253,24 @@ class RequestsScopedTransport:
                 if not isinstance(value, bool)
                 and isinstance(value, (int, str))
                 and str(value).isdigit()
+            ),
+            network_retry_max_attempts=int(
+                serp.get(
+                    "retry_max_attempts",
+                    getattr(config.runtime, "retry_max_attempts", 1),
+                )
+            ),
+            network_retry_base_delay_seconds=float(
+                serp.get(
+                    "retry_base_delay_seconds",
+                    getattr(config.runtime, "retry_base_delay_seconds", 0.0),
+                )
+            ),
+            network_retry_max_delay_seconds=float(
+                serp.get(
+                    "retry_max_delay_seconds",
+                    getattr(config.runtime, "retry_max_delay_seconds", 0.0),
+                )
             ),
         )
 
@@ -1619,31 +1656,46 @@ class RequestsScopedTransport:
             ),
         )
         attempted: list[str] = []
+        attempt_counts: dict[str, int] = {}
         last_rate_limited: ScopedTransportError | None = None
         last_payload_anomaly: ScopedTransportError | None = None
 
         for endpoint_id in ordered_ids:
             endpoint_url = self._endpoint_url(endpoint_id)
             attempted.append(endpoint_id)
-            try:
-                headers = dict(self.request_headers)
-                headers["referer"] = (
-                    f"{self.referer_base}{quote(request.task.query)}"
-                )
-                response = self.session.get(
-                    endpoint_url,
-                    params=dict(request.params),
-                    headers=headers,
-                    timeout=self._network_timeout(timeout_seconds),
-                )
-            except requests.RequestException as exc:
-                raise ScopedTransportError(
-                    "search_network_error",
-                    request_sent=True,
-                    dest_id_sent=request.dest_id_observed,
-                    endpoint_id=endpoint_id,
-                    attempted_endpoint_ids=tuple(attempted),
-                ) from exc
+            response = None
+            for network_attempt in range(self.network_retry_max_attempts):
+                try:
+                    headers = dict(self.request_headers)
+                    headers["referer"] = (
+                        f"{self.referer_base}{quote(request.task.query)}"
+                    )
+                    response = self.session.get(
+                        endpoint_url,
+                        params=dict(request.params),
+                        headers=headers,
+                        timeout=self._network_timeout(timeout_seconds),
+                    )
+                    attempt_counts[endpoint_id] = network_attempt + 1
+                    break
+                except requests.RequestException as exc:
+                    attempt_counts[endpoint_id] = network_attempt + 1
+                    if network_attempt + 1 >= self.network_retry_max_attempts:
+                        raise ScopedTransportError(
+                            "search_network_error",
+                            request_sent=True,
+                            dest_id_sent=request.dest_id_observed,
+                            endpoint_id=endpoint_id,
+                            attempted_endpoint_ids=tuple(attempted),
+                            endpoint_attempt_counts=tuple(attempt_counts.items()),
+                        ) from exc
+                    delay = self.network_retry_base_delay_seconds * (2**network_attempt)
+                    if self.network_retry_max_delay_seconds > 0:
+                        delay = min(delay, self.network_retry_max_delay_seconds)
+                    if delay > 0:
+                        self._network_retry_sleep(delay)
+            assert response is not None
+            endpoint_counts = tuple(attempt_counts.items())
 
             if response.status_code in self.retry_http_statuses:
                 retry_after_status: str | None = None
@@ -1667,6 +1719,7 @@ class RequestsScopedTransport:
                     retry_after_seconds=retry_after_seconds,
                     endpoint_id=endpoint_id,
                     attempted_endpoint_ids=tuple(attempted),
+                    endpoint_attempt_counts=endpoint_counts,
                 )
                 continue
 
@@ -1678,6 +1731,7 @@ class RequestsScopedTransport:
                     http_status=response.status_code,
                     endpoint_id=endpoint_id,
                     attempted_endpoint_ids=tuple(attempted),
+                    endpoint_attempt_counts=endpoint_counts,
                 )
 
             try:
@@ -1695,6 +1749,7 @@ class RequestsScopedTransport:
                     http_status=exc.http_status,
                     endpoint_id=endpoint_id,
                     attempted_endpoint_ids=tuple(attempted),
+                    endpoint_attempt_counts=endpoint_counts,
                 ) from exc
             try:
                 products = _extract_products(payload)
@@ -1710,6 +1765,7 @@ class RequestsScopedTransport:
                         http_status=200,
                         endpoint_id=endpoint_id,
                         attempted_endpoint_ids=tuple(attempted),
+                        endpoint_attempt_counts=endpoint_counts,
                     ) from exc
                 last_payload_anomaly = ScopedTransportError(
                     "search_payload_anomaly_nested_promo",
@@ -1718,6 +1774,7 @@ class RequestsScopedTransport:
                     http_status=200,
                     endpoint_id=endpoint_id,
                     attempted_endpoint_ids=tuple(attempted),
+                    endpoint_attempt_counts=endpoint_counts,
                 )
                 continue
             self.endpoint_policy = EffectiveEndpointPolicy(
@@ -1731,6 +1788,7 @@ class RequestsScopedTransport:
                 dest_id_sent=request.dest_id_observed,
                 http_status=200,
                 attempted_endpoint_ids=tuple(attempted),
+                endpoint_attempt_counts=endpoint_counts,
             )
 
         if last_payload_anomaly is not None:
@@ -1741,6 +1799,7 @@ class RequestsScopedTransport:
                 http_status=last_payload_anomaly.http_status,
                 endpoint_id=last_payload_anomaly.endpoint_id,
                 attempted_endpoint_ids=tuple(attempted),
+                endpoint_attempt_counts=tuple(attempt_counts.items()),
             )
         if last_rate_limited is not None:
             raise last_rate_limited
@@ -2047,6 +2106,13 @@ class CollectionPlanRunner:
                     )
                 )
             )
+        retry_sleeper = getattr(self.transport, "set_network_retry_sleep", None)
+        if callable(retry_sleeper):
+            def _retry_sleep(seconds: float) -> None:
+                self.deadline.ensure_active()
+                self.sleeper(seconds)
+                self.deadline.ensure_active()
+            retry_sleeper(_retry_sleep)
 
     def _load_bundle(self) -> CollectionPlanBundle:
         return load_collection_plan_bundle(
@@ -4071,8 +4137,14 @@ class CollectionPlanRunner:
                                     )
                                 last_attempts = tuple(attempts)
                                 last_endpoint_id = result.endpoint_id
+                                counts = dict(result.endpoint_attempt_counts)
                                 for endpoint_id in attempts:
-                                    segment_usage[endpoint_id]["attempts"] += 1
+                                    count = counts.get(endpoint_id, 1)
+                                    if type(count) is not int or count < 1:
+                                        raise CollectionPlanRunError(
+                                            "search endpoint attempt evidence mismatch"
+                                        )
+                                    segment_usage[endpoint_id]["attempts"] += count
                                 if result.dest_id_sent != request.dest_id_observed:
                                     raise CollectionPlanRunError(
                                         "search destination evidence mismatch"
@@ -4271,8 +4343,14 @@ class CollectionPlanRunner:
                                 attempts, endpoint_id = (
                                     self._sanitized_endpoint_error_evidence(exc)
                                 )
+                                error_counts = dict(exc.endpoint_attempt_counts)
                                 for attempted in attempts:
-                                    segment_usage[attempted]["attempts"] += 1
+                                    count = error_counts.get(attempted, 1)
+                                    if type(count) is not int or count < 1:
+                                        raise CollectionPlanRunError(
+                                            "search endpoint attempt evidence mismatch"
+                                        ) from exc
+                                    segment_usage[attempted]["attempts"] += count
                                 failed_segment.update(
                                     {
                                         "endpoint_id": endpoint_id or None,
@@ -4819,8 +4897,11 @@ class CollectionPlanRunner:
                                     failed_attempts,
                                     failed_endpoint_id,
                                 ) = self._sanitized_endpoint_error_evidence(exc)
+                                error_counts = dict(exc.endpoint_attempt_counts)
                                 for endpoint_id in failed_attempts:
-                                    endpoint_usage[endpoint_id]["attempts"] += 1
+                                    endpoint_usage[endpoint_id]["attempts"] += error_counts.get(
+                                        endpoint_id, 1
+                                    )
                                 region_manifest["failed_endpoint_attempt"] = {
                                     "query_id": task.query_id,
                                     "page": task.page,
@@ -4869,8 +4950,11 @@ class CollectionPlanRunner:
                                     raise CollectionPlanRunError(
                                         "search endpoint attempt evidence mismatch"
                                     )
+                                result_counts = dict(result.endpoint_attempt_counts)
                                 for endpoint_id in attempted_endpoint_ids:
-                                    endpoint_usage[endpoint_id]["attempts"] += 1
+                                    endpoint_usage[endpoint_id]["attempts"] += result_counts.get(
+                                        endpoint_id, 1
+                                    )
                                 region_manifest[
                                     "dest_resolution_status"
                                 ] = "resolved_and_sent"
