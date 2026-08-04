@@ -1755,6 +1755,65 @@ def test_retired_production_attestation_transition_rejects_old_fingerprint(
         )
 
 
+def test_live_114_unit_repair_transition_is_exact_and_hash_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key, approval = next(
+        iter(runner_module._APPROVED_RESUME_ATTESTATION_TRANSITIONS.items())
+    )
+    run_id, plan_id, effective_sha, stored_fp_sha, stored_input_sha = key
+    assert run_id == "20260803_220018Z"
+    assert plan_id == "shevron-four-regions-top1000-v2"
+    assert effective_sha == "66ea9176a128676384626eaebe60350822b7a14aefee7f05e4cd0b2c85bdc474"
+    assert approval["transition_id"] == "wb-20260803-220018z-segment-117-successor-20260804"
+    stored = _attested_fingerprint(
+        endpoint_sha256="6adec51ee15afaf98b7b2a66b53b735fcb8149f0d42b71b3bfd3e5ccc8a6ae08",
+        request_params_sha256="740688b67b86ba24e9130bba4e0813b4c00176f1f53c6990dfa9465020de1714",
+        proxy_route_sha256="632d1832fa9c70611097b15f2ce2754c492de1b4dcbfb161cc3d54e1e3c8df44",
+        input_manifest_sha256=stored_input_sha,
+        runtime_input_sha256="e51ecd60836ec0b65f2eb61a3f8abd043dc9a9db3e5b6f5def3ca7909ad9f7c9",
+    )
+    assert stored["fingerprint_sha256"] == stored_fp_sha
+    current_input = hashlib.sha256(
+        (PROJECT_ROOT / "config/wb/nightly_coordinator_adapter_inputs.json").read_bytes()
+    ).hexdigest()
+    current = _attested_fingerprint(
+        endpoint_sha256=stored["ordered_endpoint_urls_sha256"],
+        request_params_sha256=stored["request_params_sha256"],
+        proxy_route_sha256=stored["proxy_route_sha256"],
+        input_manifest_sha256=current_input,
+        runtime_input_sha256=stored["runtime_input_sha256"],
+    )
+    assert current_input != stored_input_sha
+    transition = runner_module._resume_attestation_transition(
+        stored=stored,
+        current=current,
+        project_root=PROJECT_ROOT,
+        run_id=run_id,
+        collection_plan_id=plan_id,
+        effective_plan_sha256=effective_sha,
+    )
+    assert transition is not None
+    assert transition["transition_id"] == approval["transition_id"]
+    assert transition["from_input_manifest_sha256"] == stored_input_sha
+    assert transition["to_input_manifest_sha256"] == current_input
+
+    drifted = dict(current)
+    drifted["proxy_route_sha256"] = "f" * 64
+    claimed = dict(drifted)
+    claimed.pop("fingerprint_sha256")
+    drifted["fingerprint_sha256"] = runner_module._canonical_sha256(claimed)
+    with pytest.raises(CollectionPlanRunError, match="transport fingerprint mismatch"):
+        runner_module._resume_attestation_transition(
+            stored=stored,
+            current=drifted,
+            project_root=PROJECT_ROOT,
+            run_id=run_id,
+            collection_plan_id=plan_id,
+            effective_plan_sha256=effective_sha,
+        )
+
+
 @pytest.mark.parametrize(
     "mismatch",
     [
